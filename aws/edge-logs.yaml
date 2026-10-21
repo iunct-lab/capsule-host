@@ -1,0 +1,30 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: The CloudFront access log of one stack's /v1/* requests (CloudWatch Logs); CloudFront delivers logs only to us-east-1, so this is deployed there
+Parameters:
+  DistributionArn:
+    Type: String
+    AllowedPattern: 'arn:aws:cloudfront::[0-9]{12}:distribution/[A-Z0-9]+'
+    Description: The Cdn of aws/template.yaml (its DistributionId output, in the ARN form)
+  StackName:
+    Type: String
+    AllowedPattern: '[a-zA-Z0-9-]+'
+    Description: The name of the aws/template.yaml stack this log belongs to
+Resources:
+  Group:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/capsule-host/${StackName}/cdn'
+      RetentionInDays: 90
+  Source:
+    Type: AWS::Logs::DeliverySource
+    Properties: { Name: !Sub '${StackName}-cdn', LogType: ACCESS_LOGS, ResourceArn: !Ref DistributionArn }
+  Destination:
+    Type: AWS::Logs::DeliveryDestination
+    Properties: { Name: !Sub '${StackName}-cdn', DestinationResourceArn: !GetAtt Group.Arn, OutputFormat: json }
+  Delivery:
+    Type: AWS::Logs::Delivery
+    Properties:
+      DeliverySourceName: !Ref Source
+      DeliveryDestinationArn: !GetAtt Destination.Arn
+      # Time, address, method, path, status, size and agent only. No query string, no cookie, no referer: a secret rides there.
+      RecordFields: [timestamp, c-ip, cs-method, cs-uri-stem, sc-status, sc-bytes, cs(User-Agent), x-edge-detailed-result-type, time-taken]

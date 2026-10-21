@@ -1,0 +1,344 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Shared ephemeral trip capsules; no user accounts
+Parameters:
+  WebCodeBucket:
+    Type: String
+    Description: The versioned bucket of the code stack (aws/code.yaml) that holds the Web Function's zip
+  WebCodeVersion:
+    Type: String
+    Description: The S3 VersionId of web.zip in that bucket; a revision is immutable, so new code is a new version here
+  WebRateLimit:
+    Type: Number
+    Default: 100
+    MinValue: 0
+    MaxValue: 1000
+    Description: Requests per second the Web Function endpoint accepts, a multiple of 100 (it takes no less than 100). 0 stops all of /v1/* (503), the full stop (aws/README.md)
+  PublicOrigin:
+    Type: String
+    Default: https://unconfigured.invalid
+    AllowedPattern: 'https://[a-zA-Z0-9.-]+'
+  ReservedConcurrency:
+    Type: Number
+    Default: 5
+    MinValue: -1
+    Description: Lambda reserved concurrency; -1 disables it (accounts whose concurrency limit is 10 cannot reserve any)
+  ClaimCountries:
+    Type: String
+    Default: JP
+    AllowedPattern: '([A-Z]{2}(,[A-Z]{2})*)?'
+    Description: Countries allowed to redeem an invite seat (CloudFront-Viewer-Country); empty disables the check. Access after redemption is never geo-restricted
+  DisabledActions:
+    Type: String
+    Default: ''
+    AllowedPattern: '([a-z][a-z.]*(,[a-z][a-z.]*)*)?'
+    Description: Operations to stop, by name (sessions, grants, publish, creators, passkey, assist, account), answered with 503; empty lets all through
+  AssistModel:
+    Type: String
+    Default: claude-haiku-5-5
+    AllowedPattern: '[a-z0-9-]+'
+    Description: The Anthropic model a creator's own API key is used with when a trip is generated on this host
+  BudgetLimitUsd:
+    Type: String
+    Default: '0'
+    AllowedPattern: '0|[1-9][0-9]*'
+    Description: Monthly cost budget for the whole account, in whole USD; 0 (or no BudgetEmail) creates none. Give it to one stack only, or the account gets two budgets
+  BudgetEmail:
+    Type: String
+    Default: ''
+    Description: Where the budget's alerts are e-mailed; passed at deploy, never committed
+  PermissionsBoundary:
+    Type: String
+    Default: ''
+    Description: The boundary on this stack's roles; dev passes capsule-host-agent-dev-boundary (aws/dev-agent.yaml), prod passes none
+Conditions:
+  # A Web Function refuses an environment variable whose value is empty (a Lambda accepts it); both of these may be empty on purpose, so the variable is left out then.
+  HasClaimCountries: !Not [!Equals [!Ref ClaimCountries, '']]
+  HasDisabledActions: !Not [!Equals [!Ref DisabledActions, '']]
+  HasReservedConcurrency: !Not [!Equals [!Ref ReservedConcurrency, -1]]
+  # Both, or no budget: an alert with nobody to tell would fail the deploy (a template Rule is not evaluated with the SAM transform).
+  HasBudget: !And [!Not [!Equals [!Ref BudgetLimitUsd, '0']], !Not [!Equals [!Ref BudgetEmail, '']]]
+  HasPermissionsBoundary: !Not [!Equals [!Ref PermissionsBoundary, '']]
+Resources:
+  Data:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+        - { AttributeName: sk, AttributeType: S }
+        - { AttributeName: expiry_kind, AttributeType: S }
+        - { AttributeName: purge_at, AttributeType: N }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+        - { AttributeName: sk, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: expiry
+          KeySchema:
+            - { AttributeName: expiry_kind, KeyType: HASH }
+            - { AttributeName: purge_at, KeyType: RANGE }
+          Projection: { ProjectionType: KEYS_ONLY }
+      TimeToLiveSpecification: { AttributeName: ttl, Enabled: true }
+      SSESpecification: { SSEEnabled: true }
+  HmacKey:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      GenerateSecretString: { PasswordLength: 64, ExcludePunctuation: true }
+  Host:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../dist/aws/
+      Handler: index.handler
+      Runtime: nodejs24.x
+      Architectures: [arm64]
+      MemorySize: 256
+      # No HTTP here: the sweep, a generation started by the Web Function (assist) and the operator's publish/recover/creators calls.
+      Timeout: 300
+      EventInvokeConfig:
+        MaximumRetryAttempts: 0
+        MaximumEventAgeInSeconds: 60
+      ReservedConcurrentExecutions: !If [HasReservedConcurrency, !Ref ReservedConcurrency, !Ref AWS::NoValue]
+      PermissionsBoundary: !If [HasPermissionsBoundary, !Ref PermissionsBoundary, !Ref AWS::NoValue]
+      Environment:
+        Variables:
+          CAPSULE_TABLE: !Ref Data
+          CAPSULE_ORIGIN: !Ref PublicOrigin
+          CAPSULE_HMAC_KEY: !Sub '{{resolve:secretsmanager:${HmacKey}:SecretString}}'
+          CAPSULE_CLAIM_COUNTRIES: !Ref ClaimCountries
+          CAPSULE_DISABLED_ACTIONS: !Ref DisabledActions
+          CAPSULE_ASSIST_MODEL: !Ref AssistModel
+          CAPSULE_KEY_PREFIX: !Sub '/capsule-host/${AWS::StackName}/creator-key'
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:UpdateItem", "dynamodb:ConditionCheckItem", "dynamodb:Query"]
+              Resource: [!GetAtt Data.Arn, !Sub '${Data.Arn}/index/expiry']
+            # A creator's API key, sealed by the application, under this stack's prefix only (AWS managed key, no fixed cost).
+            # The `used` tag is a key's last generation; the 5-minute sweep lists the prefix and deletes keys unused for 30 days (#744).
+            - Effect: Allow
+              Action: ["ssm:PutParameter", "ssm:GetParameter", "ssm:DeleteParameter", "ssm:AddTagsToResource", "ssm:ListTagsForResource"]
+              Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/capsule-host/${AWS::StackName}/creator-key/*'
+            - Effect: Allow
+              Action: ["ssm:GetParametersByPath"]
+              Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/capsule-host/${AWS::StackName}/creator-key'
+      Events:
+        Cleanup:
+          Type: Schedule
+          Properties: { Schedule: 'rate(5 minutes)', Enabled: true }
+  Logs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${Host}'
+      RetentionInDays: 90
+  # The Web Function serves /v1/* (docs/design/lambda-web-functions.md). CloudFront signs every request with its origin access control and
+  # the endpoint refuses an unsigned one before this code runs, so no secret header travels. The rate limit and the environment count are the
+  # cost ceiling API Gateway's throttle used to be: 100 requests per second is the lowest Web Functions allow, and two environments the lowest count.
+  WebRole:
+    Type: AWS::IAM::Role
+    Properties:
+      PermissionsBoundary: !If [HasPermissionsBoundary, !Ref PermissionsBoundary, !Ref AWS::NoValue]
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{ Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: 'sts:AssumeRole' }]
+      ManagedPolicyArns: [!Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole']
+      Policies:
+        - PolicyName: web
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:UpdateItem", "dynamodb:ConditionCheckItem", "dynamodb:Query"]
+                Resource: [!GetAtt Data.Arn, !Sub '${Data.Arn}/index/expiry']
+              # A generation started here marks the key as used (the `used` tag, #744).
+              - Effect: Allow
+                Action: ["ssm:PutParameter", "ssm:GetParameter", "ssm:DeleteParameter", "ssm:AddTagsToResource"]
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/capsule-host/${AWS::StackName}/creator-key/*'
+              # A generation outlasts an HTTP request: the Web Function starts it on the Event Function (an Event, never retried).
+              - Effect: Allow
+                Action: ["lambda:InvokeFunction"]
+                Resource: !GetAtt Host.Arn
+  WebLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/capsule-host/${AWS::StackName}/web'
+      RetentionInDays: 90
+  # Lambda writes here first and copies to the group above; it makes this one itself when missing, with no expiry.
+  WebLogsLocal:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/capsule-host/${AWS::StackName}/web.local'
+      RetentionInDays: 90
+  Web:
+    Type: AWS::Lambda::WebFunction
+    Metadata: { cfn-lint: { config: { ignore_checks: [E3006] } } }
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-web'
+  WebRevision:
+    Type: AWS::Lambda::WebFunctionRevision
+    Metadata: { cfn-lint: { config: { ignore_checks: [E3006] } } }
+    Properties:
+      FunctionName: !Ref Web
+      BuildConfig:
+        CodeConfig: { S3Object: { Bucket: !Ref WebCodeBucket, Key: web.zip, VersionId: !Ref WebCodeVersion } }
+        RuntimeConfig: { Runtime: nodejs24.x }
+      ServiceConfig:
+        ExecutionRoleArn: !GetAtt WebRole.Arn
+        # CloudFront waits 60 seconds for an origin, so a request that takes longer has no one to answer.
+        TimeoutSeconds: 60
+        TelemetryConfig: { LoggingConfig: { LogGroup: !Ref WebLogs } }
+        EnvironmentVariables:
+          AWS_LAMBDA_NODEJS_ENTRYPOINT: index.mjs
+          CAPSULE_TABLE: !Ref Data
+          CAPSULE_ORIGIN: !Ref PublicOrigin
+          CAPSULE_HMAC_KEY: !Sub '{{resolve:secretsmanager:${HmacKey}:SecretString}}'
+          CAPSULE_CLAIM_COUNTRIES: !If [HasClaimCountries, !Ref ClaimCountries, !Ref AWS::NoValue]
+          CAPSULE_DISABLED_ACTIONS: !If [HasDisabledActions, !Ref DisabledActions, !Ref AWS::NoValue]
+          CAPSULE_ASSIST_MODEL: !Ref AssistModel
+          CAPSULE_KEY_PREFIX: !Sub '/capsule-host/${AWS::StackName}/creator-key'
+          CAPSULE_EVENT_FUNCTION: !Ref Host
+    DependsOn: [WebLogsLocal]
+  WebEndpoint:
+    Type: AWS::Lambda::WebFunctionEndpoint
+    Metadata: { cfn-lint: { config: { ignore_checks: [E3006] } } }
+    Properties:
+      FunctionName: !Ref Web
+      EndpointName: prod
+      EndpointType: HomeRegion
+      AuthType: IamAuth
+      RevisionWeights: [{ RevisionId: !GetAtt WebRevision.RevisionId, Weight: 100 }]
+      ScalingConfig: { MaxEnvironments: 2 }
+      ThrottleConfig: { RateLimit: !Ref WebRateLimit }
+  WebAccess:
+    Type: AWS::CloudFront::OriginAccessControl
+    Metadata: { cfn-lint: { config: { ignore_checks: [E3031] } } }
+    Properties:
+      OriginAccessControlConfig: { Name: !Sub '${AWS::StackName}-web', OriginAccessControlOriginType: lambda, SigningBehavior: always-amz-auth, SigningProtocol: sigv4 }
+  WebInvoke:
+    Type: AWS::Lambda::ResourcePolicy
+    Metadata: { cfn-lint: { config: { ignore_checks: [E3006] } } }
+    Properties:
+      ResourceArn: !GetAtt WebEndpoint.FunctionArn
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: CloudFrontOnly
+            Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: lambda:InvokeWebFunctionEndpoint
+            Resource: !GetAtt WebEndpoint.EndpointArn
+            Condition: { StringEquals: { 'aws:SourceArn': !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Cdn}' } }
+  Assets:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      PublicAccessBlockConfiguration: { BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+  Access:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig: { Name: !Sub '${AWS::StackName}-assets', OriginAccessControlOriginType: s3, SigningBehavior: always, SigningProtocol: sigv4 }
+  Routes:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub '${AWS::StackName}-routes'
+      AutoPublish: true
+      FunctionConfig: { Comment: Capsule page routing, Runtime: cloudfront-js-2.0 }
+      FunctionCode: 'function handler(e) { var r=e.request; if(r.uri==="/" || r.uri.indexOf("/c/")===0) r.uri="/index.html"; return r; }'
+  SecurityHeaders:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub "${AWS::StackName}-security"
+        SecurityHeadersConfig:
+          ContentTypeOptions: { Override: true }
+          FrameOptions: { FrameOption: DENY, Override: true }
+          ReferrerPolicy: { ReferrerPolicy: no-referrer, Override: true }
+          StrictTransportSecurity: { AccessControlMaxAgeSec: 31536000, Override: true }
+          ContentSecurityPolicy:
+            Override: true
+            ContentSecurityPolicy: "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+        CustomHeadersConfig:
+          Items:
+            - { Header: X-Robots-Tag, Value: "noindex, nofollow", Override: true }
+            - { Header: Permissions-Policy, Value: "camera=(), microphone=(), geolocation=(self)", Override: true }
+            # The browser revalidates the page files (ETag) on every open, so it does not keep a previous deploy's app.js; the edge is renewed by the invalidation (#428).
+            - { Header: Cache-Control, Value: no-cache, Override: true }
+  ApiRequest:
+    Type: AWS::CloudFront::OriginRequestPolicy
+    Properties:
+      OriginRequestPolicyConfig:
+        Name: !Sub '${AWS::StackName}-api'
+        Comment: API headers plus viewer country and address; Host is excluded because a Web Function endpoint answers 404 to a foreign Host
+        HeadersConfig: { HeaderBehavior: whitelist, Headers: [Origin, Content-Type, If-Match, User-Agent, CloudFront-Viewer-Country, CloudFront-Viewer-Address] }
+        CookiesConfig: { CookieBehavior: all }
+        QueryStringsConfig: { QueryStringBehavior: all }
+  Cdn:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        HttpVersion: http2
+        IPV6Enabled: true
+        Origins:
+          - Id: assets
+            DomainName: !GetAtt Assets.RegionalDomainName
+            S3OriginConfig: { OriginAccessIdentity: '' }
+            OriginAccessControlId: !Ref Access
+          - Id: api
+            DomainName: !GetAtt WebEndpoint.DomainName
+            OriginAccessControlId: !Ref WebAccess
+            CustomOriginConfig: { OriginProtocolPolicy: https-only, OriginSSLProtocols: [TLSv1.2], OriginReadTimeout: 60 }
+        DefaultCacheBehavior:
+          TargetOriginId: assets
+          ViewerProtocolPolicy: redirect-to-https
+          ResponseHeadersPolicyId: !Ref SecurityHeaders
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          Compress: true
+          FunctionAssociations:
+            - { EventType: viewer-request, FunctionARN: !GetAtt Routes.FunctionARN }
+        CacheBehaviors:
+          - PathPattern: '/v1/*'
+            TargetOriginId: api
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: !Ref ApiRequest
+  AssetsPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref Assets
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub '${Assets.Arn}/*'
+            Condition:
+              StringEquals: { 'AWS:SourceArn': !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Cdn}' }
+  # An alert, not a cap: nothing is stopped when it is crossed. Free while it has no actions.
+  Budget:
+    Type: AWS::Budgets::Budget
+    Condition: HasBudget
+    Properties:
+      Budget:
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit: { Amount: !Ref BudgetLimitUsd, Unit: USD }
+      NotificationsWithSubscribers:
+        - Notification: { NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 80, ThresholdType: PERCENTAGE }
+          Subscribers: [{ SubscriptionType: EMAIL, Address: !Ref BudgetEmail }]
+        - Notification: { NotificationType: FORECASTED, ComparisonOperator: GREATER_THAN, Threshold: 100, ThresholdType: PERCENTAGE }
+          Subscribers: [{ SubscriptionType: EMAIL, Address: !Ref BudgetEmail }]
+Outputs:
+  Origin: { Value: !Sub 'https://${Cdn.DomainName}' }
+  AssetsBucket: { Value: !Ref Assets }
+  FunctionName: { Value: !Ref Host }
+  DistributionId: { Value: !Ref Cdn }
+  WebEndpoint: { Value: !Sub 'https://${WebEndpoint.DomainName}' }

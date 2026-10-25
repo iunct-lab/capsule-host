@@ -1,0 +1,32 @@
+{
+  "name": "capsule-host",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "dev": "bun src/main.ts",
+    "start": "bun src/main.ts",
+    "typecheck": "bun -e 'if (Bun.semver.order(Bun.version, \"1.4.3\") < 0) { console.error(\"bun 1.4.3 以上が要ります（今は \" + Bun.version + \"）\"); process.exit(1) }' && bun --check",
+    "test": "bun test src scripts",
+    "schema": "bun src/json-schema.ts",
+    "validate": "bun src/validate.ts",
+    "build": "bun aws/build.ts",
+    "verify:http": "bun src/verify-http.ts",
+    "verify:ui": "bun src/verify-ui.ts",
+    "check": "bun run typecheck && bun test src scripts && bun run build"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.133.0",
+    "@aws-sdk/client-dynamodb": "^3.1135.0",
+    "@aws-sdk/client-lambda": "^3.1151.0",
+    "@aws-sdk/client-ssm": "^3.1151.0",
+    "@aws-sdk/lib-dynamodb": "^3.1135.0",
+    "maplibre-gl": "^6.13.0",
+    "pmtiles": "^4.5.0",
+    "zod": "^3.25.0",
+    "zod-to-json-schema": "^3.25.2"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.0"
+  }
+}

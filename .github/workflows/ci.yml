@@ -1,0 +1,33 @@
+name: CI
+
+# 型・テスト・ビルド（bun run check）と IaC の lint を、PR と main への push で走らせる。
+# AWS には接続しない（認証情報も OIDC も渡さない）。配置は手元の手順のまま（docs/development-and-release.md）。
+on:
+  pull_request: {}
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# PR は新しい push で古い run を取り消す。main は取り消さない（main の各コミットの結果を残す）。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false   # install・test の間、git の設定にトークンを残さない
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.3
+      - run: bun install --frozen-lockfile
+      - run: bun run check
+      - uses: aws-actions/setup-sam@f84ec7d548307efafe33230528756de3c5841a17 # v2
+        with:
+          use-installer: true
+      - run: sam validate --lint --template-file aws/template.yaml --region ap-northeast-1

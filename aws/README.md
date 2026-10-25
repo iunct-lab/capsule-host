@@ -112,6 +112,10 @@ rm -rf "$W"
 bun aws/verify.ts https://DISTRIBUTION.cloudfront.net FUNCTION_NAME YOUR_PROFILE ap-northeast-1
 ```
 
+回す場面は、Host の設定にある線（下の「旅程の暗号化を始めた後に発行した旅行（`SealedFrom`）」）で変わる。線のある Host では、最初に発行する平文の旅行は owner が移すまで開けないので、その旅行の場面（招待・旅程の編集・個人のメモ・足あと・export・revise・失効・recover など）の代わりに線の扱い（`ui=2` の無い要求の 409「画面を更新してください」、招待・編集・足あとの 409「オーナーがこの旅行を移すまで開けません」、owner と運用者の一覧の `mustSeal`）を確かめ、暗号化した旅行と移す場面は線の後でも通る順で回す（分かれ目は `aws/verify.ts` の `afterLine`）。平文の場面は線の無い dev の実行が確かめるので、prod に置くコミットは先に dev で通す。出力の最初の `SealedFrom:` の行（`set (…after the line)` / `set, not reached yet (…before the line)` / `not set`）は、配置の記録にそのまま写す。
+
+暗号化した旅行の場面では、旅行の鍵を替える（#695）ことも見る: 鍵を持つ参加者を失効させた後に owner の `GET` が `rekey: "auto"` を返し、owner のブラウザと同じ部品（`src/trip-keys.ts`）で `POST rekey` を送ると、残った参加者が新しい世代を開けて owner の署名と認め、失効した参加者の世代 1 の鍵では開けず、dev では DynamoDB の payload の暗号文が全部世代 2 で `departed`・`previous` が無い。続けて `/recover` の後、新しい owner が参加者から鍵を受け取ると `rekey: "ask"` になり、`keep` で消える（成功行の `trip key replaced`。ローカルの Host は `/recover` に発行者の権限を渡さないので、ここで確かめる）。
+
 作成者まわりは、パスキーを作れないので実際の登録はしない。未サインインで `/v1/recipe`・`/v1/check`・`/v1/publish` が401、作成者のchallengeがCloudFront越しに出ること、使えない登録リンクを添えたchallengeが401（パスキーを作る前に止まる）、でたらめな登録・サインインが401、公開HTTPからの `enroll`・`list`・`revoke` が401、IAMからの `list` が200であることを見る（成功行の `creator endpoints`）。パスキーでの登録から保存までの流れは実機で確かめる。
 
 スタック出力 `WebEndpoint`（Web Function の直のURL）を読み、CloudFrontを迂回した署名なしの直接アクセスが403になることを毎回確認する（成功の行は `function URL direct 403 (always)`）（出力が無いスタックでは止まる。`cloudformation:DescribeStacks` が要る）。あわせて、`/v1/*` の応答に `Access-Control-Allow-Origin` が無いこと、`OPTIONS` が2xxでないこと、別カプセルへ付け替えたCookieが401になること、viewer / editor が owner 専用の操作で403になることも確かめる。席の引換は `ClaimCountries`（既定JP）の国からだけ通るので、検証もその国から実行する。国外から運用する場合は `--parameter-overrides ClaimCountries=JP,US` のように指定し、空文字で制限を外す。
@@ -174,6 +178,9 @@ ownerの登録ブラウザを失った場合（Cookie削除・機種変更）は
 ```sh
 bun aws/recover.ts CAPSULE_ID FUNCTION_NAME YOUR_PROFILE ap-northeast-1
 ```
+
+保存先（既定は`./capsule-<id>.owner.json`、5つ目の引数で変えられる）が既にあるか書けないときは、Hostに何も送らずに止まる（旧オーナーの席はそのまま）。前の回復のファイルが残っていれば、使い終わったものか確かめてから消すか、別の保存先を渡す。
+
 `lambda:InvokeFunction` を対象関数に許可する発行者IAM権限は、参加者には渡さない。
 
 ### 作成者（スマホのブラウザから旅行を作る人）
@@ -198,7 +205,11 @@ bun aws/capsules.ts list FUNCTION_NAME YOUR_PROFILE ap-northeast-1              
 bun aws/capsules.ts terminate CAPSULE_ID FUNCTION_NAME YOUR_PROFILE ap-northeast-1   # 1件を即時に終了。IDをもう一度入力して確かめる
 ```
 
-一覧の各項目は `id`・`kind`・`state`・`created`・`updated`・`purgeAt`・`grants`（有効な招待の数）・`members`（登録している端末の数）だけで、題名・行き先・旅程・コメント・メンバー名・秘密は含まない。`id` が `null` のカプセルは、IDを本文に持つ前（#38より前）に発行されて、その後だれも書き込んでいないもの。IDは発行の控え（`aws/publish.ts` の `<入力>.owner.json`）か、旅行のリンク（`/c/<ID>`）から探す。作成者がブラウザで保存した旅行には控えのファイルが無いので、リンクを持つ人（owner・作成者）に聞く（誰かが書き込めば一覧にIDが出る）。強制終了はownerのpurgeと同じ保存の経路で、取り消せない。以後そのカプセルへのアクセスは410になる。
+一覧の各項目は `id`・`kind`・`state`・`created`・`updated`・`purgeAt`・`grants`（有効な招待の数）・`members`（登録している端末の数）・`sealed`（旅程を暗号化したか）・`mustSeal`（下の `SealedFrom` より後に発行され、まだ移していないので owner が移すまで使えない旅行か）だけで、題名・行き先・旅程・コメント・メンバー名・秘密は含まない。`id` が `null` のカプセルは、IDを本文に持つ前（#38より前）に発行されて、その後だれも書き込んでいないもの。IDは発行の控え（`aws/publish.ts` の `<入力>.owner.json`）か、旅行のリンク（`/c/<ID>`）から探す。作成者がブラウザで保存した旅行には控えのファイルが無いので、リンクを持つ人（owner・作成者）に聞く（誰かが書き込めば一覧にIDが出る）。強制終了はownerのpurgeと同じ保存の経路で、取り消せない。以後そのカプセルへのアクセスは410になる。
+
+### 旅程の暗号化を始めた後に発行した旅行（`SealedFrom`）
+
+パラメータ `SealedFrom`（既定は空）は、旅程を暗号化する新しい画面を配り終えた時刻（`YYYY-MM-DDTHH:MM:SSZ`）。`created` がこの時刻以後の平文の旅行は、owner が新しい画面で移す（暗号化して置き直す）まで、owner が移すための操作とログアウト・削除のほかは 409 を返す（一覧は `src/cloud-host.ts` の `mustSeal` の検査）。空なら扱いを始めていない。dev は普段は空のまま（線の扱いは `src/cloud-host.test.ts` の "after the new screen is out" で確かめる）。線のある Host では、`aws/verify.ts` は平文の旅行の場面の代わりに線の扱い（409 の 2 種・`mustSeal`）を確かめ、出力の `SealedFrom: set (trips published by this run are after the line)` の行で分かる（時刻がまだ来ていなければ `SealedFrom: set, not reached yet …` で、線の無い Host として回る）（上の「AWS検証」）。prod には画面を配り終えた後に、下の止めるコマンドと同じ形（`--use-previous-template`、ほかは `UsePreviousValue=true`）で `ParameterKey=SealedFrom,ParameterValue=<時刻>` を渡す。パラメータの形の検査は月・日・時の範囲までで、暦にない日（2 月 30 日など）は通る。Host が時刻として読めない値なら起動のときに断って全部の要求が失敗するので、渡した後に `GET /v1/account` が 200 であること（失敗なら前の値に戻す）と、`bun aws/capsules.ts list` の `mustSeal` が意図どおりの旅行に付いたことを見る。配る順番と「配った後」の線は `docs/development-and-release.md`、設計は `docs/design/trip-e2e.md` §5。
 
 ### 不審なアクセスがあったとき（止める・戻す）
 
@@ -224,7 +235,7 @@ aws cloudformation wait stack-update-complete --stack-name capsule-host-dev --pr
 
 表に無い名前も、パスの最初の区切り（`/v1/c/<ID>/` の下はその次の区切り。例: `spec`・`members`・`terminate`）でそのまま指定できる。名前の綴りは Host では検査しない（綴りを誤ると何も止まらない）ので、止めたあと下の確かめ方で 503 が返ることを必ず見る。
 
-`PermissionsBoundary` は、それを持つ template（#775 から）を配置した後のスタックにだけ付ける（前のスタックに付けると「前の値が無い」で止まる）。dev では渡さないと境界を外そうとして失敗する。
+`SealedFrom` を持つ template（#718 から）を配置した後のスタックでは、止める・戻すコマンドに `ParameterKey=SealedFrom,UsePreviousValue=true` も足す（渡さないと既定の空に戻り、配った後の扱いが外れる）。前のスタックに付けると「前の値が無い」で止まる。`PermissionsBoundary` は、それを持つ template（#775 から）を配置した後のスタックにだけ付ける（前のスタックに付けると「前の値が無い」で止まる）。dev では渡さないと境界を外そうとして失敗する。
 
 全停止は、止める例の `ParameterKey=WebRateLimit,UsePreviousValue=true` を `ParameterKey=WebRateLimit,ParameterValue=0` に替え、`DisabledActions` は `UsePreviousValue=true` にする（dev で試した。配置の記録は Private のリポジトリだけにある）。Event Function（sweep・生成の続き）も止めるときは `ReservedConcurrency=0` も替える。
 

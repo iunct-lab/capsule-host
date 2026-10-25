@@ -1,5 +1,7 @@
 import { expect, test } from "bun:test";
-import { revisable, reviseText, merge, settle, diff } from "./revise";
+import { revisable, reviseText, merge, settle, diff, reviseTrip, undoTrip, PASTE_LIMIT } from "./revise";
+import { CloudHost } from "./cloud-host";
+import { LocalD1 } from "./local-d1";
 import { validate } from "./schema";
 import { recipe } from "./recipe";
 import { testTrip } from "./test-fixture";
@@ -213,4 +215,46 @@ test("a changed coordinate of a place that has them already shows as a change of
   const current = testTrip(); current.document.items[1]!.place = { label: "港の食堂", lat: 35.1, lng: 139.6 };
   const { diff: d } = revised(t => { t.document.items[1] = { ...t.document.items[1]!, place: { label: "港の食堂", lat: 35.2, lng: 139.6 } }; }, current);
   expect(d.items).toEqual([{ change: "changed", id: "dinner", title: "夕食", fields: [{ field: "場所", before: "港の食堂 / 35.1 / 139.6", after: "港の食堂 / 35.2 / 139.6" }] }]);
+});
+
+// The host and the browser revise and undo with the same functions: what the browser shows for a sealed trip is what the
+// host shows for a plain one.
+test("reviseTrip and undoTrip match the host", async () => {
+  const db = new LocalD1(), at = +new Date("2026-09-16T00:00:00Z"), origin = "https://trip.example";
+  const host = new CloudHost({ DB: db, CAPSULE_HMAC_KEY: "test-key-".repeat(8), CAPSULE_ORIGIN: origin }, () => at, async () => "test");
+  try {
+    const send = (path: string, method = "GET", body?: unknown, cookie?: string, revision = 1) => host.fetch(new Request(origin + path, { method, headers: { Origin: origin, "Content-Type": "application/json", "If-Match": `"${revision}"`, ...(cookie ? { Cookie: cookie } : {}) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) }));
+    const created = await (await send("/v1/publish", "POST", { ...testTrip(), confirm: true })).json() as { id: string; url: string }, base = `/v1/c/${created.id}`;
+    const owner = (await send(base + "/sessions", "POST", { secret: new URLSearchParams(new URL(created.url).hash.slice(1)).get("k") })).headers.get("Set-Cookie")!.split(";")[0]!;
+    const stored = async () => JSON.parse((await host.store.get(host.digest(created.id)))!.payload!);
+    const trip = structuredClone(revisable(testTrip().spec, testTrip().document));
+    trip.document.items[1]!.startsAt = "2026-09-25T18:30:00+09:00"; trip.document.suggestions.push({ id: "s-new", body: "星を見る", promoted: false });
+    const text = `直しました。\n\n\`\`\`json\n${JSON.stringify(trip)}\n\`\`\``;
+    const c = await stored(), by = { author: "オーナー", at: new Date(at).toISOString(), created: c.created, now: at, keepSpec: false };
+    const local = reviseTrip({ spec: c.spec, document: c.document }, text, by);
+    const shown = await (await send(base + "/revise/check", "POST", { text }, owner)).json();
+    expect(local.ok).toBe(true);
+    if (!local.ok) return;
+    expect(shown).toEqual({ ok: true, diff: local.diff, revision: 1 });
+    expect((await send(base + "/revise", "POST", { text, confirm: true }, owner)).status).toBe(200);
+    const after = await stored();
+    expect(after.document).toEqual({ ...local.next.document, revision: 2 });
+    expect(after.spec).toEqual(local.next.spec);
+    const back = undoTrip({ spec: after.spec, document: after.document }, after.previous, { created: after.created, keepSpec: false });
+    expect(back.ok).toBe(true);
+    if (!back.ok) return;
+    expect(await (await send(base + "/undo", "GET", undefined, owner, 2)).json()).toEqual({ diff: back.diff, revision: 2 });
+    expect(undoTrip({ spec: after.spec, document: after.document }, undefined, { created: after.created, keepSpec: false })).toEqual({ ok: false, reason: "none" });
+    // The paste's own rules, before anything reaches the host: https only, 4000 characters a text, 200,000 bytes in all.
+    const refused = (edit: (t: typeof trip) => void) => { const t = structuredClone(trip); edit(t); return reviseTrip({ spec: c.spec, document: c.document }, JSON.stringify(t), by); };
+    expect(refused(t => { t.document.items[0]!.place = { label: "駅", publicUrl: "http://example.com/" }; })).toMatchObject({ ok: false, messages: [expect.stringContaining("公開HTTPS URLのみ使用できます")] });
+    expect(refused(t => { t.document.items[0]!.description = "あ".repeat(4001); })).toEqual({ ok: false, messages: ["1 つめの予定の説明: 4000 文字以内で指定してください"] });
+    expect(reviseTrip({ spec: c.spec, document: c.document }, "x".repeat(PASTE_LIMIT + 1), by)).toEqual({ ok: false, tooLong: true });
+    expect(PASTE_LIMIT).toBe(200_000);
+  } finally { db.close(); }
+});
+test("revise runs in the browser", async () => {
+  const built = await Bun.build({ entrypoints: ["src/revise.ts", "src/schema.ts"], target: "browser" });
+  expect(built.success).toBe(true);
+  for (const out of built.outputs) expect((await out.text()).includes("node:")).toBe(false);
 });

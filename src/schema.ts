@@ -1,4 +1,8 @@
-import { z } from "zod";
+import { z, ZodError } from "zod";
+
+// zod 4 compiles a fast path with `new Function`; the page's CSP has no 'unsafe-eval' (src/cloud-host.ts), so in the browser
+// that throws partway through a parse. Every bundle that parses imports this module.
+z.config({ jitless: true });
 
 const short = z.string().trim().min(1).max(160);
 const identifier = short.regex(/^[a-zA-Z0-9_-]+$/);
@@ -6,7 +10,9 @@ const text = z.string().trim().max(4000);
 const day = z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine(v => {
   const n = new Date(v); return !isNaN(+n) && n.toISOString().slice(0, 10) === v;
 }, "実在する日付を指定してください");
-const instant = z.string().datetime({ offset: true });
+// zod 3's `.datetime({ offset: true })`, which zod 4 narrowed (seconds required, the offset only as ±hh:mm). Trips and entries
+// stored under zod 3 hold what it took: seconds optional, the offset as Z, ±hh:mm or ±hhmm. A real date, as zod 3 checked.
+export const instant = z.stringFormat("date-time", /^((\d\d[2468][048]|\d\d[13579][26]|\d\d0[48]|[02468][048]00|[13579][26]00)-02-29|\d{4}-((0[13578]|1[02])-(0[1-9]|[12]\d|3[01])|(0[469]|11)-(0[1-9]|[12]\d|30)|(02)-(0[1-9]|1\d|2[0-8])))T([01]\d|2[0-3]):[0-5]\d(:[0-5]\d(\.\d+)?)?(Z|([+-]\d{2}:?\d{2}))$/);
 const zone = z.string().max(80).refine(v => { try { new Intl.DateTimeFormat("en", { timeZone: v }); return true; } catch { return false; } });
 const url = z.string().url().max(2000).refine(v => { try { const u = new URL(v); return u.protocol === "https:" && !u.username && !u.password; } catch { return false; } }, "公開HTTPS URLのみ使用できます");
 // The page kinds, with the label's type as the argument: plain words, or ciphertext in a sealed trip (§3.1).
@@ -76,6 +82,36 @@ function rules<S extends SpecPlain & { timezone: string }, D extends { items: Ar
 export function validate(spec: unknown, document: unknown, createdAt: number) {
   return rules(specSchema.parse(spec), documentSchema.parse(document), createdAt);
 }
+export type Problem = { path: string; message: string };
+// The checks of a trip as a chat assistant wrote it, without publishing: validate()'s rules, so what passes here passes at
+// publication. Runs in the host and the browser (src/validate.ts adds the publication's hash). `input` is { spec, document }
+// or its JSON text. An item without a time is refused as publishing refuses it, except those named in `allowUntimed`: in a
+// revise, the items the trip already held without a time.
+export function checkTrip(input: unknown, now: number, options: { allowUntimed?: string[] } = {}): { ok: true; validated: ReturnType<typeof validate> } | { ok: false; errors: Problem[] } {
+  if (typeof input === "string") try { input = JSON.parse(input); } catch (e) { return { ok: false, errors: [{ path: "", message: `JSONとして読めません: ${(e as Error).message}` }] }; }
+  if (!input || typeof input !== "object" || Array.isArray(input)) return { ok: false, errors: [{ path: "", message: "{ spec, document } の形のJSONが必要です" }] };
+  const { spec, document } = input as Record<string, unknown>, errors: Problem[] = [];
+  for (const [name, schema, value] of [["spec", specSchema, spec], ["document", documentSchema, document]] as const) {
+    if (value === undefined) { errors.push({ path: name, message: "必須です" }); continue; }
+    const parsed = schema.safeParse(value, { reportInput: true });  // `problems` tells a missing choice from a wrong one
+    if (!parsed.success) errors.push(...problems(parsed.error, name));
+  }
+  if (errors.length) return { ok: false, errors };
+  try {
+    const validated = validate(spec, document, now), missing = untimed(validated.document, options.allowUntimed);
+    return missing.length ? { ok: false, errors: missing } : { ok: true, validated };
+  } catch (e) {
+    return { ok: false, errors: e instanceof ZodError ? problems(e, "") : [{ path: "", message: (e as Error).message }] };
+  }
+}
+// Zod's enum message quotes the rejected value; a generated file can hold something that should not be repeated in a log.
+export const problems = (error: ZodError, prefix: string): Problem[] => error.issues.map(i => ({
+  path: [prefix, ...i.path].filter(p => p !== "").join("."),
+  // zod 4 reports a literal as a one-value `invalid_value`, and a missing choice as a wrong one: only a choice of several,
+  // given, is an enum. A missing one reads as any missing field does.
+  message: i.code !== "invalid_value" || i.values.length < 2 ? i.message
+    : "input" in i && i.input === undefined ? "指定してください" : `次のいずれかを指定してください: ${i.values.join(" | ")}`,
+}));
 // A sealed trip as the host keeps it (docs/design/trip-e2e.md §3.1): the words are `v1.<generation>.` ciphertext under the
 // trip's key, the parts the host works with stay plain. Each limit is that of the longest plain text the field allows
 // (3 bytes a character, JSON's quotes), sealed. The host checks only the plain parts and the ciphertext's form; the words
@@ -87,8 +123,8 @@ export const sealedSpecSchema = z.object({
   locale: z.enum(["ja", "en"]), timezone: zone,
   trip: z.object({ startsOn: day, endsOn: day, destinations: cipher(CIPHER.destinations) }).strict(),
   modules: z.array(modulesOf(cipher(CIPHER.short))).min(1).max(12), navigation: z.array(identifier).min(1).max(12),
-  theme: specSchema.innerType().shape.theme, collaboration: specSchema.innerType().shape.collaboration,
-  lifecycle: specSchema.innerType().shape.lifecycle, exports: specSchema.innerType().shape.exports,
+  theme: specSchema.shape.theme, collaboration: specSchema.shape.collaboration,
+  lifecycle: specSchema.shape.lifecycle, exports: specSchema.shape.exports,
   presentation: z.object({
     kicker: cipher(CIPHER.short), postcardLabel: cipher(CIPHER.short), postcardCaption: cipher(CIPHER.short),
     dayHeadings: z.array(z.object({ day, title: cipher(CIPHER.short) }).strict()).max(180),
@@ -116,6 +152,10 @@ export type SealedItem = z.infer<typeof sealedItemSchema>;
 export function validateSealed(spec: unknown, document: unknown, createdAt: number) {
   return rules(sealedSpecSchema.parse(spec), sealedDocumentSchema.parse(document), createdAt);
 }
+// A footprint's position (#480): at most a kilometre off. The host checks it of a plain trip's footprint; of a sealed trip's,
+// the screen checks it before sealing and after opening (docs/design/trip-e2e.md §4).
+export const pointSchema = z.object({ lat: z.number().min(-90).max(90), lng: z.number().min(-180).max(180), accuracy: z.number().min(0).max(1000) }).strict();
+export type PlainPoint = z.infer<typeof pointSchema>;
 // What a member asks of the trip's document (PATCH document). The screen checks a plain one with this before sealing it (§4).
 export const author = z.string().trim().min(1).max(80);
 const body = z.string().trim().min(1).max(4000);

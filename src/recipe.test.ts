@@ -29,7 +29,7 @@ test("promoted belongs to suggestions only, as the recipe says", () => {
 });
 
 test("the recipe names every module kind, theme preset and export the schema accepts", () => {
-  const shape = specSchema.innerType().shape;
+  const shape = specSchema.shape;
   const words = [...shape.modules.element.options.map(o => o.shape.kind.value), ...shape.theme.shape.preset.options, ...shape.exports.element.options];
   expect(words.length).toBeGreaterThanOrEqual(7 + 4 + 4);
   expect(words.filter(w => !section("構造").includes(`\`${w}\``))).toEqual([]);

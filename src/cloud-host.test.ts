@@ -11,10 +11,10 @@ import { LocalD1 } from "./local-d1";
 import { validate, stateOf } from "./schema";
 import { fakeAuthenticator, testTrip } from "./test-fixture";
 import { recipe } from "./recipe";
-import { revisable } from "./revise";
+import { revisable, reviseTrip, undoTrip } from "./revise";
 import { emptyTrip } from "./template";
 import { b64 } from "./private-entries";
-import { confirmationCodes, matchesCommitment, sealTrip, sealSpec, openField, openTrip, sealOperation, newAttempt, newHandoffKeys, newSeatKeys, newTripKey, seatPublic, signEdge, unwrapSeatSecret, unwrapTripKey, verifyEdge, wrapSeatSecret, wrapTripKey } from "./trip-keys";
+import { confirmationCodes, matchesCommitment, openName, openPoint, sealName, sealPoint, sealTrip, sealMove, sealSpec, openField, openTrip, sealOperation, newAttempt, newHandoffKeys, newSeatKeys, newTripKey, seatPublic, signEdge, unwrapSeatSecret, unwrapTripKey, verifyEdge, wrapSeatSecret, wrapTripKey, acceptRekey, reachableSeats, resealAll, sealField, signRekey, signSuccession, type SeatKeys } from "./trip-keys";
 
 // Exercises actual SQLite statements through D1's asynchronous shape, without claiming remote D1 QA.
 
@@ -172,13 +172,14 @@ const key = "test-key-".repeat(8);
 let now = +new Date("2026-09-16T00:00:00Z");
 const dbs: LocalD1[] = [];
 afterEach(() => { dbs.splice(0).forEach(d => d.close()); now = +new Date("2026-09-16T00:00:00Z"); devices.clear(); });
-async function setup(path?: string) {
+async function setup(path?: string, env: { CAPSULE_SEALED_FROM?: string } = {}) {
   const db = new LocalD1(path); dbs.push(db);
-  const host = new CloudHost({ DB: db, CAPSULE_HMAC_KEY: key, CAPSULE_ORIGIN: origin }, () => now, async () => "test");
+  const host = new CloudHost({ DB: db, CAPSULE_HMAC_KEY: key, CAPSULE_ORIGIN: origin, ...env }, () => now, async () => "test");
   const seed = testTrip();
   const publish = async () => { const r = await host.fetch(new Request(origin + "/v1/publish", { method: "POST", headers: { Origin: origin, "Content-Type": "application/json" }, body: JSON.stringify({ ...seed, confirm: true }) })); expect(r.status).toBe(201); return await r.json() as { id: string; url: string; grantId: string }; };
   const created = await publish(), base = `/v1/c/${created.id}`;
-  const request = (path = "", method = "GET", body?: unknown, cookie?: string, revision = 1, source = origin) => host.fetch(new Request(origin + base + path, { method, headers: { Origin: source, "Content-Type": "application/json", "If-Match": `"${revision}"`, ...(cookie ? { Cookie: cookie } : {}) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) }));
+  // As the new screen sends them (ui=2, src/client.ts api()); an older screen's are sent with host.fetch directly.
+  const request = (path = "", method = "GET", body?: unknown, cookie?: string, revision = 1, source = origin) => host.fetch(new Request(origin + base + path + "?ui=2", { method, headers: { Origin: source, "Content-Type": "application/json", "If-Match": `"${revision}"`, ...(cookie ? { Cookie: cookie } : {}) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) }));
   const login = async (url: string) => { const secret = new URLSearchParams(new URL(url).hash.slice(1)).get("k"); const res = await request("/sessions", "POST", { secret }); expect(res.status).toBe(200); return res.headers.get("Set-Cookie")!.split(";")[0]!; };
   return { host, db, seed, created, publish, request, login };
 }
@@ -214,11 +215,11 @@ describe("a loopback origin for local development", () => {
     expect(secureSession.headers.get("Set-Cookie")).toContain("HttpOnly; Secure; SameSite=Strict"); expect(secureSession.headers.get("Strict-Transport-Security")).toBe("max-age=31536000");
     expect(secureSession.headers.get("Permissions-Policy")).toBe("camera=(), microphone=(), geolocation=(self)");
   });
-  test("CSP: images, scripts and connections come only from the host itself", async () => {
+  test("CSP: images and scripts come only from the host itself; connections also go to Anthropic, and nowhere else", async () => {
     // The footprint map's background (#563) comes from the same origin: MapLibre's worker is a file beside app.js and the
-    // map tiles are ranges of /map/*.pmtiles, so the policy needs nothing added (docs/design/footprint-basemap.md §2) and
-    // neither the host's pages nor CloudFront's (aws/template.yaml) name an outside origin.
-    const csp = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'";
+    // map tiles are ranges of /map/*.pmtiles, so the policy needs nothing added (docs/design/footprint-basemap.md §2).
+    // The one outside origin is Anthropic's API, which a sealed trip's browser calls with the member's own key (#692 回答 B).
+    const csp = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' https://api.anthropic.com; base-uri 'none'; frame-ancestors 'none'; form-action 'self'";
     // The page itself (src/main.ts passes it through secure(), as every answer of the host) and an answer of the API.
     expect(secure(new Response("<!doctype html>", { headers: { "Content-Type": "text/html" } }), local).headers.get("Content-Security-Policy")).toBe(csp);
     const t = await setup();
@@ -226,7 +227,7 @@ describe("a loopback origin for local development", () => {
     expect(readFileSync(join(import.meta.dir, "../aws/template.yaml"), "utf8")).toContain(`ContentSecurityPolicy: "${csp}"`);
     // Where the map could be pointed at a tile, font or image server: only the host itself (and inline data for images).
     const sources = (name: string) => csp.split(";").map(d => d.trim().split(" ")).find(([n]) => n === name)!.slice(1);
-    expect(sources("connect-src")).toEqual(["'self'"]);
+    expect(sources("connect-src")).toEqual(["'self'", "https://api.anthropic.com"]);
     expect(sources("img-src")).toEqual(["'self'", "data:"]);
     for (const name of ["script-src", "style-src", "default-src"]) expect(sources(name).every(s => s === "'self'" || s === "'none'")).toBe(true);
   });
@@ -417,7 +418,7 @@ describe("capability permissions and session boundaries", () => {
     expect((await t.request("/document", "PATCH", { type: "remove", list: "comments", id: question.id }, editor, 6)).status).toBe(200);
     expect((await doc()).comments).toEqual([]);
     expect((await t.request("/document", "PATCH", { type: "remove", list: "suggestions", id: market.id }, editor, 7)).status).toBe(200);
-    const after = await doc(), readme = exportFiles(t.created.id, t.seed.spec, after, "2026-09-16T00:00:00Z")["README.md"]!;
+    const after = await doc(), readme = (await exportFiles(t.created.id, t.seed.spec, after, "2026-09-16T00:00:00Z"))["README.md"]!;
     expect(after.suggestions.map((s: { body: string }) => s.body)).toEqual(["夜は星を見に行きたい"]);
     expect(readme).toContain("- 夜は星を見に行きたい (みどり)"); expect(readme).not.toContain("朝市");
     // A participant may post (participantSuggestions, participantComments) but not change or remove a post; a viewer changes nothing.
@@ -566,7 +567,7 @@ describe("lifecycle and deletion", () => {
     const login = async (role: string) => t.login((await (await t.request("/grants", "POST", { role, label: role, expiresAt: t.seed.spec.lifecycle.purgeAt, confirm: true }, owner)).json()).url);
     const others = { editor: await login("editor"), participant: await login("participant"), viewer: await login("viewer") };
     const { spec, document } = await (await t.request("", "GET", undefined, owner)).json();
-    const readme = exportFiles(t.created.id, spec, document, "2026-09-16T00:00:00Z")["README.md"];
+    const readme = (await exportFiles(t.created.id, spec, document, "2026-09-16T00:00:00Z"))["README.md"];
     expect(readme).toContain("# テスト旅行");
     for (const cookie of [owner, ...Object.values(others)]) {
       const r = await t.request("/export.md", "GET", undefined, cookie);
@@ -578,7 +579,7 @@ describe("lifecycle and deletion", () => {
     // The Spec's exports choose the ZIP's files, not the copy: a trip whose ZIP has no README.md still gives the text.
     expect((await t.request("/spec", "PATCH", { spec: { ...spec, exports: ["json"] }, confirm: true }, owner)).status).toBe(200);
     const edited = await (await t.request("", "GET", undefined, owner)).json();
-    expect(exportFiles(t.created.id, edited.spec, edited.document, "2026-09-16T00:00:00Z")["README.md"]).toBeUndefined();
+    expect((await exportFiles(t.created.id, edited.spec, edited.document, "2026-09-16T00:00:00Z"))["README.md"]).toBeUndefined();
     expect(await (await t.request("/export.md", "GET", undefined, others.viewer)).json()).toEqual({ text: tripMarkdown(edited.spec, edited.document) });
     expect((await t.request("/freeze", "POST", { confirm: true }, owner, edited.document.revision)).status).toBe(200);
     expect((await t.request("/export.md", "GET", undefined, owner)).status).toBe(200);
@@ -591,7 +592,7 @@ describe("lifecycle and deletion", () => {
     const login = async (role: string) => t.login((await (await t.request("/grants", "POST", { role, label: role, expiresAt: t.seed.spec.lifecycle.purgeAt, confirm: true }, owner)).json()).url);
     const others = { editor: await login("editor"), participant: await login("participant"), viewer: await login("viewer") };
     const { spec, document } = await (await t.request("", "GET", undefined, owner)).json();
-    const page = exportFiles(t.created.id, spec, document, "2026-09-16T00:00:00Z")["index.html"];
+    const page = (await exportFiles(t.created.id, spec, document, "2026-09-16T00:00:00Z"))["index.html"];
     expect(page).toContain("<h1>テスト旅行</h1>");
     for (const cookie of [owner, ...Object.values(others)]) {
       const r = await t.request("/export.html", "GET", undefined, cookie);
@@ -600,7 +601,7 @@ describe("lifecycle and deletion", () => {
     // The Spec's exports choose the ZIP's files, not the trip page: a trip whose ZIP has no index.html still gives it.
     expect((await t.request("/spec", "PATCH", { spec: { ...spec, exports: ["json"] }, confirm: true }, owner)).status).toBe(200);
     const edited = await (await t.request("", "GET", undefined, owner)).json();
-    expect(exportFiles(t.created.id, edited.spec, edited.document, "2026-09-16T00:00:00Z")["index.html"]).toBeUndefined();
+    expect((await exportFiles(t.created.id, edited.spec, edited.document, "2026-09-16T00:00:00Z"))["index.html"]).toBeUndefined();
     expect(await (await t.request("/export.html", "GET", undefined, others.viewer)).json()).toEqual({ text: tripHtml(edited.spec, edited.document) });
     expect((await t.request("/freeze", "POST", { confirm: true }, owner, edited.document.revision)).status).toBe(200);
     expect((await t.request("/export.html", "GET", undefined, owner)).status).toBe(200);
@@ -698,10 +699,10 @@ describe("spec and portable exports", () => {
     // The deadline must still land on a later date than the last day of the trip.
     expect(() => validate({ ...spec, lifecycle: { reflectionDays: 30, purgeAt: `${day(2)}T23:59:59Z` } }, document, now)).toThrow();
   });
-  test("snapshot exports are deterministic, escaped and have correct hashes and confirmed calendar events", () => {
+  test("snapshot exports are deterministic, escaped and have correct hashes and confirmed calendar events", async () => {
     const { spec, document } = testTrip(); document.notes = "<script>alert(1)</script>";
     document.reflections.push({ id: "r1", author: "a", body: "unselected memory", createdAt: "2026-09-27T00:00:00Z", included: false });
-    const a = exportFiles("id", spec, document, "2026-09-16T00:00:00Z"), b = exportFiles("id", spec, document, "2026-09-16T00:00:00Z");
+    const a = await exportFiles("id", spec, document, "2026-09-16T00:00:00Z"), b = await exportFiles("id", spec, document, "2026-09-16T00:00:00Z");
     expect(a).toEqual(b); expect(zip(a)).toEqual(zip(b));
     expect(a["index.html"]).not.toContain("<script>"); expect(a["index.html"]).toContain("&lt;script&gt;");
     expect(a["README.md"]).not.toContain("unselected memory"); expect(a["trip.json"]).toContain("unselected memory");
@@ -1629,6 +1630,53 @@ describe("signing out and idle sessions", () => {
     now = started + 29 * day + (expires - (started + 29 * day)) - 1; expect(now - (started + 29 * day)).toBeLessThan(idle);
     expect((await t.request("", "GET", undefined, daily)).status).toBe(200);
     now = expires; expect((await t.request("", "GET", undefined, daily)).status).toBe(410);
+  });
+  test("a revoked seat's 401 says the seat is gone; an idle cookie's does not", async () => {
+    const text = "この端末の登録は失効したか、期限が切れました";
+    const refusal = async (t: Awaited<ReturnType<typeof setup>>, cookie: string) => { const r = await t.request("", "GET", undefined, cookie); return [r.status, await r.json()]; };
+    const t = await setup(), owner = await stepUp(t.request, await t.login(t.created.url)); owners.set(t, owner);
+    const self = async (cookie: string) => (await (await t.request("", "GET", undefined, cookie)).json()).self.id as string;
+    // The owner revokes a member, rotates an invite, revokes an invite: each seat's cookie is told its seat is gone.
+    const revoked = await t.login((await invite(t)).url);
+    expect((await t.request("/revoke", "POST", { member: await self(revoked), confirm: true }, owner)).status).toBe(200);
+    const rotatedLink = await invite(t), rotated = await t.login(rotatedLink.url);
+    expect((await t.request("/grants", "POST", { role: "participant", label: "p", expiresAt: t.seed.spec.lifecycle.purgeAt, confirm: true, rotate: rotatedLink.grantId }, owner)).status).toBe(201);
+    const cutLink = await invite(t), cut = await t.login(cutLink.url);
+    expect((await t.request("/revoke", "POST", { id: cutLink.grantId, confirm: true }, owner)).status).toBe(200);
+    for (const cookie of [revoked, rotated, cut]) expect(await refusal(t, cookie)).toEqual([401, { error: text, seat: "gone" }]);
+    // A member whose passkey brought the seat back in another browser (however many times), and a kept copy of a signed-out
+    // cookie: the seat is still there, so the answer is the one an idle cookie gets. (A minute apart, for the limit on sign-ins.)
+    now += 60000; const moved = await t.login((await invite(t)).url), device = await register(t, moved);
+    for (let i = 1; i <= 6; i++) { now += 60000; device.setCounter(i); expect((await back(t, device)).status).toBe(200); }
+    const left = await t.login((await invite(t)).url); expect((await t.request("/signout", "POST", { confirm: true }, left)).status).toBe(200);
+    for (const cookie of [moved, left]) expect(await refusal(t, cookie)).toEqual([401, { error: text }]);
+    // A seat taken away before the host kept the gone seats' cookies is not known to be gone: its browser keeps its keys.
+    now += 60000; const earlier = await t.login((await invite(t)).url), seat = await self(earlier);
+    const row = t.db.db.query("SELECT key, payload FROM trip_capsules").get() as { key: string; payload: string }, c = JSON.parse(row.payload);
+    c.sessions = c.sessions.filter((s: { id: string }) => s.id !== seat); t.db.db.query("UPDATE trip_capsules SET payload = ? WHERE key = ?").run(JSON.stringify(c), row.key);
+    expect(await refusal(t, earlier)).toEqual([401, { error: text }]);
+    // An invite that ended takes its seat with it.
+    now += 60000; const short = await t.login((await (await t.request("/grants", "POST", { role: "participant", label: "p", expiresAt: new Date(now + 2 * day).toISOString(), confirm: true }, await stepUp(t.request, owner))).json()).url);
+    now += 3 * day; expect(await refusal(t, short)).toEqual([401, { error: text, seat: "gone" }]);
+    // Sharing ended: every seat but the owner's is gone.
+    const frozen = await t.login((await invite(t)).url);
+    expect((await t.request("/freeze", "POST", { confirm: true }, owner)).status).toBe(200);
+    expect(await refusal(t, frozen)).toEqual([401, { error: text, seat: "gone" }]);
+    // Thirty days unused: the owner's seat is still there, and its passkey brings it back.
+    now += idle; expect(await refusal(t, owner)).toEqual([401, { error: text }]);
+  });
+  test("the record of gone seats keeps the newest 1000", async () => {
+    const t = await setup(), owner = await stepUp(t.request, await t.login(t.created.url)); owners.set(t, owner);
+    const first = await t.login((await invite(t)).url), second = await t.login((await invite(t)).url);
+    const self = async (cookie: string) => (await (await t.request("", "GET", undefined, cookie)).json()).self.id as string;
+    expect((await t.request("/revoke", "POST", { member: await self(first), confirm: true }, owner)).status).toBe(200);
+    // 999 more seats gone since, then one more: the first falls off the end, and its browser is answered as an idle cookie is.
+    const row = t.db.db.query("SELECT key, payload FROM trip_capsules").get() as { key: string; payload: string }, c = JSON.parse(row.payload);
+    c.left = [...c.left, ...Array.from({ length: 999 }, (_, i) => String(i).padStart(64, "0"))]; t.db.db.query("UPDATE trip_capsules SET payload = ? WHERE key = ?").run(JSON.stringify(c), row.key);
+    expect((await t.request("/revoke", "POST", { member: await self(second), confirm: true }, owner)).status).toBe(200);
+    expect(stored(t).left).toHaveLength(1000);
+    expect((await (await t.request("", "GET", undefined, first)).json()).seat).toBeUndefined();
+    expect((await (await t.request("", "GET", undefined, second)).json()).seat).toBe("gone");
   });
   test("a session stored before idle expiry keeps working", async () => {
     const t = await setup(), member = await t.login((await invite(t)).url);
@@ -2861,7 +2909,7 @@ describe("the operator's list and terminate", () => {
     const listed = await t.list();
     expect(listed.map(c => c.id).sort()).toEqual([a.id, b.id].sort());
     for (const c of listed) {
-      expect(Object.keys(c).sort()).toEqual(["created", "grants", "id", "kind", "members", "purgeAt", "state", "updated"]);
+      expect(Object.keys(c).sort()).toEqual(["created", "grants", "id", "kind", "members", "mustSeal", "purgeAt", "sealed", "state", "updated"]);
       expect(c).toMatchObject({ kind: "trip", state: "active", purgeAt: testTrip().spec.lifecycle.purgeAt, grants: 1 });
     }
     expect(listed.find(c => c.id === a.id)!.members).toBe(1); expect(listed.find(c => c.id === b.id)!.members).toBe(0);
@@ -3211,7 +3259,7 @@ describe("assist", () => {
     expect(t.dispatched).toEqual([id]);
     expect(await (await t.send("/v1/assist/" + id)).json()).toEqual({ state: "running" });
     await t.host.runAssist(id);
-    expect(t.calls).toEqual([{ apiKey, model: "claude-test", text: "京都 2泊3日" }]);
+    expect(t.calls).toEqual([{ apiKey, model: "claude-test", text: "今日は 2026-09-16 です。\n\n京都 2泊3日" }]);
     const done = await (await t.send("/v1/assist/" + id)).json() as any;
     const pasted = await (await t.send("/v1/check", "POST", { text: JSON.stringify(testTrip()) })).json() as any;
     expect(done.state).toBe("done"); expect(done.result.ok).toBe(true); expect(done.result).toEqual(pasted);
@@ -3283,6 +3331,15 @@ describe("assist", () => {
     const { id } = await (await start(t)).json() as { id: string };
     await t.host.runAssist(id);
     expect(t.calls).toHaveLength(1);
+  });
+  test("a new trip is asked for with one answer and nobody to ask, and today's date first", async () => {
+    const t = assistHost(); await register(t);
+    let seen: { text: string; system?: string } = { text: "" };
+    t.host.env.ASSIST!.generate = async (_k, _m, text, system) => { seen = { text, system }; return { kind: "text", text: JSON.stringify(testTrip()) }; };
+    const { id } = await (await start(t, "福岡 1泊2日")).json() as { id: string };
+    await t.host.runAssist(id);
+    expect(seen.text.startsWith("今日は 2026-09-16 です。")).toBe(true); expect(seen.text).toContain("福岡 1泊2日");
+    expect(seen.system).toContain(recipe.text); expect(seen.system).toContain("質問や確認はせず"); expect(seen.system).toContain("予定（document.items）を具体的に"); expect(seen.system).toContain("今日以降のもの（その月が過ぎていれば来年のその月）");
   });
   test("two a minute and one at a time per creator", async () => {
     const t = assistHost(); await register(t);
@@ -3450,6 +3507,16 @@ describe("revising on the host with a member's own API key", () => {
     const done = await (await t.request(`/revise/assist/${id}`, "GET", undefined, t.editor)).json() as { state: string; result: { ok: boolean; text: string } };
     expect(done.state).toBe("done"); expect(done.result.text).toBe(answer);
   });
+  test("a revision is told it answers once without asking, and has today's date first", async () => {
+    const t = await room(); await t.put(t.editor, editorKey);
+    let seen: { text: string; system?: string } = { text: "" };
+    t.host.env.ASSIST!.generate = async (_k, _m, text, system) => { seen = { text, system }; return { kind: "text", text: answer }; };
+    const { id } = await (await t.request("/revise/assist", "POST", { instruction: "夕食を18:30に" }, t.editor)).json() as { id: string };
+    await t.host.runAssist(id);
+    expect(seen.text.startsWith("今日は 2026-09-16 です。")).toBe(true); expect(seen.text).toContain("夕食を18:30に");
+    expect(seen.system).toContain("質問や確認はせず"); expect(seen.system).toContain("今の旅程の日付の中に収める");
+    expect(seen.system).not.toContain("今日以降のもの");  // a revision keeps to the trip's own dates
+  });
   test("a finished job keeps neither the wish nor the sealed key", async () => {
     const t = await room();
     await t.put(t.editor, editorKey);
@@ -3467,6 +3534,13 @@ describe("revising on the host with a member's own API key", () => {
   });
 });
 
+// The names a seal brings with the trip (src/trip-keys.ts sealMove): every footprint, member and invite, read as the owner's
+// browser reads them just before (docs/design/trip-e2e.md §5).
+async function moveNames(t: Awaited<ReturnType<typeof setup>>, trip: CryptoKey, owner: string) {
+  const view = await (await t.request("", "GET", undefined, owner)).json(), grants = await (await t.request("/grants", "GET", undefined, owner)).json();
+  const { footprints, members, grants: named } = await sealMove(trip, t.created.id, 1, { spec: view.spec, document: view.document, previous: null, footprints: view.footprints, grants });
+  return { footprints, members, grants: named };
+}
 describe("sealed trip", () => {
   // As the owner's browser does it (src/trip-keys.ts): a trip key put on its seat (PATCH keys), the trip it reads sealed under
   // that key, then POST seal. Before sealing, the plan gets words of every kind, so a leak shows in the stored payload.
@@ -3482,11 +3556,12 @@ describe("sealed trip", () => {
     expect((await t.request("/document", "PATCH", { type: "budget", budget: [{ id: "b1", title: "宿代", amount: 98765, description: "" }] }, owner, 3)).status).toBe(200);
     const view = await (await t.request("", "GET", undefined, owner)).json();
     const sealed = await sealTrip(trip, t.created.id, 1, { spec: view.spec, document: view.document });
-    const seal = (body: object = {}, cookie = owner, revision: number = view.document.revision) => t.request("/seal", "POST", { generation: 1, ...sealed, confirm: true, ...body }, cookie, revision);
+    const seal = async (body: object = {}, cookie = owner, revision: number = view.document.revision) => t.request("/seal", "POST", { generation: 1, ...sealed, ...await moveNames(t, trip, owner), confirm: true, ...body }, cookie, revision);
     const stored = () => JSON.parse((t.db.db.query("SELECT payload FROM trip_capsules WHERE payload IS NOT NULL").get() as { payload: string }).payload);
     return { ...t, owner, trip, view, sealed, seal, stored };
   }
-  const invite = async (t: Awaited<ReturnType<typeof setup>>, owner: string, role = "participant") => t.login((await (await t.request("/grants", "POST", { role, label: "p", expiresAt: t.seed.spec.lifecycle.purgeAt, confirm: true }, owner)).json()).url);
+  // A sealed trip's invite is named by the host (招待リンク) and carries the id the browser chose (#693).
+  const invite = async (t: Awaited<ReturnType<typeof setup>>, owner: string, role = "participant") => t.login((await (await t.request("/grants", "POST", { role, ...(await (await t.request("", "GET", undefined, owner)).json()).sealed ? { id: crypto.randomUUID().replaceAll("-", "") } : {}, expiresAt: t.seed.spec.lifecycle.purgeAt, confirm: true }, owner)).json()).url);
 
   test("the owner's seal leaves only ciphertext of the words in the stored payload, and no plain previous", async () => {
     const t = await sealable();
@@ -3551,17 +3626,21 @@ describe("sealed trip", () => {
     const css = await (await t.request("/theme.css", "GET", undefined, t.owner)).text(), listed = await list();
     expect((await t.seal()).status).toBe(200);
     expect(await (await t.request("/theme.css", "GET", undefined, t.owner)).text()).toBe(css);
-    const strip = (l: Array<Record<string, unknown>>) => l.map(({ updated: _updated, ...rest }) => rest);
+    // Only whether it is sealed changes (#694).
+    const strip = (l: Array<Record<string, unknown>>) => l.map(({ updated: _updated, sealed: _sealed, ...rest }) => rest);
     expect(strip(await list())).toEqual(strip(listed));
+    expect([listed[0]!.sealed, (await list())[0]!.sealed]).toEqual([false, true]);
   });
-  test("export, revise and undo are 409 in a sealed trip; purge does not compare the title", async () => {
+  test("export and the host's revise text, check and assist are 409 in a sealed trip, with no plain word; purge does not compare the title", async () => {
     const t = await sealable(); expect((await t.seal()).status).toBe(200);
     const revision = t.view.document.revision + 1;
-    for (const [path, method, body] of [["/export", "GET"], ["/export.md", "GET"], ["/export.html", "GET"], ["/revise", "GET"], ["/undo", "GET"], ["/revise", "POST", { text: "{}", confirm: true }], ["/revise/check", "POST", { text: "{}" }], ["/revise/assist", "POST", { instruction: "" }], ["/undo", "POST", { confirm: true }], ["/document", "PATCH", { type: "suggest", author: "A", body: "朝市" }]] as Array<[string, string, object?]>) {
-      const r = await t.request(path, method, body, t.owner, revision);
-      // A plain operation is not the sealed form PATCH document takes now (400); the rest is 409.
-      if (path === "/document") { expect(r.status).toBe(400); continue; }
-      expect(r.status).toBe(409); expect((await r.json()).error).toBe("暗号化した旅行では、まだ使えません");
+    for (const [path, method, body] of [["/export", "GET"], ["/export.md", "GET"], ["/export.html", "GET"], ["/revise", "GET"], ["/revise/check", "POST", { text: "{}" }], ["/revise/assist", "POST", { instruction: "" }], ["/revise", "POST", { text: "{}", confirm: true }], ["/undo", "POST", { confirm: true }], ["/document", "PATCH", { type: "suggest", author: "A", body: "朝市" }]] as Array<[string, string, object?]>) {
+      const r = await t.request(path, method, body, t.owner, revision), text = await r.text();
+      for (const w of words) expect(text).not.toContain(w);
+      // A plain operation or a pasted text is not the sealed form these take now (400), and there is no step to go back to (404); the rest is 409.
+      if (path === "/undo") { expect(r.status).toBe(404); continue; }
+      if (["/document", "/revise"].includes(path) && method !== "GET") { expect(r.status).toBe(400); continue; }
+      expect(r.status).toBe(409); expect(JSON.parse(text).error).toBe("暗号化した旅行では、まだ使えません");
     }
     expect((await t.request("/purge", "POST", { title: "どんな題でも" }, t.owner, revision)).status).toBe(200);
     expect((await t.request("", "GET", undefined, t.owner)).status).toBe(410);
@@ -3579,6 +3658,129 @@ describe("sealed trip", () => {
     const raw = async (body: object, cookie = t.owner) => t.request("/document", "PATCH", body, cookie, (await read()).v.document.revision);
     return { ...t, read, send, raw };
   }
+  // What the screen sends to revise or go back (docs/design/trip-e2e.md §4): the next trip reviseTrip / undoTrip made from the
+  // opened one, sealed, with the memories and the kept posts' seats as the host keeps them. `spec`: ciphertext kept as it is.
+  type Sealed = Awaited<ReturnType<typeof sealedTrip>>;
+  const sealedNext = async (t: Sealed, v: { spec: object; document: Record<string, Array<{ id: string; seat?: string }>> }, next: { spec: Parameters<typeof sealTrip>[3]["spec"]; document: Parameters<typeof sealTrip>[3]["document"] }, spec?: object, step?: Record<string, Array<{ id: string; seat?: string }>>) => {
+    const s = await sealTrip(t.trip, t.created.id, 1, next);
+    const seat = (list: string) => (p: { id: string }) => { const old = [...v.document[list]!, ...step?.[list] ?? []].find(o => o.id === p.id); return old?.seat !== undefined ? { ...p, seat: old.seat } : p; };
+    return { spec: spec ?? s.spec, document: { ...s.document, reflections: v.document.reflections, suggestions: s.document.suggestions.map(seat("suggestions")), comments: s.document.comments.map(seat("comments")) }, confirm: true };
+  };
+  const revised = async (t: Sealed, edit: (trip: ReturnType<typeof revisable>) => void, keepSpec = false) => {
+    const { v, plain } = await t.read(), trip = structuredClone(revisable(plain.spec, plain.document)); edit(trip);
+    const r = reviseTrip(plain, JSON.stringify(trip), { author: "オーナー", at: new Date(now).toISOString(), created: t.stored().created, now, keepSpec });
+    if (!r.ok) throw new Error(JSON.stringify(r));
+    return { v, plain, next: r.next, body: await sealedNext(t, v, r.next, keepSpec ? v.spec : undefined) };
+  };
+  test("revise and undo: the browser's sealed next trip is kept; the host checks roles, plain parts and the ciphertext that must stay", async () => {
+    const t = await sealedTrip(), editor = await invite(t, t.owner, "editor"), member = await invite(t, t.owner), viewer = await invite(t, t.owner, "viewer");
+    expect((await t.send({ type: "reflect", author: "参加者", body: "楽しかった" }, member)).status).toBe(200);
+    expect((await t.send({ type: "suggest", author: "参加者", body: "温泉" }, member)).status).toBe(200);
+    expect((await t.request("/undo", "GET", undefined, t.owner)).status).toBe(404);
+    // (a) The owner's revise: an item's title, a 準備 line and a 候補 change; nothing plain is kept, and the step back is the trip as it was.
+    const a = await revised(t, trip => { trip.document.items[0]!.title = "新しい集合"; trip.document.checklist.push({ id: "c-new", title: "傘を持つ", done: false }); trip.document.suggestions.push({ id: "s-new", body: "夜市に寄る", promoted: false }); });
+    for (const cookie of [member, viewer]) expect((await t.request("/revise", "POST", a.body, cookie, a.v.document.revision)).status).toBe(403);
+    expect((await t.request("/revise", "POST", a.body, t.owner, a.v.document.revision - 1)).status).toBe(409);
+    // A new post's time is the host's, whatever the browser wrote.
+    a.body.document.suggestions = a.body.document.suggestions.map(p => p.id === "s-new" ? { ...p, createdAt: "2020-01-01T00:00:00Z" } : p);
+    const r = await t.request("/revise", "POST", a.body, t.owner, a.v.document.revision); expect(r.status).toBe(200); expect(await r.json()).toEqual({ revision: a.v.document.revision + 1 });
+    const kept = t.stored(), text = JSON.stringify(kept);
+    for (const w of [...words, "新しい集合", "傘を持つ", "夜市に寄る", "温泉", "楽しかった"]) expect(text).not.toContain(w);
+    const { items, checklist, notes, budget, suggestions, comments } = a.v.document;
+    expect(kept.previous).toEqual({ spec: a.v.spec, document: { items, checklist, notes, budget, suggestions, comments }, revisedIds: { suggestions: a.next.document.suggestions.map(p => p.id), comments: a.next.document.comments.map(p => p.id) } });
+    const after = (await t.read()).plain;
+    expect(after.document.items[0]!.title).toBe("新しい集合"); expect(after.document.checklist.map(c => c.title)).toContain("傘を持つ");
+    const self = kept.sessions.find((s: { grantId: string }) => kept.grants.find((g: { id: string; role: string }) => g.id === s.grantId)?.role === "owner").id;
+    expect(kept.document.suggestions.find((p: { id: string }) => p.id === "s-new").seat).toBe(self);
+    expect(kept.document.suggestions.find((p: { seat?: string }) => p.seat && p.seat !== self)).toBeDefined();
+    // (b) An editor's revise keeps the Spec as it is kept, ciphertext and plain parts both.
+    const b = await revised(t, trip => { trip.document.items[1]!.title = "編集者の夕食"; }, true);
+    const retitled = { ...b.body.spec as object, title: (await sealSpec(t.trip, t.created.id, 1, { ...b.plain.spec, title: "別の題" })).title };
+    const later = { ...b.v.spec, trip: { ...(b.v.spec as { trip: object }).trip, endsOn: "2026-09-27" } };
+    for (const spec of [retitled, later]) { const refused = await t.request("/revise", "POST", { ...b.body, spec }, editor, b.v.document.revision); expect(refused.status).toBe(403); expect((await refused.json()).error).toBe("設定はオーナーだけが変えられます"); }
+    expect((await t.request("/revise", "POST", b.body, editor, b.v.document.revision)).status).toBe(200);
+    // A revise that moves the deadline is an important action: past the passkey check's five minutes it is 428.
+    now += 6 * 60_000;
+    const moves = await revised(t, trip => { trip.spec.lifecycle.purgeAt = "2026-10-20T00:00:00+09:00"; });
+    expect((await t.request("/revise", "POST", moves.body, t.owner, moves.v.document.revision)).status).toBe(428);
+    // (d) Memories are not revised; a post kept keeps its seat and time.
+    const d = await revised(t, () => {});
+    expect((await t.request("/revise", "POST", { ...d.body, document: { ...d.body.document, reflections: [] } }, t.owner, d.v.document.revision)).status).toBe(400);
+    const moved = (d.body.document.suggestions as Array<{ id: string; seat?: string }>).map(p => p.seat ? { ...p, seat: "someone-else" } : p);
+    expect((await t.request("/revise", "POST", { ...d.body, document: { ...d.body.document, suggestions: moved } }, t.owner, d.v.document.revision)).status).toBe(400);
+    const plainTitle = { ...d.body.document, notes: "平文のメモ" };
+    expect((await t.request("/revise", "POST", { ...d.body, document: plainTitle }, t.owner, d.v.document.revision)).status).toBe(400);
+    // (e) The step back is handed out sealed; going back sends the step's own Spec.
+    const shown = await (await t.request("/undo", "GET", undefined, editor)).json(), view = (await t.read()).v;
+    expect(shown).toEqual({ previous: t.stored().previous, revision: view.document.revision });
+    for (const cookie of [member, viewer]) expect((await t.request("/undo", "GET", undefined, cookie)).status).toBe(403);
+    const back = async () => {
+      const { v, plain } = await t.read(), p = (await t.request("/undo", "GET", undefined, t.owner).then(r => r.json())).previous;
+      const opened = (await openTrip(t.trip, t.created.id, { spec: p.spec, document: { ...v.document, ...p.document } }))!;
+      const { items, checklist, notes, budget, suggestions, comments } = opened.document;
+      const u = undoTrip(plain, { spec: opened.spec, document: { items, checklist, notes, budget, suggestions, comments }, revisedIds: p.revisedIds }, { created: t.stored().created, keepSpec: false });
+      if (!u.ok) throw new Error(u.reason);
+      return { v, p, body: await sealedNext(t, v, u.next, p.spec, p.document) };
+    };
+    let u = await back();
+    for (const cookie of [member, viewer]) expect((await t.request("/undo", "POST", u.body, cookie, u.v.document.revision)).status).toBe(403);
+    const wrong = await t.request("/undo", "POST", { ...u.body, spec: retitled }, t.owner, u.v.document.revision); expect(wrong.status).toBe(400); expect((await wrong.json()).error).toBe("1 つ前の旅程に戻せません");
+    // The owner changes the settings after the revise: the step back would change them again, which an editor may not.
+    const respec = { ...u.v.spec, theme: { ...(u.v.spec as { theme: object }).theme, accent: "#123456" } };
+    await stepUp(t.request, t.owner);
+    expect((await t.request("/spec", "PATCH", { spec: respec, confirm: true }, t.owner, u.v.document.revision)).status).toBe(200);
+    u = await back();
+    const refused = await t.request("/undo", "POST", u.body, editor, u.v.document.revision); expect(refused.status).toBe(403); expect((await refused.json()).error).toBe("設定も戻るため、オーナーだけが戻せます");
+    expect((await t.request("/undo", "POST", u.body, t.owner, u.v.document.revision)).status).toBe(200);
+    expect(t.stored().previous).toBeUndefined();
+    expect((await t.read()).plain.document.items[1]!.title).toBe("夕食");
+    expect((await t.request("/undo", "GET", undefined, t.owner)).status).toBe(404);
+    // A participant's post the revise dropped comes back with its seat and time; the new one got the time of the revise.
+    const own = t.stored().document.suggestions.find((p: { seat?: string }) => p.seat && p.seat !== self);
+    expect(t.stored().document.suggestions.find((p: { id: string }) => p.id === "s-new").createdAt).toBe("2026-09-16T00:00:00.000Z");
+    const g = await revised(t, trip => { trip.document.suggestions = trip.document.suggestions.filter(p => p.id !== own.id); });
+    expect((await t.request("/revise", "POST", g.body, t.owner, g.v.document.revision)).status).toBe(200);
+    expect(t.stored().document.suggestions.some((p: { id: string }) => p.id === own.id)).toBe(false);
+    u = await back();
+    expect((await t.request("/undo", "POST", u.body, t.owner, u.v.document.revision)).status).toBe(200);
+    expect(t.stored().document.suggestions.find((p: { id: string }) => p.id === own.id)).toMatchObject({ id: own.id, seat: own.seat, createdAt: own.createdAt });
+    // (c) Once sharing has ended, nothing is revised or undone.
+    const f = await revised(t, trip => { trip.document.notes = "終わった後"; });
+    expect((await t.request("/revise", "POST", f.body, t.owner, f.v.document.revision)).status).toBe(200);
+    u = await back();
+    expect((await t.request("/freeze", "POST", { confirm: true }, t.owner, u.v.document.revision)).status).toBe(200);
+    expect((await t.request("/revise", "POST", f.body, t.owner, u.v.document.revision + 1)).status).toBe(403);
+    expect((await t.request("/undo", "POST", u.body, t.owner, u.v.document.revision + 1)).status).toBe(403);
+  });
+  test("assist key: a sealed trip keeps only the key its browser wrapped; the host's sealed keys go at the seal", async () => {
+    const t = await sealable(), editor = await invite(t, t.owner, "editor"), member = await invite(t, t.owner), checked: string[] = [];
+    t.host.env.VERIFY_KEY = async k => { checked.push(k); return true; };
+    const key = "sk-ant-" + "k".repeat(40), wrapped = `v1.${b64(crypto.getRandomValues(new Uint8Array(60)))}`;
+    // (e) Before the seal the host's key works as before, and is gone once the trip is sealed (a).
+    expect((await t.request("/key", "PUT", { key }, editor)).status).toBe(204); expect(checked).toEqual([key]);
+    expect(t.stored().sessions.some((s: { assistKey?: string }) => s.assistKey)).toBe(true);
+    expect((await t.seal()).status).toBe(200);
+    expect(t.stored().sessions.some((s: { assistKey?: string }) => s.assistKey)).toBe(false);
+    // (b) The wrapped key is kept and handed back to its seat with the model; the key itself is refused and not sent to Anthropic.
+    expect((await t.request("/key", "PUT", { wrapped }, t.owner)).status).toBe(204);
+    const view = await (await t.request("", "GET", undefined, t.owner)).json();
+    expect(view).toMatchObject({ assistKey: true, assistWrapped: wrapped, assistModel: "claude-haiku-5-5" });
+    // The trip's creation time and the seat's own name, which the browser's revise checks against and writes on a new post (#786).
+    expect(view).toMatchObject({ created: t.stored().created }); expect(typeof view.created).toBe("number");
+    expect(await openName(t.trip, t.created.id, "member", view.self.id, view.label)).toBe("オーナー");  // sealed by the move (sealMove)
+    expect(await (await t.request("", "GET", undefined, editor)).json()).toMatchObject({ assistKey: false, assistWrapped: null });
+    for (const body of [{ key }, { wrapped: key }, { wrapped, key }, { wrapped: "v2.abc" }]) expect((await t.request("/key", "PUT", body, editor)).status).toBe(400);
+    expect(checked).toEqual([key]);
+    expect(JSON.stringify(t.stored())).not.toContain("sk-ant-");
+    // (c) The members' list does not carry it. (d) A participant may not put one; deleting takes both kinds away.
+    const members = await (await t.request("/grants", "GET", undefined, t.owner)).text(); expect(members).not.toContain("assistWrapped"); expect(members).not.toContain(wrapped);
+    expect((await t.request("/key", "PUT", { wrapped }, member)).status).toBe(403);
+    expect((await t.request("/key", "DELETE", {}, t.owner)).status).toBe(204);
+    expect(await (await t.request("", "GET", undefined, t.owner)).json()).toMatchObject({ assistKey: false, assistWrapped: null });
+    // A plain trip still answers without the sealed fields.
+    const plain = await setup(), owner = await plain.login(plain.created.url), seen = await (await plain.request("", "GET", undefined, owner)).json();
+    expect(seen.assistKey).toBe(false); expect("assistWrapped" in seen).toBe(false); expect("assistModel" in seen).toBe(false);
+  });
   test("役割: a participant may post, and check when allowed, but not touch the plan; a viewer and a frozen trip read only", async () => {
     const t = await sealedTrip(), member = await invite(t, t.owner), viewer = await invite(t, t.owner, "viewer");
     const { plain } = await t.read(), day = plain.document.items[0]!.day;
@@ -3644,3 +3846,602 @@ describe("sealed trip", () => {
     expect(t.stored().document.items.find((i: { id: string }) => i.id === "x1").sealed).toMatch(/^v1\.1\./);
   });
 });
+
+describe("sealed footprints and names", () => {
+  // A trip sealed by its owner's browser (as in "sealed trip"), whose points, names and history lines are then written as the
+  // browser does with the trip's key (src/trip-keys.ts). Names and the point are chosen to be found in the stored payload.
+  type Setup = Awaited<ReturnType<typeof setup>>;
+  const during = +new Date("2026-09-25T01:00:00Z"), here = { lat: 35.6812, lng: 139.7671, accuracy: 20 };
+  const gid = () => crypto.randomUUID().replaceAll("-", "");
+  async function sealedTrip() {
+    const t = await setup(), owner = await stepUp(t.request, await t.login(t.created.url));
+    const seat = await newSeatKeys(), pub = await seatPublic(seat), trip = await newTripKey(), wrap = await wrapTripKey(trip, pub.x25519, t.created.id, 1);
+    expect((await t.request("/keys", "PATCH", { type: "seat", ...pub, ephemeral: wrap.ephemeral, generation: 1, wrapped: wrap.wrapped }, owner)).status).toBe(200);
+    const view = await (await t.request("", "GET", undefined, owner)).json();
+    expect((await t.request("/seal", "POST", { generation: 1, ...await sealTrip(trip, t.created.id, 1, { spec: view.spec, document: view.document }), ...await moveNames(t, trip, owner), confirm: true }, owner, view.document.revision)).status).toBe(200);
+    const name = (kind: "member" | "grant" | "footprint", id: string, n: string) => sealName(trip, t.created.id, 1, kind, id, n);
+    const issue = async (role: string, label?: string, body: object = {}) => {
+      const id = gid(), r = await t.request("/grants", "POST", { role, id, ...(label ? { label: await name("grant", id, label) } : {}), expiresAt: t.seed.spec.lifecycle.purgeAt, confirm: true, ...body }, owner);
+      expect(r.status).toBe(201); return { id, ...await r.json() as { url: string; grantId: string } };
+    };
+    const join = async (role: string, label: string) => { const g = await issue(role, label); return { grant: g.id, cookie: await t.login(g.url) }; };
+    const m = { editor: await join("editor", "編集の招待"), participant: await join("participant", "参加の招待"), other: await join("participant", "別の招待"), viewer: await join("viewer", "閲覧の招待") };
+    const stored = () => JSON.parse((t.db.db.query("SELECT payload FROM trip_capsules WHERE payload IS NOT NULL").get() as { payload: string }).payload);
+    const self = async (cookie: string) => (await (await t.request("", "GET", undefined, cookie)).json()).self as { id: string; label: string };
+    const add = async (cookie: string, point: object = here, extra: object = {}) => {
+      const id = gid(), me = await self(cookie);
+      return t.request("/footprints", "PATCH", { type: "add", id, point: await sealPoint(trip, t.created.id, 1, id, point as typeof here), by: await name("footprint", id, `名前-${me.id.slice(0, 6)}`), ...extra }, cookie);
+    };
+    return { ...t, owner, trip, name, issue, m, stored, self, add };
+  }
+  const error = async (r: Response) => [r.status, (await r.json()).error];
+
+  test("足あと: a sealed point and name are kept as ciphertext and open back; the roles, dates and removal hold", async () => {
+    const t = await sealedTrip(), { m } = t;
+    now = during;
+    const r = await t.add(m.participant.cookie); expect(r.status).toBe(200);
+    const list = (await r.json()).footprints;
+    expect(list).toHaveLength(1); expect(list[0]).not.toHaveProperty("lat"); expect(list[0]).not.toHaveProperty("seat");
+    expect(await openPoint(t.trip, t.created.id, list[0].id, list[0].point)).toEqual(here);
+    const me = await t.self(m.participant.cookie);
+    expect(await openName(t.trip, t.created.id, "footprint", list[0].id, list[0].by)).toBe(`名前-${me.id.slice(0, 6)}`);
+    const text = JSON.stringify(t.stored());
+    expect(text).not.toContain("35.6812"); expect(text).not.toContain("139.7671"); expect(text).not.toContain(`名前-${me.id.slice(0, 6)}`);
+    // Every role reads it; whose it is, only as whether it is one's own.
+    for (const cookie of [t.owner, m.viewer.cookie]) expect((await (await t.request("", "GET", undefined, cookie)).json()).footprints.map((p: { mine: boolean }) => p.mine)).toEqual([false]);
+    expect(await error(await t.add(m.viewer.cookie))).toEqual([403, "閲覧者は足あとを残せません"]);
+    // The plain form, a ciphertext without its generation and an id already taken are refused.
+    expect((await t.request("/footprints", "PATCH", { type: "add", ...here }, m.other.cookie)).status).toBe(400);
+    const id = gid(), point = await sealPoint(t.trip, t.created.id, 1, id, here), by = await t.name("footprint", id, "x");
+    expect((await t.request("/footprints", "PATCH", { type: "add", id, point: point.replace(/^v1\.1\./, "v1."), by }, m.other.cookie)).status).toBe(400);
+    expect(await error(await t.request("/footprints", "PATCH", { type: "add", id: list[0].id, point, by }, m.other.cookie))).toEqual([400, "足あとを確認してください"]);
+    // Removal: the seat itself, the owner and an editor; another participant cannot.
+    now += 60000; const own = (await (await t.add(m.other.cookie)).json()).footprints.at(-1).id;
+    expect(await error(await t.request("/footprints", "PATCH", { type: "remove", id: own }, m.participant.cookie))).toEqual([403, "自分の足あとだけ消せます"]);
+    expect((await t.request("/footprints", "PATCH", { type: "remove", id: own }, m.other.cookie)).status).toBe(200);
+    expect((await t.request("/footprints", "PATCH", { type: "remove", id: list[0].id }, m.editor.cookie)).status).toBe(200);
+    // Outside the trip, and once sharing has ended.
+    now = +new Date("2026-09-23T14:00:00Z"); expect(await error(await t.add(m.other.cookie))).toEqual([403, "足あとは旅行期間中だけ残せます"]);
+    now = during + 3600000; expect((await t.request("/freeze", "POST", { confirm: true }, await stepUp(t.request, t.owner), t.stored().document.revision)).status).toBe(200);
+    expect(await error(await t.add(t.owner))).toEqual([403, "足あとは旅行期間中だけ残せます"]);
+  });
+  test("件数と時刻: once a minute per seat and a thousand per trip, by the plain seat and time alone", async () => {
+    const t = await sealedTrip(), { m } = t;
+    now = during;
+    expect((await t.add(m.participant.cookie, here, { auto: true })).status).toBe(200);
+    now += 59999; expect(await error(await t.add(m.participant.cookie))).toEqual([429, "足あとは1分に1回までです"]);
+    expect((await t.add(m.other.cookie)).status).toBe(200);
+    now += 1; expect((await t.add(m.participant.cookie)).status).toBe(200);
+    const kept = t.stored().footprints;
+    expect(kept.map((p: { auto?: true }) => Boolean(p.auto))).toEqual([true, false, false]);
+    for (const p of kept) { expect(Object.keys(p).sort()).toEqual(["at", "by", "id", "point", "seat", ...p.auto ? ["auto"] : []].sort()); expect(p.point).toMatch(/^v1\.1\./); }
+    // The thousandth is taken, the next refused, whatever the stored points hold.
+    const row = (await t.host.store.get(t.host.digest(t.created.id)))!, c = JSON.parse(row.payload!);
+    c.footprints = [...c.footprints, ...Array.from({ length: 996 }, (_, i) => ({ id: `f${i}`, seat: "gone", by: "v1.1.x", at: "2026-09-25T00:00:00.000Z", point: "v1.1.x" }))];
+    expect(await t.host.store.save(row, JSON.stringify(c), row.purge_at, now)).toBe(true);
+    now += 60000; expect((await t.add(m.editor.cookie)).status).toBe(200);
+    now += 60000; expect(await error(await t.add(t.owner))).toEqual([400, "足あとは1旅行1000件までです"]);
+  });
+  test("名前: members and invites are named in ciphertext or with the host's own names; GET gives the seat itself", async () => {
+    const t = await sealedTrip(), { m } = t;
+    const grants = async () => await (await t.request("/grants", "GET", undefined, t.owner)).json() as Array<{ id: string; label: string; members: Array<{ id: string; label: string }> }>;
+    const seat = (await grants()).find(g => g.id === m.participant.grant)!.members[0]!;
+    expect(seat.label).toMatch(/^メンバー\d+$/);  // the host's default name, until the owner's browser seals it
+    expect(await t.self(m.participant.cookie)).toEqual({ id: seat.id, label: seat.label });
+    expect((await t.request("/members", "PATCH", { id: seat.id, label: "花子" }, t.owner)).status).toBe(400);
+    expect((await t.request("/members", "PATCH", { id: seat.id, label: await t.name("member", seat.id, "花子") }, t.owner)).status).toBe(200);
+    const renamed = (await grants()).find(g => g.id === m.participant.grant)!.members[0]!;
+    expect(await openName(t.trip, t.created.id, "member", seat.id, renamed.label)).toBe("花子");
+    expect(await openName(t.trip, t.created.id, "member", seat.id, (await t.self(m.participant.cookie)).label)).toBe("花子");
+    // An invite: a plain name, no id, or an id taken are refused; a sealed name or none (招待リンク) is kept.
+    const body = { role: "viewer", expiresAt: t.seed.spec.lifecycle.purgeAt, confirm: true };
+    const id = gid();
+    expect((await t.request("/grants", "POST", { ...body, id, label: "家族" }, t.owner)).status).toBe(400);
+    expect((await t.request("/grants", "POST", { ...body, label: await t.name("grant", id, "家族") }, t.owner)).status).toBe(400);
+    expect((await t.request("/grants", "POST", { ...body, id: "short" }, t.owner)).status).toBe(400);
+    expect(await error(await t.request("/grants", "POST", { ...body, id: m.viewer.grant }, t.owner))).toEqual([400, "招待を確認してください"]);
+    const named = await t.issue("viewer", "家族"), plain = await t.issue("viewer"), own = await t.issue("viewer", undefined, { label: "自分用" });
+    expect(named.grantId).toBe(named.id);
+    const list = await grants();
+    expect(await openName(t.trip, t.created.id, "grant", named.id, list.find(g => g.id === named.id)!.label)).toBe("家族");
+    expect(list.find(g => g.id === plain.id)!.label).toBe("招待リンク"); expect(list.find(g => g.id === own.id)!.label).toBe("自分用");
+    const text = JSON.stringify(t.stored());
+    for (const w of ["花子", "家族", "編集の招待", "参加の招待"]) expect(text).not.toContain(w);
+  });
+  test("履歴: lines hold the invite's and the seats' ids, not their names; the publisher's stays", async () => {
+    const t = await sealedTrip(), { m } = t, owner = await stepUp(t.request, t.owner), ownerSeat = await t.self(owner);
+    const g = await t.issue("participant", "履歴の招待"), joined = await t.login(g.url), seat = await t.self(joined);
+    const rotated = gid();
+    expect((await t.request("/grants", "POST", { role: "participant", id: rotated, label: await t.name("grant", rotated, "交換の招待"), rotate: m.other.grant, expiresAt: t.seed.spec.lifecycle.purgeAt, confirm: true }, owner)).status).toBe(201);
+    const viewerSeat = await t.self(m.viewer.cookie);
+    expect((await t.request("/revoke", "POST", { member: viewerSeat.id, confirm: true }, owner)).status).toBe(200);
+    expect((await t.request("/revoke", "POST", { id: g.id, confirm: true }, owner)).status).toBe(200);
+    expect((await t.request("/freeze", "POST", { confirm: true }, owner, t.stored().document.revision)).status).toBe(200);
+    const history = await (await t.request("/history", "GET", undefined, owner)).json() as Array<Record<string, string>>;
+    const of = (event: string) => history.find(h => h.event === event)!;
+    expect(of("freeze")).toMatchObject({ seat: ownerSeat.id }); expect(of("freeze")).not.toHaveProperty("by");
+    expect(of("revoke")).toMatchObject({ grant: g.id, seat: ownerSeat.id, role: "participant" });
+    expect(of("revoke-member")).toMatchObject({ grant: m.viewer.grant, member: viewerSeat.id, seat: ownerSeat.id, role: "viewer" });
+    expect(of("rotate")).toMatchObject({ grant: rotated, seat: ownerSeat.id });
+    expect(history.find(h => h.event === "sessions" && h.grant === g.id)).toMatchObject({ seat: seat.id, role: "participant" });
+    expect(history.find(h => h.event === "grants" && h.grant === g.id)).toMatchObject({ seat: ownerSeat.id });
+    const after = history.filter(h => h.grant !== undefined || h.seat !== undefined);
+    expect(after.length).toBeGreaterThanOrEqual(10);
+    for (const h of after) { expect(h).not.toHaveProperty("label"); expect(h).not.toHaveProperty("by"); }
+    const audit = JSON.stringify(t.stored().audit);
+    for (const w of ["履歴の招待", "交換の招待", "編集の招待", "参加の招待", "閲覧の招待", "メンバー"]) expect(audit).not.toContain(w);
+    // The publisher's line is not a member's, and keeps 発行者.
+    expect((await t.host.fetch(new Request(origin + `/v1/c/${t.created.id}/recover`, { method: "POST", headers: { Origin: origin, "Content-Type": "application/json" }, body: JSON.stringify({ confirm: true }) }))).status).toBe(201);
+    expect(t.stored().audit.at(-1)).toMatchObject({ event: "recover", by: "発行者" });
+  });
+  test("履歴: an approval and a refusal are kept with the ids too", async () => {
+    const t = await sealedTrip(), owner = await stepUp(t.request, t.owner), ownerSeat = await t.self(owner);
+    const g = await t.issue("participant", "承認の招待", { seats: 2, approval: "owner" });
+    for (let n = 0; n < 2; n++) expect((await t.request("/sessions", "POST", { secret: new URLSearchParams(new URL(g.url).hash.slice(1)).get("k") })).status).toBe(200);
+    const waiting = (await (await t.request("/grants", "GET", undefined, owner)).json()).find((x: { id: string }) => x.id === g.id).members as Array<{ id: string }>;
+    expect((await t.request("/approve", "POST", { member: waiting[0]!.id, approve: true, confirm: true }, owner)).status).toBe(200);
+    expect((await t.request("/approve", "POST", { member: waiting[1]!.id, approve: false, confirm: true }, owner)).status).toBe(200);
+    const lines = t.stored().audit.filter((a: { event: string }) => a.event === "approve" || a.event === "reject");
+    expect(lines).toEqual([
+      expect.objectContaining({ event: "approve", grant: g.id, member: waiting[0]!.id, seat: ownerSeat.id }),
+      expect.objectContaining({ event: "reject", grant: g.id, member: waiting[1]!.id, seat: ownerSeat.id }),
+    ]);
+    for (const a of lines) { expect(a).not.toHaveProperty("label"); expect(a).not.toHaveProperty("by"); }
+    expect(JSON.stringify(t.stored().audit)).not.toContain("メンバー");
+  });
+});
+
+describe("moving a plain trip", () => {
+  // A plain trip with words of every kind, a step back, two seats' points and names of its own, moved by its owner's browser as
+  // src/trip-keys.ts sealMove does it: GET seal, GET grants, then one POST seal (docs/design/trip-e2e.md §5).
+  type Setup = Awaited<ReturnType<typeof setup>>;
+  const during = +new Date("2026-09-25T01:00:00Z"), here = { lat: 35.6812, lng: 139.7671, accuracy: 20 };
+  const words = ["テスト旅行", "集合", "駅前の広場", "旅のしおり", "朝市に行きたい", "相談の言葉", "傘を持つ", "宿代", "98765", "旅のメモの言葉", "直した予定の題", "35.6812", "139.7671", "名前を変えた人", "家族への招待", "オーナー", "メンバー2"];
+  const error = async (r: Response) => [r.status, (await r.json()).error];
+  async function plainTrip(t?: Setup) {
+    t ??= await setup();
+    const owner = await stepUp(t.request, await t.login(t.created.url)); now = during; await stepUp(t.request, owner);
+    let view = await (await t.request("", "GET", undefined, owner)).json();
+    const answer = structuredClone(revisable(view.spec, view.document)); answer.document.items[0]!.title = "直した予定の題";
+    expect((await t.request("/revise", "POST", { text: "```json\n" + JSON.stringify(answer) + "\n```", confirm: true }, owner, view.document.revision)).status).toBe(200);
+    view = await (await t.request("", "GET", undefined, owner)).json();
+    const item = { ...view.document.items[1]!, place: { label: "駅前の広場", publicUrl: "https://example.com/plaza" }, description: "旅のしおり" };
+    for (const op of [{ type: "item", item }, { type: "suggest", author: "A", body: "朝市に行きたい" }, { type: "comment", author: "A", body: "相談の言葉" }, { type: "checklist", checklist: [{ id: "c1", title: "傘を持つ" }] },
+      { type: "budget", budget: [{ id: "b1", title: "宿代", amount: 98765, description: "" }] }, { type: "notes", body: "旅のメモの言葉" }]) {
+      expect((await t.request("/document", "PATCH", op, owner, view.document.revision)).status).toBe(200); view.document.revision++;
+    }
+    const grant = await (await t.request("/grants", "POST", { role: "participant", label: "家族への招待", expiresAt: t.seed.spec.lifecycle.purgeAt, confirm: true }, owner)).json();
+    const member = await t.login(grant.url), seat = (await (await t.request("", "GET", undefined, member)).json()).self.id;
+    expect((await t.request("/members", "PATCH", { id: seat, label: "名前を変えた人" }, owner)).status).toBe(200);
+    for (const cookie of [owner, member]) expect((await t.request("/footprints", "PATCH", { type: "add", ...here }, cookie)).status).toBe(200);
+    const keys = await newSeatKeys(), pub = await seatPublic(keys), trip = await newTripKey(), wrap = await wrapTripKey(trip, pub.x25519, t.created.id, 1);
+    expect((await t.request("/keys", "PATCH", { type: "seat", ...pub, ephemeral: wrap.ephemeral, generation: 1, wrapped: wrap.wrapped }, owner)).status).toBe(200);
+    // What the owner's browser reads, and the body it makes of it.
+    const read = async () => {
+      const v = await (await t!.request("", "GET", undefined, owner)).json(), { previous } = await (await t!.request("/seal", "GET", undefined, owner)).json();
+      return { view: v, input: { spec: v.spec, document: v.document, previous, footprints: v.footprints, grants: await (await t!.request("/grants", "GET", undefined, owner)).json() } };
+    };
+    const move = async (body: object, revision?: number) => { await stepUp(t!.request, owner); return t!.request("/seal", "POST", body, owner, revision ?? (await read()).view.document.revision); };
+    const stored = () => JSON.parse((t!.db.db.query("SELECT payload FROM trip_capsules WHERE payload IS NOT NULL").get() as { payload: string }).payload);
+    return { ...t, owner, member, seat, trip, read, move, stored };
+  }
+
+  test("置き直し: one POST seal leaves no plain word, point or name in any row; the trip, points and step back open as they were", async () => {
+    const t = await plainTrip(), { view, input } = await t.read();
+    expect(input.previous.document.items[0].title).not.toBe("直した予定の題");
+    const r = await t.move(await sealMove(t.trip, t.created.id, 1, input)); expect(r.status).toBe(200);
+    // Every row of every table: the version CAS wrote the trip over its plain row, so no plain version is left anywhere.
+    const tables = (t.db.db.query("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>).map(x => x.name);
+    const dump = JSON.stringify(tables.map(name => t.db.db.query(`SELECT * FROM ${name}`).all()));
+    for (const w of words) expect(dump).not.toContain(w);
+    expect((t.db.db.query("SELECT count(*) AS n FROM trip_capsules").get() as { n: number }).n).toBe(1);
+    const after = await (await t.request("", "GET", undefined, t.owner)).json();
+    expect(after.sealed).toEqual({ generation: 1 });
+    expect(await openTrip(t.trip, t.created.id, after)).toEqual({ spec: view.spec, document: { ...view.document, revision: view.document.revision + 1 }, unreadable: [] });
+    const kept = t.stored(), back = (await openTrip(t.trip, t.created.id, { spec: kept.previous.spec, document: { ...kept.document, ...kept.previous.document } }))!;
+    expect(back.document.items.map(i => i.title)).toEqual(input.previous.document.items.map((i: { title: string }) => i.title));
+    expect(kept.previous.revisedIds).toEqual(input.previous.revisedIds);
+    // The points keep their seat, time and id; their place and name open back.
+    expect(after.footprints.map((p: { id: string }) => p.id)).toEqual(view.footprints.map((p: { id: string }) => p.id));
+    for (const p of after.footprints) {
+      expect(await openPoint(t.trip, t.created.id, p.id, p.point)).toEqual(here);
+      expect(await openName(t.trip, t.created.id, "footprint", p.id, p.by)).toBe(view.footprints.find((x: { id: string }) => x.id === p.id).by);
+    }
+    expect(after.footprints.map((p: { mine: boolean }) => p.mine)).toEqual([true, false]);
+    for (const p of kept.footprints) expect(Object.keys(p).sort()).toEqual(["at", "by", "id", "point", "seat"]);
+    const grants = await (await t.request("/grants", "GET", undefined, t.owner)).json() as Array<{ id: string; role: string; label: string; members: Array<{ id: string; label: string }> }>;
+    const family = grants.find(g => g.members.some(m => m.id === t.seat))!;
+    expect(await openName(t.trip, t.created.id, "grant", family.id, family.label)).toBe("家族への招待");
+    expect(await openName(t.trip, t.created.id, "member", t.seat, family.members[0]!.label)).toBe("名前を変えた人");
+    expect(grants.find(g => g.role === "owner")!.label).toBe("自分用");
+    // The history keeps its lines, with no name but the publisher's.
+    const history = await (await t.request("/history", "GET", undefined, t.owner)).json() as Array<Record<string, unknown>>;
+    expect(history.map(h => h.event)).toEqual(expect.arrayContaining(["publish", "grants", "sessions"]));
+    for (const h of history) { expect(h.label).toBeUndefined(); expect([undefined, "発行者", "作成者"]).toContain(h.by as string | undefined); }
+  });
+  test("競合: a point, a seat or an invite added or gone meanwhile is 409, a plain name 400, an old If-Match 409", async () => {
+    const t = await plainTrip(), first = await t.read(), body = await sealMove(t.trip, t.created.id, 1, first.input);
+    now += 60000; expect((await t.request("/footprints", "PATCH", { type: "add", ...here }, t.member)).status).toBe(200);
+    expect(await error(await t.move(body))).toEqual([409, "足あとが増えました。もう一度移してください"]);
+    const again = await sealMove(t.trip, t.created.id, 1, (await t.read()).input);
+    expect(await t.login((await (await t.request("/grants", "POST", { role: "viewer", expiresAt: t.seed.spec.lifecycle.purgeAt, confirm: true }, t.owner)).json()).url)).toBeTruthy();
+    expect(await error(await t.move(again))).toEqual([409, "メンバーが増えました。もう一度移してください"]);
+    const third = await sealMove(t.trip, t.created.id, 1, (await t.read()).input);
+    expect((await t.move({ ...third, members: { ...third.members, [t.seat]: "花子" } })).status).toBe(400);
+    // A seat or an invite the body names that is not here any more (revoked, expired, refused meanwhile): read again, as for one added.
+    const changed = [409, "メンバーが変わりました。もう一度移してください"]; now += 61000;  // each move checks the passkey: the login limit is 15 a minute
+    expect(await error(await t.move({ ...third, grants: { ...third.grants, nope: third.grants[Object.keys(third.grants)[0]!] } }))).toEqual(changed);
+    expect(await error(await t.move({ ...third, members: { ...third.members, gone: third.members[t.seat]! } }))).toEqual(changed);
+    expect((await t.move({ ...third, footprints: [...third.footprints, third.footprints[0]] })).status).toBe(409);
+    expect(await error(await t.move(third, first.view.document.revision - 1))).toEqual([409, "別の人が更新しました。再読込して内容を確認し、もう一度操作してください"]);
+    expect(t.stored().sealed).toBeUndefined();
+    expect((await t.move(third)).status).toBe(200);
+  });
+  test("大きな旅行: with its step back past the limit, 413 leaves the trip as it was; without the step back it moves; still too large stays plain", async () => {
+    // Items written straight into the row, as a trip published before the limits might hold them: ASCII words, which seal to about 4/3.
+    const grow = async (t: Awaited<ReturnType<typeof plainTrip>>, size: number, withPrevious: boolean) => {
+      const row = (await t.host.store.get(t.host.digest(t.created.id)))!, c = JSON.parse(row.payload!), base = c.document.items[0];
+      c.document.items = Array.from({ length: 300 }, (_, n) => ({ ...base, id: `big${n}`, title: `予定${n}`, description: "a".repeat(size) }));
+      if (withPrevious) c.previous = { spec: c.spec, document: { items: c.document.items, checklist: c.document.checklist, notes: c.document.notes, budget: c.document.budget } };
+      else delete c.previous;
+      expect(await t.host.store.save(row, JSON.stringify(c), row.purge_at, now)).toBe(true);
+    };
+    const t = await plainTrip(); await grow(t, 2700, true);
+    const trip = (x: Record<string, unknown>) => JSON.stringify([x.spec, x.document, x.previous, x.footprints, x.sealed]);
+    const { view, input } = await t.read(), before = trip(t.stored());
+    expect(Buffer.byteLength(JSON.stringify(t.stored()))).toBeLessThan(1_900_000);
+    // Past 2 MiB the body itself is refused (本文が大きすぎます), past 1,900,000 bytes the capsule: 413 either way, which the screen reads alike.
+    expect((await t.move(await sealMove(t.trip, t.created.id, 1, input))).status).toBe(413);
+    expect(trip(t.stored())).toBe(before);
+    expect(t.stored()).toMatchObject({ document: { revision: view.document.revision }, spec: { title: view.spec.title } });
+    expect((await t.move(await sealMove(t.trip, t.created.id, 1, input, { dropPrevious: true }))).status).toBe(200);
+    expect(t.stored().previous).toBeUndefined(); expect(t.stored().sealed).toEqual({ generation: 1 });
+    // One too large even without its step back stays plain, and is used as before.
+    const big = await plainTrip(); await grow(big, 1, false);
+    const row = (await big.host.store.get(big.host.digest(big.created.id)))!, c = JSON.parse(row.payload!);
+    c.document.items = c.document.items.map((i: { description: string }) => ({ ...i, description: "あ".repeat(1700) }));
+    expect(await big.host.store.save(row, JSON.stringify(c), row.purge_at, now)).toBe(true);
+    expect(Buffer.byteLength(JSON.stringify(big.stored()))).toBeLessThan(1_900_000);
+    const plainOnly = await big.read();
+    expect((await big.move(await sealMove(big.trip, big.created.id, 1, plainOnly.input, { dropPrevious: true }))).status).toBe(413);
+    expect(big.stored().sealed).toBeUndefined();
+    expect((await big.request("/document", "PATCH", { type: "notes", body: "まだ平文" }, big.owner, plainOnly.view.document.revision)).status).toBe(200);
+  });
+  test("役割: only the owner reads GET seal, and only before the trip is sealed", async () => {
+    const t = await plainTrip();
+    expect((await t.request("/seal", "GET", undefined, t.member)).status).toBe(403);
+    expect(await (await t.request("/seal", "GET", undefined, t.owner)).json()).toMatchObject({ previous: { revisedIds: expect.any(Object) } });
+    expect((await t.move(await sealMove(t.trip, t.created.id, 1, (await t.read()).input))).status).toBe(200);
+    expect(await error(await t.request("/seal", "GET", undefined, t.owner))).toEqual([409, "旅程はもう暗号化してあります"]);
+  });
+});
+
+describe("after the new screen is out", () => {
+  // CAPSULE_SEALED_FROM: a trip published at or after it is not used plain (docs/design/trip-e2e.md §5). The line is put in the
+  // host's clock between two trips; a request without ui=2 is an older screen's.
+  type Setup = Awaited<ReturnType<typeof setup>>;
+  const error = async (r: Response) => [r.status, (await r.json()).error];
+  const old = (t: Setup, path = "", cookie?: string) => t.host.fetch(new Request(origin + `/v1/c/${t.created.id}${path}`, { headers: { Origin: origin, ...(cookie ? { Cookie: cookie } : {}) } }));
+  const list = async (t: Setup) => (await (await t.host.fetch(new Request(origin + "/v1/capsules/list", { method: "POST", headers: { Origin: origin, "Content-Type": "application/json" }, body: "{}" }))).json()) as Array<Record<string, unknown>>;
+  // A trip with an owner and a participant, then the line put just before or after its publishing.
+  async function trip(after: boolean) {
+    const t = await setup(undefined, { CAPSULE_SEALED_FROM: new Date(now - 1000).toISOString() });
+    if (!after) t.host.sealedFrom = now + 1000;
+    // The participant is invited before the line is drawn: after it, the owner can hand out no invite until the trip is moved.
+    const line = t.host.sealedFrom; t.host.sealedFrom = undefined;
+    const owner = await stepUp(t.request, await t.login(t.created.url));
+    const member = await t.login((await (await t.request("/grants", "POST", { role: "participant", expiresAt: t.seed.spec.lifecycle.purgeAt, confirm: true }, owner)).json()).url);
+    t.host.sealedFrom = line;
+    return { ...t, owner, member };
+  }
+  async function move(t: { request: Setup["request"]; created: { id: string }; owner: string }) {
+    const keys = await newSeatKeys(), pub = await seatPublic(keys), key = await newTripKey(), wrap = await wrapTripKey(key, pub.x25519, t.created.id, 1);
+    expect((await t.request("/keys", "PATCH", { type: "seat", ...pub, ephemeral: wrap.ephemeral, generation: 1, wrapped: wrap.wrapped }, t.owner)).status).toBe(200);
+    const v = await (await t.request("", "GET", undefined, t.owner)).json(), { previous } = await (await t.request("/seal", "GET", undefined, t.owner)).json();
+    const grants = await (await t.request("/grants", "GET", undefined, t.owner)).json();
+    await stepUp(t.request, t.owner);
+    return t.request("/seal", "POST", await sealMove(key, t.created.id, 1, { spec: v.spec, document: v.document, previous, footprints: v.footprints, grants }), t.owner, v.document.revision);
+  }
+
+  test("線: a trip published before the line is used plain as before; one after it, only by its owner, to move it", async () => {
+    const before = await trip(false);
+    expect((await (await before.request("", "GET", undefined, before.owner)).json()).mustSeal).toBe(false);
+    expect((await before.request("/document", "PATCH", { type: "notes", body: "線の前" }, before.owner)).status).toBe(200);
+    expect((await before.request("", "GET", undefined, before.member)).status).toBe(200);
+    expect((await before.request("/export", "GET", undefined, before.owner)).status).toBe(200);
+    const t = await trip(true), unsealed = [409, "オーナーがこの旅行を移すまで開けません"];
+    expect((await (await t.request("", "GET", undefined, t.owner)).json()).mustSeal).toBe(true);
+    expect(await error(await t.request("/document", "PATCH", { type: "notes", body: "線の後" }, t.owner))).toEqual(unsealed);
+    expect(await error(await t.request("/footprints", "PATCH", { type: "add", lat: 35.6812, lng: 139.7671, accuracy: 20 }, t.owner))).toEqual(unsealed);
+    expect(await error(await t.request("/grants", "POST", { role: "viewer", expiresAt: t.seed.spec.lifecycle.purgeAt, confirm: true }, t.owner))).toEqual(unsealed);
+    expect(await error(await t.request("/export", "GET", undefined, t.owner))).toEqual(unsealed);
+    expect(await error(await t.request("/history", "GET", undefined, t.owner))).toEqual(unsealed);
+    expect(await error(await t.request("", "GET", undefined, t.member))).toEqual(unsealed);
+    // What moving needs goes through: the keys, GET seal and grants, the passkey check, POST seal.
+    expect((await move(t)).status).toBe(200);
+    const view = await (await t.request("", "GET", undefined, t.owner)).json();
+    expect(view).toMatchObject({ sealed: { generation: 1 }, mustSeal: false });
+    expect((await t.request("", "GET", undefined, t.member)).status).toBe(200);
+    expect((await t.request("/history", "GET", undefined, t.owner)).status).toBe(200);
+    // Without the setting there is no line: the same trip is used plain.
+    const none = await setup();
+    expect(none.host.sealedFrom).toBeUndefined();
+    const owner = await stepUp(none.request, await none.login(none.created.url));
+    expect((await (await none.request("", "GET", undefined, owner)).json()).mustSeal).toBe(false);
+    expect((await none.request("/document", "PATCH", { type: "notes", body: "設定なし" }, owner)).status).toBe(200);
+    expect(() => new CloudHost({ DB: new LocalD1(), CAPSULE_HMAC_KEY: key, CAPSULE_ORIGIN: origin, CAPSULE_SEALED_FROM: "いつか" })).toThrow("CAPSULE_SEALED_FROM は時刻で指定してください");
+  });
+  test("発行の上限: past 1,200,000 bytes a trip is not published; one just under it moves within 1,900,000", async () => {
+    const t = await setup(), publish = (body: object) => t.host.fetch(new Request(origin + "/v1/publish", { method: "POST", headers: { Origin: origin, "Content-Type": "application/json" }, body: JSON.stringify({ ...body, confirm: true }) }));
+    const sized = (size: number) => { const seed = testTrip(), base = seed.document.items.find(i => i.startsAt)!; seed.document.items = Array.from({ length: 300 }, (_, n) => ({ ...base, id: `big${n}`, title: `予定${n}`, description: "a".repeat(size) })); return seed; };
+    expect(await error(await publish(sized(4000)))).toEqual([413, "旅程が大きすぎます。予定や投稿を減らしてください"]);
+    const r = await publish(sized(3600)); expect(r.status).toBe(201);
+    const created = await r.json() as { id: string; url: string };
+    const near = { ...t, created, request: (path = "", method = "GET", body?: unknown, cookie?: string, revision = 1) => t.host.fetch(new Request(origin + `/v1/c/${created.id}${path}?ui=2`, { method, headers: { Origin: origin, "Content-Type": "application/json", "If-Match": `"${revision}"`, ...(cookie ? { Cookie: cookie } : {}) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) })) };
+    const secret = new URLSearchParams(new URL(created.url).hash.slice(1)).get("k"), joined = await near.request("/sessions", "POST", { secret });
+    const owner = await stepUp(near.request, joined.headers.get("Set-Cookie")!.split(";")[0]!);
+    const row = (await t.host.store.get(t.host.digest(created.id)))!;
+    expect(Buffer.byteLength(row.payload!)).toBeGreaterThan(1_100_000);
+    expect((await move({ ...near, owner })).status).toBe(200);
+    const moved = (await t.host.store.get(t.host.digest(created.id)))!;
+    expect(Buffer.byteLength(moved.payload!)).toBeGreaterThan(1_300_000); expect(Buffer.byteLength(moved.payload!)).toBeLessThanOrEqual(1_900_000);
+  });
+  test("古い画面: a request without ui=2 is asked to reload for a sealed trip and one after the line; a plain one before it works", async () => {
+    const before = await trip(false), after = await trip(true), stale = [409, "画面を更新してください"];
+    expect((await old(before, "", before.owner)).status).toBe(200);
+    expect(await error(await old(after, "", after.owner))).toEqual(stale);
+    expect((await move(before)).status).toBe(200);
+    expect(await error(await old(before, "", before.owner))).toEqual(stale);
+    expect(await error(await old(before, "", before.member))).toEqual(stale);
+    expect((await old(before, "/theme.css", before.owner)).status).toBe(200);
+  });
+  test("一覧: whether a trip is sealed, and whether it must be moved before it is used", async () => {
+    const t = await trip(true), of = async () => (await list(t)).find(c => c.id === t.created.id)!;
+    expect(await of()).toMatchObject({ sealed: false, mustSeal: true });
+    expect((await move(t)).status).toBe(200);
+    expect(await of()).toMatchObject({ sealed: true, mustSeal: false });
+  });
+  test("線の後: the owner may still check its passkey, sign out and delete an unmoved trip", async () => {
+    const t = await trip(true);
+    expect((await t.request("/signout", "POST", { confirm: true }, t.member)).status).toBe(409);  // not the owner's
+    await stepUp(t.request, t.owner);  // passkey/challenge and passkey/verify
+    expect((await t.request("/purge", "POST", { title: t.seed.spec.title }, t.owner)).status).toBe(200);
+    const other = await trip(true);
+    expect((await other.request("/signout", "POST", { confirm: true }, other.owner)).status).toBe(200);
+    // An owner without a passkey registers one there, as the move asks it to (428, then POST passkey).
+    const bare = await setup(undefined, { CAPSULE_SEALED_FROM: new Date(now - 1000).toISOString() }), cookie = await bare.login(bare.created.url);
+    expect((await stepUp(bare.request, cookie)) && (await (await bare.request("", "GET", undefined, cookie)).json()).passkey).toBe(true);
+  });
+});
+
+// A sealed trip whose owner seat holds the trip key, and members given it by the confirmation-code handoff (#702), with the
+// browsers' own functions. The seat keys stay in the test, as in the browsers.
+type Keyed = { cookie: string; id: string; grant: string; seat: SeatKeys; pub: { x25519: string; ed25519: string } };
+async function keyedTrip() {
+  const t = await setup(), cookie = await stepUp(t.request, await t.login(t.created.url));
+  const seat = await newSeatKeys(), pub = await seatPublic(seat), trip = await newTripKey(), wrap = await wrapTripKey(trip, pub.x25519, t.created.id, 1);
+  expect((await t.request("/keys", "PATCH", { type: "seat", ...pub, ephemeral: wrap.ephemeral, generation: 1, wrapped: wrap.wrapped }, cookie)).status).toBe(200);
+  const read = async (c: string) => (await (await t.request("", "GET", undefined, c)).json()) as any;
+  const view = await read(cookie);
+  expect((await t.request("/seal", "POST", { generation: 1, ...await sealTrip(trip, t.created.id, 1, { spec: view.spec, document: view.document }), ...await moveNames(t, trip, cookie), confirm: true }, cookie, view.document.revision)).status).toBe(200);
+  const owner: Keyed = { cookie, id: view.self.id, grant: t.created.grantId, seat, pub };
+  // A member's seat, with no key yet. A sealed trip's invite carries the id the browser chose.
+  const join = async (body: object = {}) => {
+    const r = await t.request("/grants", "POST", { role: "participant", id: crypto.randomUUID().replaceAll("-", ""), expiresAt: t.seed.spec.lifecycle.purgeAt, confirm: true, ...body }, owner.cookie);
+    expect(r.status).toBe(201); const g = await r.json(), c = await t.login(g.url);
+    return { cookie: c, id: ((await read(c)).self?.id ?? "") as string, grant: g.grantId as string };  // no id for a seat awaiting approval
+  };
+  // Steps 1-4 and the two edges, from a seat holding the key to one waiting.
+  const hand = async (giver: Keyed, to: { cookie: string; id: string; grant: string }, key = trip, generation = 1): Promise<Keyed> => {
+    const ms = await newSeatKeys(), mp = await seatPublic(ms), attempt = await newAttempt(mp, t.created.id), h = await newHandoffKeys();
+    const att = (await (await t.request("/keys", "PATCH", { type: "wait", commitment: attempt.commitment }, to.cookie)).json()).handoff.attempt;
+    expect((await t.request("/keys", "PATCH", { type: "give", seat: to.id, attempt: att, ephemeral: h.ephemeral }, giver.cookie)).status).toBe(200);
+    expect((await t.request("/keys", "PATCH", { type: "reveal", attempt: att, ...mp, nonce: attempt.nonce }, to.cookie)).status).toBe(200);
+    const w = await wrapTripKey(key, mp.x25519, t.created.id, generation, h.pair);
+    expect((await t.request("/keys", "PATCH", { type: "wrap", seat: to.id, attempt: att, wrapped: w.wrapped }, giver.cookie)).status).toBe(200);
+    expect((await t.request("/keys", "PATCH", { type: "edge", seat: to.id, signature: await signEdge(giver.seat.ed25519.privateKey, { seat: to.id, ...mp }, t.created.id) }, giver.cookie)).status).toBe(200);
+    expect((await t.request("/keys", "PATCH", { type: "edge", seat: giver.id, signature: await signEdge(ms.ed25519.privateKey, { seat: giver.id, ...giver.pub }, t.created.id) }, to.cookie)).status).toBe(200);
+    return { ...to, seat: ms, pub: mp };
+  };
+  const stored = () => JSON.parse((t.db.db.query("SELECT payload FROM trip_capsules WHERE payload IS NOT NULL").get() as { payload: string }).payload);
+  return { ...t, trip, owner, read, join, hand, stored };
+}
+
+describe("rekey marks", () => {
+  const mark = async (t: Awaited<ReturnType<typeof keyedTrip>>, cookie: string) => (await t.read(cookie)).rekey;
+  test("替える: after a key holder's revocation, its invite's rotation or revocation, the owner is told to replace the key; others are not", async () => {
+    for (const how of ["member", "rotate", "revoke"] as const) {
+      const t = await keyedTrip(), a = await t.hand(t.owner, await t.join()), b = await t.hand(t.owner, await t.join());
+      expect(await mark(t, t.owner.cookie)).toBeNull();
+      const r = how === "member" ? await t.request("/revoke", "POST", { member: b.id, confirm: true }, t.owner.cookie)
+        : how === "revoke" ? await t.request("/revoke", "POST", { id: b.grant, confirm: true }, t.owner.cookie)
+        : await t.request("/grants", "POST", { role: "participant", id: crypto.randomUUID().replaceAll("-", ""), expiresAt: t.seed.spec.lifecycle.purgeAt, confirm: true, rotate: b.grant }, t.owner.cookie);
+      expect(r.status).toBe(how === "rotate" ? 201 : 200);
+      expect(await mark(t, t.owner.cookie)).toBe("auto");
+      expect(await mark(t, a.cookie)).toBeNull();
+      expect(t.stored().departed).toEqual([{ seat: b.id, at: now, why: how === "member" ? "revoke" : "rotate" }]);
+    }
+  });
+  test("替えない: an unredeemed invite revoked, sharing ended, a seat without the key revoked: nothing is recorded", async () => {
+    const t = await keyedTrip(), keyless = await t.join(), pending = await t.join({ approval: "owner" });
+    await t.hand(t.owner, await t.join());
+    const unredeemed = await (await t.request("/grants", "POST", { role: "participant", id: crypto.randomUUID().replaceAll("-", ""), expiresAt: t.seed.spec.lifecycle.purgeAt, confirm: true }, t.owner.cookie)).json();
+    expect((await t.request("/revoke", "POST", { id: unredeemed.grantId, confirm: true }, t.owner.cookie)).status).toBe(200);
+    expect((await t.request("/revoke", "POST", { member: keyless.id, confirm: true }, t.owner.cookie)).status).toBe(200);
+    expect((await t.request("/revoke", "POST", { id: pending.grant, confirm: true }, t.owner.cookie)).status).toBe(200);
+    expect(await mark(t, t.owner.cookie)).toBeNull();
+    const view = await t.read(t.owner.cookie);
+    expect((await t.request("/freeze", "POST", { confirm: true }, t.owner.cookie, view.document.revision)).status).toBe(200);
+    expect(await mark(t, t.owner.cookie)).toBeNull(); expect(t.stored().departed).toBeUndefined();
+    // A plain trip records nothing either.
+    const p = await setup(), owner = await stepUp(p.request, await p.login(p.created.url));
+    const g = await (await p.request("/grants", "POST", { role: "participant", expiresAt: p.seed.spec.lifecycle.purgeAt, confirm: true }, owner)).json(), m = await p.login(g.url);
+    const seat = await newSeatKeys(), pub = await seatPublic(seat), w = await wrapTripKey(await newTripKey(), pub.x25519, p.created.id, 1);
+    expect((await p.request("/keys", "PATCH", { type: "seat", ...pub, ephemeral: w.ephemeral, generation: 1, wrapped: w.wrapped }, owner)).status).toBe(200);
+    expect((await p.request("/revoke", "POST", { member: (await (await p.request("", "GET", undefined, m)).json()).self.id, confirm: true }, owner)).status).toBe(200);
+    expect((await (await p.request("", "GET", undefined, owner)).json()).rekey).toBeNull();
+  });
+  test("期限: a key holder whose invite ends before the trip's deletion is recorded when the owner next opens it; one lasting to the deletion is not", async () => {
+    const t = await keyedTrip(), purge = +new Date(t.seed.spec.lifecycle.purgeAt), ends = now + 10 * 86400000;
+    const short = await t.hand(t.owner, await t.join({ expiresAt: new Date(ends).toISOString() })), long = await t.hand(t.owner, await t.join());
+    now = ends - 1; expect(await mark(t, t.owner.cookie)).toBeNull();
+    now = ends + 1; expect(await mark(t, t.owner.cookie)).toBe("auto");
+    expect(t.stored().departed).toEqual([{ seat: short.id, at: ends + 1, why: "expired" }]);
+    expect(t.stored().sessions.some((s: { id: string }) => s.id === short.id)).toBe(false);
+    // The seat lasting to the deletion is still there just before it; the owner reads at least once a month to stay in.
+    const t2 = await keyedTrip(), kept = await t2.hand(t2.owner, await t2.join());
+    for (now += 20 * 86400000; now < purge - 1; now = Math.min(now + 20 * 86400000, purge - 1)) expect(await mark(t2, t2.owner.cookie)).toBeNull();
+    expect(await mark(t2, t2.owner.cookie)).toBeNull(); expect(t2.stored().departed).toBeUndefined();
+    expect(t2.stored().sessions.some((s: { id: string }) => s.id === kept.id)).toBe(true);
+    expect(long.id).toBeString();
+  });
+  test("owner: after the owner invite's rotation or /recover the new owner is asked, even before it holds the key; keep clears it", async () => {
+    for (const how of ["rotate", "recover"] as const) {
+      const t = await keyedTrip(), a = await t.hand(t.owner, await t.join());
+      const r = how === "rotate"
+        ? await t.request("/grants", "POST", { role: "owner", id: crypto.randomUUID().replaceAll("-", ""), expiresAt: t.seed.spec.lifecycle.purgeAt, confirm: true, rotate: t.owner.grant }, t.owner.cookie)
+        : await t.request("/recover", "POST", { confirm: true });
+      expect(r.status).toBe(201);
+      const next = await t.login((await r.json()).url);
+      expect(await mark(t, next)).toBe("ask");
+      expect(t.stored().departed).toEqual([{ seat: t.owner.id, at: now, why: "owner" }]);
+      expect((await t.request("/keys", "PATCH", { type: "keep" }, a.cookie)).status).toBe(403);
+      expect((await t.request("/keys", "PATCH", { type: "keep" }, next)).status).toBe(428);
+      expect((await t.request("/keys", "PATCH", { type: "keep" }, await stepUp(t.request, next))).status).toBe(200);
+      expect(await mark(t, next)).toBeNull(); expect(t.stored().departed).toBeUndefined();
+    }
+    // Keeping leaves a member's departure to be replaced.
+    const t = await keyedTrip(), b = await t.hand(t.owner, await t.join()); await t.hand(t.owner, await t.join());
+    expect((await t.request("/revoke", "POST", { member: b.id, confirm: true }, t.owner.cookie)).status).toBe(200);
+    const r = await t.request("/grants", "POST", { role: "owner", id: crypto.randomUUID().replaceAll("-", ""), expiresAt: t.seed.spec.lifecycle.purgeAt, confirm: true, rotate: t.owner.grant }, t.owner.cookie);
+    const next = await stepUp(t.request, await t.login((await r.json()).url));
+    expect(await mark(t, next)).toBe("auto");
+    expect((await t.request("/keys", "PATCH", { type: "keep" }, next)).status).toBe(200);
+    expect(await mark(t, next)).toBe("auto"); expect(t.stored().departed.map((d: { why: string }) => d.why)).toEqual(["revoke"]);
+  });
+  test("最後の鍵: the owner invite is not rotated while no other seat holds the key", async () => {
+    const t = await keyedTrip(), a = await t.join(); await t.join();
+    const rotate = () => t.request("/grants", "POST", { role: "owner", id: crypto.randomUUID().replaceAll("-", ""), expiresAt: t.seed.spec.lifecycle.purgeAt, confirm: true, rotate: t.owner.grant }, t.owner.cookie);
+    const refused = await rotate();
+    expect(refused.status).toBe(409); expect((await refused.json()).error).toBe("鍵を持つメンバーが他にいないため、交換すると旅程をだれも読めなくなります。先に別の端末かメンバーに鍵を渡してください");
+    expect(t.stored().grants.find((g: { id: string }) => g.id === t.owner.grant).revoked).toBeNull();
+    await t.hand(t.owner, a);
+    expect((await rotate()).status).toBe(201);
+    // A plain trip rotates as before.
+    const p = await setup(), owner = await stepUp(p.request, await p.login(p.created.url));
+    expect((await p.request("/grants", "POST", { role: "owner", expiresAt: p.seed.spec.lifecycle.purgeAt, confirm: true, rotate: p.created.grantId }, owner)).status).toBe(201);
+  });
+});
+
+describe("rekey", () => {
+  type K = Awaited<ReturnType<typeof keyedTrip>>;
+  const during = +new Date("2026-09-25T01:00:00Z");
+  const generations = (v: unknown) => new Set([...JSON.stringify(v).matchAll(/v1\.(\d+)\./g)].map(m => Number(m[1])));
+  // The body the owner's browser sends (src/client.ts rekeyTrip): the trip read as it stands, sealed again under a new key, wrapped
+  // to `to` with the owner seat's signature.
+  async function rekey(t: K, by: Keyed, to: Keyed[], generation?: number) {
+    const view = await t.read(by.cookie), grants = await (await t.request("/grants", "GET", undefined, by.cookie)).json();
+    const old = await unwrapTripKey(view.seatKey.wrapped, view.seatKey.ephemeral, by.seat.x25519.privateKey, t.created.id, view.sealed.generation, true);
+    const key = await newTripKey(), gen = generation ?? view.sealed.generation + 1;
+    const sealed = await resealAll(old, key, t.created.id, gen, { spec: view.spec, document: view.document, footprints: view.footprints.map((p: any) => ({ id: p.id, point: p.point, by: p.by })), members: grants.flatMap((g: any) => g.members).map((m: any) => ({ id: m.id, label: m.label })), grants: grants.map((g: any) => ({ id: g.id, label: g.label })) });
+    const seats = await Promise.all(to.map(async s => { const w = await wrapTripKey(key, s.pub.x25519, t.created.id, gen); return { seat: s.id, ...w, signature: await signRekey(by.seat.ed25519.privateKey, { capsuleId: t.created.id, generation: gen, seat: s.id, x25519: s.pub.x25519, ...w }) }; }));
+    const body = { generation: gen, ...sealed, seats, confirm: true };
+    return { key, old, gen, body, send: (over: object = {}, cookie = by.cookie) => t.request("/rekey", "POST", { ...body, ...over }, cookie, view.document.revision) };
+  }
+  const opens = async (t: K, m: Keyed, generation: number) => {
+    const v = await t.read(m.cookie), key = await unwrapTripKey(v.seatKey.wrapped, v.seatKey.ephemeral, m.seat.x25519.privateKey, t.created.id, generation);
+    return { key, trip: await openTrip(key, t.created.id, v), view: v };
+  };
+  test("替える: the owner seals the trip again under the next generation and wraps it to the seats that remain", async () => {
+    const t = await keyedTrip(), a = await t.hand(t.owner, await t.join()), b = await t.hand(t.owner, await t.join());
+    expect((await t.request("/revoke", "POST", { member: b.id, confirm: true }, t.owner.cookie)).status).toBe(200);
+    const r = await rekey(t, t.owner, [t.owner, a]), sent = await r.send();
+    expect(sent.status).toBe(200);
+    const kept = t.stored();
+    expect(kept.sealed).toEqual({ generation: 2 }); expect(kept.departed).toBeUndefined(); expect(kept.previous).toBeUndefined();
+    expect(generations({ spec: kept.spec, document: kept.document, labels: [kept.sessions.map((s: any) => s.label), kept.grants.map((g: any) => g.label)] })).toEqual(new Set([2]));
+    expect(kept.sessions.find((s: any) => s.id === a.id).seatKey).toMatchObject({ generation: 2, rekey: { seat: t.owner.id } });
+    // A reads it with the new wrap, takes the generation as the owner's, and B's key opens none of it.
+    const opened = await opens(t, a, 2);
+    expect(opened.trip!.spec.title).toBe("テスト旅行");
+    expect(await acceptRekey({ self: { id: a.id, ed25519: a.pub.ed25519 }, known: 1, capsuleId: t.created.id, seats: opened.view.seats, seatKey: opened.view.seatKey })).toBe(true);
+    expect(await openTrip(r.old, t.created.id, opened.view)).toBeNull();
+    expect((await t.read(t.owner.cookie)).rekey).toBeNull();
+  });
+  test("断る: only the owner holding the present generation replaces it, with the next generation, the records as they are, to seats of this trip", async () => {
+    now = during;
+    const t = await keyedTrip(), a = await t.hand(t.owner, await t.join());
+    const id = crypto.randomUUID().replaceAll("-", "");
+    expect((await t.request("/footprints", "PATCH", { type: "add", id, point: await sealPoint(t.trip, t.created.id, 1, id, { lat: 35, lng: 139, accuracy: 10 }), by: await sealName(t.trip, t.created.id, 1, "footprint", id, "足あとの人") }, a.cookie)).status).toBe(200);
+    const r = await rekey(t, t.owner, [t.owner, a]), error = async (res: Response) => [res.status, (await res.json()).error];
+    expect((await r.send({}, await stepUp(t.request, a.cookie))).status).toBe(403);
+    expect(await error(await r.send({ generation: 3 }))).toEqual([400, "鍵の世代を確認してください"]);
+    const mixed = structuredClone(r.body.document); mixed.notes = await sealField(r.old, t.created.id, 1, "notes", "notes", "body", "古い世代");
+    expect(await error(await r.send({ document: mixed }))).toEqual([400, "鍵の世代を確認してください"]);
+    expect(await error(await r.send({ footprints: [] }))).toEqual([409, "旅行が変わりました。開き直してください"]);
+    expect(await error(await r.send({ members: r.body.members.slice(1) }))).toEqual([409, "旅行が変わりました。開き直してください"]);
+    // A footprint's name goes as ciphertext only: the host gives none of its own.
+    expect((await r.send({ footprints: r.body.footprints.map(p => ({ ...p, by: "足あとの人" })) })).status).toBe(400);
+    const stranger = await seatPublic(await newSeatKeys()), w = await wrapTripKey(r.key, stranger.x25519, t.created.id, 2);
+    expect(await error(await r.send({ seats: [...r.body.seats, { seat: "no-such-seat", ...w, signature: r.body.seats[0]!.signature }] }))).toEqual([400, "包む席を確認してください"]);
+    expect(await error(await r.send({ seats: r.body.seats.filter(x => x.seat !== t.owner.id) }))).toEqual([400, "包む席を確認してください"]);
+    expect(t.stored().sealed).toEqual({ generation: 1 });
+    // An owner seat without the key (the new owner after the owner invite's rotation) cannot replace it.
+    const g = await (await t.request("/grants", "POST", { role: "owner", id: crypto.randomUUID().replaceAll("-", ""), expiresAt: t.seed.spec.lifecycle.purgeAt, confirm: true, rotate: t.owner.grant }, t.owner.cookie)).json();
+    const next = await stepUp(t.request, await t.login(g.url));
+    expect(await error(await t.request("/rekey", "POST", r.body, next, (await t.read(next)).document.revision))).toEqual([409, "旅行の鍵がありません"]);
+  });
+  test("古い世代の書き込み: once replaced, ciphertext of the previous generation is refused; the next generation's passes", async () => {
+    now = during;
+    const t = await keyedTrip(), a = await t.hand(t.owner, await t.join()), r = await rekey(t, t.owner, [t.owner, a]);
+    expect((await r.send()).status).toBe(200);
+    const doc = (await t.read(t.owner.cookie)).document, error = async (res: Response) => [res.status, (await res.json()).error];
+    const item = (key: CryptoKey, gen: number) => sealOperation(key, t.created.id, gen, { type: "item", item: { id: "new1", kind: "meal", status: "proposed", title: "昼食", day: doc.items[0].day, revision: 1 }, after: doc.items[0].id }, doc as never);
+    expect(await error(await t.request("/document", "PATCH", await item(r.old, 1), t.owner.cookie, doc.revision))).toEqual([409, "旅行の鍵が替わりました。開き直してください"]);
+    expect((await t.request("/document", "PATCH", await item(r.key, 2), t.owner.cookie, doc.revision)).status).toBe(200);
+    const fp = async (key: CryptoKey, gen: number) => { const id = crypto.randomUUID().replaceAll("-", ""); return { type: "add", id, point: await sealPoint(key, t.created.id, gen, id, { lat: 35, lng: 139, accuracy: 10 }), by: await sealName(key, t.created.id, gen, "footprint", id, "A") }; };
+    expect((await t.request("/footprints", "PATCH", await fp(r.old, 1), a.cookie)).status).toBe(409);
+    expect((await t.request("/footprints", "PATCH", await fp(r.key, 2), a.cookie)).status).toBe(200);
+    expect((await t.request("/members", "PATCH", { id: a.id, label: await sealName(r.old, t.created.id, 1, "member", a.id, "古い名前") }, t.owner.cookie)).status).toBe(409);
+    expect((await t.request("/members", "PATCH", { id: a.id, label: await sealName(r.key, t.created.id, 2, "member", a.id, "新しい名前") }, t.owner.cookie)).status).toBe(200);
+    const gid = crypto.randomUUID().replaceAll("-", ""), grant = async (key: CryptoKey, gen: number) => t.request("/grants", "POST", { role: "participant", id: gid, label: await sealName(key, t.created.id, gen, "grant", gid, "招待"), expiresAt: t.seed.spec.lifecycle.purgeAt, confirm: true }, t.owner.cookie);
+    expect((await grant(r.old, 1)).status).toBe(409);
+    expect((await grant(r.key, 2)).status).toBe(201);
+    const v = await t.read(t.owner.cookie), spec = { ...v.spec, title: await sealField(r.old, t.created.id, 1, "spec", "spec", "title", "古い題") };
+    expect((await t.request("/spec", "PATCH", { spec, confirm: true }, t.owner.cookie, v.document.revision)).status).toBe(409);
+  });
+  test("待っている席: a seat the owner could not reach waits again, and takes the present generation by the codes", async () => {
+    const t = await keyedTrip(), a = await t.hand(t.owner, await t.join()), c = await t.hand(a, await t.join());
+    expect((await t.request("/revoke", "POST", { member: a.id, confirm: true }, t.owner.cookie)).status).toBe(200);
+    const view = await t.read(t.owner.cookie);
+    expect([...await reachableSeats({ id: t.owner.id, ed25519: t.owner.pub.ed25519 }, view.seats, t.created.id)]).toEqual([t.owner.id]);
+    const r = await rekey(t, t.owner, [t.owner]);
+    expect((await r.send()).status).toBe(200);
+    expect((await t.read(t.owner.cookie)).waiting.map((w: any) => w.id)).toEqual([c.id]);
+    expect((await t.read(c.cookie)).seatKey.generation).toBe(1);
+    // A seat of an older generation gives nothing.
+    const d = await t.join(), w = await (await t.request("/keys", "PATCH", { type: "wait", commitment: (await newAttempt(await seatPublic(await newSeatKeys()), t.created.id)).commitment }, d.cookie)).json();
+    expect((await t.request("/keys", "PATCH", { type: "give", seat: d.id, attempt: w.handoff.attempt, ephemeral: (await newHandoffKeys()).ephemeral }, c.cookie)).status).toBe(403);
+    expect((await t.request("/keys", "PATCH", { type: "abandon", attempt: w.handoff.attempt }, d.cookie)).status).toBe(200);
+    const again = await t.hand(t.owner, c, r.key, 2);
+    expect((await opens(t, again, 2)).trip!.spec.title).toBe("テスト旅行");
+    expect((await t.read(t.owner.cookie)).waiting.map((x: any) => x.id)).toEqual([d.id]);
+  });
+  test("作り直し: a pair made again brings `since` and its edges, listed in seats, and the owner still reaches it", async () => {
+    const t = await keyedTrip(), a = await t.hand(t.owner, await t.join()), cookie = await stepUp(t.request, a.cookie);
+    const v = await t.read(cookie), trip = await unwrapTripKey(v.seatKey.wrapped, v.seatKey.ephemeral, a.seat.x25519.privateKey, t.created.id, 1, true);
+    const seat = await newSeatKeys(), pub = await seatPublic(seat), w = await wrapTripKey(trip, pub.x25519, t.created.id, 1);
+    const since = await signSuccession(a.seat.ed25519.privateKey, a.pub, { capsuleId: t.created.id, seat: a.id, ...pub });
+    const edges = [{ seat: t.owner.id, signature: await signEdge(seat.ed25519.privateKey, { seat: t.owner.id, ...t.owner.pub }, t.created.id) }];
+    const body = { type: "seat", ...pub, ephemeral: w.ephemeral, generation: 1, wrapped: w.wrapped, secret: await wrapSeatSecret(seat, crypto.getRandomValues(new Uint8Array(32)), t.created.id), since, edges };
+    expect((await t.request("/keys", "PATCH", { ...body, generation: 2 }, cookie)).status).toBe(400);
+    expect((await t.request("/keys", "PATCH", body, cookie)).status).toBe(200);
+    const seats = (await t.read(t.owner.cookie)).seats;
+    expect(seats.find((s: any) => s.id === a.id)).toEqual({ id: a.id, role: "participant", ...pub, edges, since });
+    expect(JSON.stringify(seats)).not.toContain(w.wrapped);
+    // A seat that holds no key is told none of them.
+    expect((await t.read((await t.join()).cookie)).seats).toEqual([]);
+    expect([...await reachableSeats({ id: t.owner.id, ed25519: t.owner.pub.ed25519 }, seats, t.created.id)].sort()).toEqual([t.owner.id, a.id].sort());
+  });
+});
+

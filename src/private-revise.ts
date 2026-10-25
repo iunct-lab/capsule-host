@@ -3,7 +3,7 @@
 // sealed and applied in one PATCH private. The shared trip goes along as a reference only, titles and times, never to be answered.
 import { z } from "zod";
 import text from "../docs/recipes/private.md" with { type: "text" };
-import { localDay, type Spec, type Document } from "./schema";
+import { instant, localDay, problems, type Spec, type Document } from "./schema";
 import { extract, explain } from "./paste";
 import { same } from "./revise";
 import type { PlainEntry } from "./private-entries";
@@ -19,7 +19,7 @@ export function privateReviseText(spec: Spec, document: Document, entries: Plain
 // no time. The lengths are those the host's sealed sizes are made for.
 const entry = z.object({
   id: z.string().regex(/^[a-zA-Z0-9_-]+$/).max(160).optional(), kind: z.enum(["item", "diary"]), day: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
-  startsAt: z.string().datetime({ offset: true }).optional(), endsAt: z.string().datetime({ offset: true }).optional(),
+  startsAt: instant.optional(), endsAt: instant.optional(),
   title: z.string().trim().max(160), body: z.string().trim().max(4000),
   place: z.object({ label: z.string().trim().min(1).max(160), publicUrl: z.string().url().max(2000).refine(v => v.startsWith("https://"), "公開HTTPS URLのみ使用できます").optional() }).strict().optional(),
 }).strict()
@@ -35,8 +35,8 @@ const reasons = { empty: "返事が貼られていません。チャットの答
 // The entries the answer holds, each with an id (a new one gets one here), or what to fix in the words the screen uses.
 export function takePrivate(answer: string, spec: Spec): { ok: true; entries: PlainEntry[] } | { ok: false; messages: string[] } {
   const taken = extract(answer); if (!taken.ok) return { ok: false, messages: [reasons[taken.reason]] };
-  const parsed = privateAnswerSchema.safeParse(taken.value);
-  if (!parsed.success) return { ok: false, messages: explain(parsed.error.issues.map(i => ({ path: i.path.join("."), message: i.message }))) };
+  const parsed = privateAnswerSchema.safeParse(taken.value, { reportInput: true });
+  if (!parsed.success) return { ok: false, messages: explain(problems(parsed.error, "")) };
   const { startsOn, endsOn } = spec.trip, messages: string[] = [], named = parsed.data.entries.flatMap(e => e.id ? [e.id] : []);
   parsed.data.entries.forEach((e, i) => {
     const real = !isNaN(+new Date(e.day)) && new Date(e.day).toISOString().slice(0, 10) === e.day;

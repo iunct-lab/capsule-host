@@ -25,6 +25,12 @@ export async function wrappingKey(prf: BufferSource, capsuleId: string): Promise
   const base = await crypto.subtle.importKey("raw", prf, "HKDF", false, ["deriveKey"]);
   return crypto.subtle.deriveKey({ name: "HKDF", hash: "SHA-256", salt: new Uint8Array(), info: text(`${INFO}/${capsuleId}`) }, base, { name: "AES-GCM", length: 256 }, false, ["wrapKey", "unwrapKey"]);
 }
+// The key that seals a seat's Anthropic API key on a sealed trip (#787): from the same PRF output, under its own info, so it is
+// never the memo key's wrapping key. The API key is words, not a CryptoKey, so this one encrypts and decrypts (seal / open).
+export async function assistSealingKey(prf: BufferSource, capsuleId: string): Promise<CryptoKey> {
+  const base = await crypto.subtle.importKey("raw", prf, "HKDF", false, ["deriveKey"]);
+  return crypto.subtle.deriveKey({ name: "HKDF", hash: "SHA-256", salt: new Uint8Array(), info: text(`${INFO}/${capsuleId}/assist`) }, base, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+}
 // Extractable only so it can be wrapped; the copy a browser keeps is unwrapped again as one that cannot be taken out.
 export const newMemoKey = () => crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt", "decrypt"]);
 export async function wrapMemoKey(memo: CryptoKey, wrapping: CryptoKey, capsuleId: string): Promise<string> {
@@ -62,8 +68,7 @@ export async function openEntry(key: CryptoKey, e: SealedEntry): Promise<PlainEn
   } catch { return null; }
 }
 // A member's own plans and diary as Markdown, made in the browser from what it could open (the host has ciphertext only, §4.3).
-// Times read in the trip's zone. The Markdown escaping lives here for src/export.ts too: that file uses node:crypto, which the
-// screen does not load.
+// Times read in the trip's zone. The Markdown escaping lives here and src/export.ts uses it too.
 export const md = (s: string) => s.replace(/[\\`*_{}\[\]()<>#!|]/g, "\\$&");
 export function privateMarkdown(spec: Spec, entries: PlainEntry[], unreadable: number, exportedAt: string) {
   const time = (at: string) => new Intl.DateTimeFormat("ja", { timeZone: spec.timezone, hour: "2-digit", minute: "2-digit" }).format(new Date(at));

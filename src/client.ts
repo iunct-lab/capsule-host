@@ -1,12 +1,16 @@
-import type { Spec, Document, Role, State, Item, SealedSpec, SealedDocument } from "./schema";
-import { validate, untimed, localDay, sameTitle, specSchema } from "./schema";
+import Anthropic from "@anthropic-ai/sdk";
+import type { Spec, Document, Role, State, Item, SealedSpec, SealedDocument, PlainPoint } from "./schema";
+import { validate, untimed, localDay, sameTitle, specSchema, pointSchema } from "./schema";
 import { explain } from "./paste";
 import { placeholder, gapBefore } from "./timing";
 import { emptyTrip } from "./template";
-import type { Diff } from "./revise";
-import { PRF_INPUT, b64, unb64, newMemoKey, unwrapMemoKey, wrapMemoKey, wrappingKey, openEntry, sealEntry, privateMarkdown, type PlainEntry } from "./private-entries";
-import { openTrip, sealOperation, sealSpec, confirmationCodes, matchesCommitment, newAttempt, newHandoffKeys, newSeatKeys, newTripKey, seatPublic, signEdge, unwrapSeatSecret, unwrapTripKey, wrapSeatSecret, wrapTripKey } from "./trip-keys";
+import { reviseText, reviseTrip, undoTrip, type Diff, type Previous } from "./revise";
+import { exportFiles, tripHtml, tripMarkdown, zip } from "./export";
+import { PRF_INPUT, assistSealingKey, b64, unb64, newMemoKey, unwrapMemoKey, wrapMemoKey, wrappingKey, openEntry, sealEntry, privateMarkdown, seal as sealWords, open as openWords, type PlainEntry } from "./private-entries";
+import { generate, REVISE_LIMIT, REVISE_SYSTEM, todayLine } from "./assist";
+import { openName, openPoint, sealMove, sealName, sealPoint, openTrip, resealTrip, sealOperation, sealSpec, confirmationCodes, matchesCommitment, newAttempt, newHandoffKeys, newSeatKeys, newTripKey, seatPublic, signEdge, unwrapSeatSecret, unwrapTripKey, wrapSeatSecret, wrapTripKey, acceptRekey, reachableSeats, resealAll, signRekey, signSuccession, verifyEdge, verifySuccession, type KeyedSeat } from "./trip-keys";
 import { privateReviseText, takePrivate, privateDiff } from "./private-revise";
+import { expiredIn, type Joined } from "./joined";
 import { autoDue, footprints, spotsOf, type Point } from "./footprints";
 import type { MapCamera, MapData } from "./map";
 import { itemAt } from "./moments";
@@ -19,14 +23,18 @@ type PrivateEntry = { id: string; kind: "item" | "diary"; day: string; startsAt?
 let plain = new Map<string, PlainEntry | null>();
 // `privateKey`: this seat's memo key as the host keeps it, wrapped with the seat's passkey (null until the seat's first entry).
 // `footprints`: the trip's points, every member's, oldest first (src/cloud-host.ts). `mine`: left by this seat. `auto`: left on
-// opening the page, not on a press (#481).
+// opening the page, not on a press (#481). In a sealed trip they come from the host as `point` and `by` ciphertext, and
+// `openFootprints` opens them into this shape first (`HostFootprint`).
 type Footprint = { id: string; at: string; lat: number; lng: number; accuracy: number; by: string; mine: boolean; auto: boolean };
-type View = { id?: string; spec: Spec; document: Document; role: Role; state: State | "draft"; passkey?: boolean; private?: PrivateEntry[]; privateKey?: string | null; seatKey?: SeatKey | null; keyed?: boolean; handoff?: Handoff | null; waiting?: Array<{ id: string; label: string; handoff: Handoff | null }>; footprints?: Footprint[]; sealed?: { generation: number } | null; unreadable?: string[] };
+type HostFootprint = Omit<Footprint, "lat" | "lng" | "accuracy"> & (PlainPoint | { point: string });
+type View = { id?: string; spec: Spec; document: Document; role: Role; state: State | "draft"; passkey?: boolean; private?: PrivateEntry[]; privateKey?: string | null; seatKey?: SeatKey | null; keyed?: boolean; handoff?: Handoff | null; waiting?: Array<{ id: string; label: string; handoff: Handoff | null }>; footprints?: Footprint[]; sealed?: { generation: number } | null; unreadable?: string[]; updated?: string; created?: number; label?: string; self?: { id: string; label: string }; assistKey?: boolean; assistWrapped?: string | null; assistModel?: string; mustSeal?: boolean; rekey?: "auto" | "ask" | null; seats?: KeyedSeat[] };
 // This seat's keys for the trip as the host keeps them (docs/design/trip-e2e.md §2.1): public keys and what is already wrapped.
-type SeatKey = { x25519: string; ed25519: string; generation: number; wrapped: string; ephemeral: string; secret?: { x25519: string; ed25519: string; passkey: string }; edges?: Array<{ seat: string; signature: string }> };
+// `rekey`: the owner seat's signature over this wrap, when the owner's browser replaced the trip key (docs/design/trip-e2e.md §8).
+type SeatKey = { x25519: string; ed25519: string; generation: number; wrapped: string; ephemeral: string; secret?: { x25519: string; ed25519: string; passkey: string }; edges?: Array<{ seat: string; signature: string }>; since?: KeyedSeat["since"]; rekey?: { seat: string; signature: string } };
 // One attempt of the confirmation-code handoff as the host relays it (docs/design/trip-e2e.md §2.1 案 A). Public values only.
 type Handoff = { attempt: string; commitment: string; giver?: { seat: string; ephemeral: string; x25519: string; ed25519: string }; reveal?: { x25519: string; ed25519: string; nonce: string } };
-let view: View, tab = "days", opened = false, selectedDay = "", diaryDay = "", editingDiaryId = "", stale = false;
+// `loads`: how many times this page has read the trip (load()), for the 20-second refresh to tell an answer older than one read since.
+let view: View, tab = "days", opened = false, selectedDay = "", diaryDay = "", editingDiaryId = "", stale = false, loads = 0;
 // The footprint map's narrowing: one day (in the trip's zone) and one member (`by`), "" for all.
 let mapDay = "", mapBy = "";
 // What the footprints page shows (#646): the plans with a place on the map, the footprints, or both. Not kept past the page.
@@ -59,13 +67,18 @@ function notice(text: string, error = false) { const el = document.querySelector
 // seat's passkey for an owner, a fresh sign-in for a creator. It is then sent once more as it was.
 async function api(action = "", method = "GET", body?: unknown, revision = view?.document.revision, retried = false): Promise<any> {
   const url = action.startsWith("/") ? action : `/v1/c/${id}/${action}`.replace(/\/$/, "");
-  const res = await fetch(url, { method, headers: { ...(body !== undefined ? { "Content-Type": "application/json" } : {}), ...(revision !== undefined ? { "If-Match": `"${revision}"` } : {}) }, ...(body !== undefined ? { body: JSON.stringify(body) } : {}) });
+  // ui=2: this screen draws a sealed trip and moves a plain one; the host asks an older screen to reload (docs/design/trip-e2e.md §5).
+  const res = await fetch(url.startsWith("/v1/c/") ? `${url}${url.includes("?") ? "&" : "?"}ui=2` : url, { method, headers: { ...(body !== undefined ? { "Content-Type": "application/json" } : {}), ...(revision !== undefined ? { "If-Match": `"${revision}"` } : {}) }, ...(body !== undefined ? { body: JSON.stringify(body) } : {}) });
   if (res.status === 428 && !retried) {
     try { await (url.startsWith("/v1/c/") ? stepUp() : creatorCheck()); } catch (err) { throw (err as Error).name === "NotAllowedError" ? new Error("パスキーの操作を中止しました。") : err; }
     return api(action, method, body, revision, true);
   }
   if (res.status === 204) return null;
-  if (!res.ok) { const data = await res.json(); if (res.status === 409) stale = true; throw Object.assign(new Error(data.error ?? "通信に失敗しました"), { status: res.status, ...(data.pending ? { pending: true, code: data.code as string } : {}) }); }
+  if (!res.ok) {
+    const data = await res.json(); if (res.status === 409) stale = true;
+    // The owner replaced the trip key meanwhile: what this page sealed is of the older generation (§8). Read again to take the new one.
+    if (res.status === 409 && data.error === "旅行の鍵が替わりました。開き直してください" && id) { await reload(); throw new Error("旅行の鍵が替わりました。もう一度保存してください"); }
+    throw Object.assign(new Error(data.error ?? "通信に失敗しました"), { status: res.status, gone: data.seat === "gone", ...(data.pending ? { pending: true, code: data.code as string } : {}) }); }
   return res.json();
 }
 // The seat is held by the cookie this browser keeps. It is a bearer key: a copy opens the trip from any device, and nothing here
@@ -83,7 +96,8 @@ const noPrf = "このブラウザ（またはこのパスキー）では、自�
 const passkeyCannotRead = "このパスキーでは読めませんでした。この旅行に登録したパスキーを選んでください。別の端末から QR で使った場合は、パスキーのある端末で直接開いてください。";
 // This browser's copy of the memo key, per trip, in IndexedDB: a key that cannot be taken out, next to the wrapped form it was
 // opened from, so a key from before a re-invite (another seat, another wrapped key) is never used. Kept in memory as well, for a
-// browser that has no IndexedDB (private browsing): there it lasts as long as the page.
+// browser that has no IndexedDB (private browsing): there it lasts as long as the page. Both this and the seat's keys below go
+// with the trip's row when the seat or the trip is gone, or the trip is past its deletion (forgetTrip).
 let held: { trip: string; wrapped: string; key: CryptoKey } | undefined;
 function keyStore<T>(mode: IDBTransactionMode, use: (store: IDBObjectStore) => IDBRequest<T>) {
   return new Promise<T>((resolve, reject) => {
@@ -129,17 +143,53 @@ async function seatSecret(): Promise<SeatSecret | undefined> {
   const kept = await keyStore<{ x25519: string; secret: SeatSecret } | undefined>("readonly", s => s.get(`seat:${id}`)).catch(() => undefined);
   return kept?.x25519 === pub ? kept.secret : undefined;
 }
-async function keepSeat(x25519: string, secret: SeatSecret, ed25519?: string) {
+// `generation`: the trip key's generation this browser last took (docs/design/trip-e2e.md §8): a later one is taken only when
+// the owner signed it (acceptRekey). A pair kept before it was recorded takes the generation it holds, once.
+async function keepSeat(x25519: string, secret: SeatSecret, ed25519?: string, generation?: number) {
   heldSeat = { trip: id!, x25519, secret };
-  await keyStore("readwrite", s => s.put({ x25519, secret, ...(ed25519 ? { ed25519 } : {}) }, `seat:${id}`)).catch(() => undefined);
+  // The same pair kept again (brought back with the passkey) keeps the generation this browser took: forgetting it would let a
+  // later generation in unchecked.
+  const before = await keptSeat(), same = before?.x25519 === x25519;
+  ed25519 ??= same ? before?.ed25519 : undefined; generation ??= same ? before?.generation : undefined;
+  await keyStore("readwrite", s => s.put({ x25519, secret, ...(ed25519 ? { ed25519 } : {}), ...(generation ? { generation } : {}) }, `seat:${id}`)).catch(() => undefined);
 }
-// The trip key, opened with this browser's copy of the seat's private key; undefined where this browser holds none.
+const keptSeat = () => keyStore<{ x25519: string; ed25519?: string; secret: SeatSecret; generation?: number } | undefined>("readonly", s => s.get(`seat:${id}`)).catch(() => undefined);
+async function keepGeneration(generation: number) {
+  const kept = await keptSeat();
+  if (kept) await keyStore("readwrite", s => s.put({ ...kept, generation }, `seat:${id}`)).catch(() => undefined);
+}
+// Whether the public keys the host lists for this seat are the ones whose private halves this browser holds: the Ed25519 key
+// signs what it verifies, and the X25519 key agrees on the same secret with a throwaway pair. The edges are walked from these.
+async function owns(secret: SeatSecret, pub: { x25519: string; ed25519: string }) {
+  try {
+    const m = crypto.getRandomValues(new Uint8Array(32)), signed = await crypto.subtle.sign("Ed25519", secret.ed25519, m);
+    if (!await crypto.subtle.verify("Ed25519", await crypto.subtle.importKey("raw", unb64(pub.ed25519), "Ed25519", false, ["verify"]), signed, m)) return false;
+    const other = await crypto.subtle.generateKey("X25519", false, ["deriveBits"]) as CryptoKeyPair;
+    const mine = await crypto.subtle.deriveBits({ name: "X25519", public: other.publicKey }, secret.x25519, 256);
+    const theirs = await crypto.subtle.deriveBits({ name: "X25519", public: await crypto.subtle.importKey("raw", unb64(pub.x25519), "X25519", false, []) }, other.privateKey, 256);
+    return b64(mine) === b64(theirs);
+  } catch { return false; }
+}
+// A later generation whose signature this browser could not trace to an owner seat it reaches: it is not opened (§8 (1)).
+let keyRefused = false;
+// The trip key, opened with this browser's copy of the seat's private key; undefined where this browser holds none, where the seat
+// holds an older generation than the trip's (it was left out when the key was replaced, and takes the present one by the codes),
+// and where a later generation is not the owner's.
 async function openTripKey() {
   const k = view.seatKey;
-  if (tripKey && k && tripKeyFrom === `${id}/${k.x25519}/${k.wrapped}`) return;
-  const secret = await seatSecret();
-  tripKey = k && secret ? await unwrapTripKey(k.wrapped, k.ephemeral, secret.x25519, id!, k.generation).catch(() => undefined) : undefined;
-  tripKeyFrom = tripKey && k ? `${id}/${k.x25519}/${k.wrapped}` : "";
+  // The same wrap opened before, while it is still of the trip's generation (a seat left out keeps its older wrap).
+  if (tripKey && k && tripKeyFrom === `${id}/${k.x25519}/${k.wrapped}` && (!view.sealed || k.generation === view.sealed.generation)) return;
+  const secret = await seatSecret(), kept = secret && await keptSeat();
+  tripKey = undefined; tripKeyFrom = ""; keyRefused = false;
+  if (!k || !secret || (view.sealed && k.generation !== view.sealed.generation)) return;
+  if (kept?.generation !== undefined && k.generation > kept.generation) {
+    const self = view.self && await owns(secret, k) ? { id: view.self.id, ed25519: k.ed25519 } : undefined;
+    if (!self || !await acceptRekey({ self, known: kept.generation, capsuleId: id!, seats: view.seats ?? [], seatKey: k })) { keyRefused = true; return; }
+  }
+  tripKey = await unwrapTripKey(k.wrapped, k.ephemeral, secret.x25519, id!, k.generation).catch(() => undefined);
+  if (!tripKey) return;
+  tripKeyFrom = `${id}/${k.x25519}/${k.wrapped}`;
+  if (kept && kept.generation !== k.generation) await keepGeneration(k.generation);
 }
 // A key made extractable only to be wrapped is read back as one that cannot be taken out.
 const sealedAway = async (key: CryptoKey, alg: "X25519" | "Ed25519", usages: KeyUsage[]) => crypto.subtle.importKey("pkcs8", await crypto.subtle.exportKey("pkcs8", key), alg, false, usages);
@@ -151,7 +201,7 @@ function ensureTripKey() {
       const seat = await newSeatKeys(), pub = await seatPublic(seat), wrap = await wrapTripKey(await newTripKey(), pub.x25519, id!, 1);
       await api("keys", "PATCH", { type: "seat", ...pub, ephemeral: wrap.ephemeral, generation: 1, wrapped: wrap.wrapped });
       view.seatKey = { ...pub, generation: 1, wrapped: wrap.wrapped, ephemeral: wrap.ephemeral }; view.keyed = true;
-      await keepSeat(pub.x25519, { x25519: await sealedAway(seat.x25519.privateKey, "X25519", ["deriveBits"]), ed25519: await sealedAway(seat.ed25519.privateKey, "Ed25519", ["sign"]) });
+      await keepSeat(pub.x25519, { x25519: await sealedAway(seat.x25519.privateKey, "X25519", ["deriveBits"]), ed25519: await sealedAway(seat.ed25519.privateKey, "Ed25519", ["sign"]) }, pub.ed25519, 1);
     } catch {
       // 409: another owner seat made them first. Read the keys again so this seat shows as waiting, not as one about to make them.
       stale = false;
@@ -163,16 +213,25 @@ function ensureTripKey() {
 }
 // With this seat's key pair in this browser and none wrapped by a passkey on the seat, makes a new pair, wraps the trip key to it
 // and puts both with the private keys wrapped by `prf`. The old private key cannot be taken out of IndexedDB to be wrapped, so the
-// pair is made again; with no edge signatures yet (§6 of the design) nothing refers to the old one.
+// pair is made again. The old Ed25519 key signs the new public keys (`since`), so the edges other seats signed over the old ones
+// still lead here, and this seat's own edges that still hold are signed again with the new key (docs/design/trip-e2e.md §8 (3)).
 async function sealSeatKeys(prf: BufferSource | undefined) {
   const k = view.seatKey, secret = await seatSecret();
   if (!prf || !id || !k || k.secret || !secret) return;
   const trip = await unwrapTripKey(k.wrapped, k.ephemeral, secret.x25519, id, k.generation, true);
   const seat = await newSeatKeys(), pub = await seatPublic(seat), wrap = await wrapTripKey(trip, pub.x25519, id, k.generation);
-  const body = { type: "seat", ...pub, ephemeral: wrap.ephemeral, generation: k.generation, wrapped: wrap.wrapped, secret: await wrapSeatSecret(seat, prf, id) };
+  const since = view.self && await owns(secret, k) ? await signSuccession(secret.ed25519, { x25519: k.x25519, ed25519: k.ed25519 }, { capsuleId: id, seat: view.self.id, ...pub }) : undefined;
+  const edges: Array<{ seat: string; signature: string }> = [];
+  for (const e of since ? k.edges ?? [] : []) {
+    // An edge holds over the other seat's present keys, or over its previous ones when that seat made its pair again (`since`).
+    const to = view.seats?.find(s => s.id === e.seat), target = to && { seat: to.id, x25519: to.x25519, ed25519: to.ed25519 };
+    const holds = target && (await verifyEdge(k.ed25519, e.signature, target, id) || (to.since !== undefined && await verifyEdge(k.ed25519, e.signature, { seat: to.id, x25519: to.since.x25519, ed25519: to.since.ed25519 }, id) && await verifySuccession(to, id)));
+    if (target && holds) edges.push({ seat: to.id, signature: await signEdge(seat.ed25519.privateKey, target, id) });
+  }
+  const body = { type: "seat", ...pub, ephemeral: wrap.ephemeral, generation: k.generation, wrapped: wrap.wrapped, secret: await wrapSeatSecret(seat, prf, id), ...since && { since, edges } };
   const put = await api("keys", "PATCH", body);
   view.seatKey = put.seatKey;
-  await keepSeat(pub.x25519, { x25519: await sealedAway(seat.x25519.privateKey, "X25519", ["deriveBits"]), ed25519: await sealedAway(seat.ed25519.privateKey, "Ed25519", ["sign"]) });
+  await keepSeat(pub.x25519, { x25519: await sealedAway(seat.x25519.privateKey, "X25519", ["deriveBits"]), ed25519: await sealedAway(seat.ed25519.privateKey, "Ed25519", ["sign"]) }, pub.ed25519, k.generation);
   await openTripKey();
 }
 // The seat's private keys opened from what the passkey's PRF wrapped, when this browser holds none.
@@ -232,7 +291,8 @@ async function receiveKey() {
     const typed = await typedCode(); if (run !== handoffRun || !typed) return;
     if (typed.trim() !== codes.giver) { await api("keys", "PATCH", { type: "abandon", attempt: att }).catch(() => undefined); modal("鍵を受け取る", `<p>${wrongCode}</p>${retry("receive-key")}`); return; }
     modal("鍵を受け取る", "<p>コードが合いました。鍵を受け取っています…</p>");
-    const key = await watch(run, v => v.seatKey ? v.seatKey : v.handoff?.attempt === att ? undefined : null as never);
+    // A seat left out when the key was replaced still holds its older wrap: the one to wait for is to this attempt's keys.
+    const key = await watch(run, v => v.seatKey?.x25519 === pub.x25519 ? v.seatKey : v.handoff?.attempt === att ? undefined : null as never);
     if (run !== handoffRun) return;
     if (!key || key.ephemeral !== giver.ephemeral || key.x25519 !== pub.x25519 || key.ed25519 !== pub.ed25519) { modal("鍵を受け取る", `<p>${wrongCode}</p>${retry("receive-key")}`); return; }
     const opened = await unwrapTripKey(key.wrapped, key.ephemeral, secret.x25519, id, key.generation).catch(() => undefined);
@@ -240,6 +300,8 @@ async function receiveKey() {
     // The giver's public keys are the ones this screen kept at step 2, which the codes confirmed.
     const edge = await signEdge(secret.ed25519, { seat: giver.seat, x25519: giver.x25519, ed25519: giver.ed25519 }, id);
     await api("keys", "PATCH", { type: "edge", seat: giver.seat, signature: edge }).catch(() => undefined);
+    // Taken by the codes, so it is this browser's from now on, whichever generation it is.
+    await keepGeneration(key.generation);
     await finishHandoff("旅行の鍵を受け取りました。");
   } catch (err) { if (run === handoffRun) modal("鍵を受け取る", `<p>${e((err as Error).message)}</p>${retry("receive-key")}`); }
 }
@@ -374,7 +436,7 @@ async function passkeyLogin() {
   const prf = prfOf(credential);
   if (prf) {
     const seat = await restoreSeat(prf).then(() => Boolean(tripKey), () => false), memo = Boolean(view.privateKey) && await unlock(prf).then(() => true, () => false);
-    if (seat || memo) { await openAll(); render(); }
+    if (seat || memo) { await openAll(); render(); await rekeyIfDue(); }
   }
 }
 // Cancelling the OS dialog is not an error worth a red banner.
@@ -474,29 +536,138 @@ async function creatorEnrollScreen(secret: string) {
   app.innerHTML = `<header class="topbar"><a class="brand" href="/">旅のカプセル</a></header><main class="empty"><h1>作成者として登録する</h1><p>この端末でパスキーを作ると、この端末から新しい旅行を作れるようになります。作成者の権利では、誰の旅行の中身も読めません。作った旅行は、保存したときに、この端末をオーナーにするか、オーナーのリンクを受け取って別の端末・別の人に渡すかを選びます。</p>${able ? `${button("この端末でパスキーを作る", "creator-register", "primary")}<p class="muted">登録リンクは1回だけ使えます。パスキーを作れなかったときは、リンクはそのまま使えます。</p>` : '<p class="warning">この端末ではパスキーを作れないため、作成者になれません。スマホの既定のブラウザ（Safari・Chrome）で開き直してください。</p>'}</main>`;
 }
 // Trips this browser has joined. Holds no secret: the HttpOnly cookie is still required, this only lets the top page link back.
-type Joined = { id: string; title: string; startsOn: string; endsOn: string; purgeAt: string };
-function joined(): Joined[] { try { return (JSON.parse(localStorage.getItem("capsules") ?? "[]") as Joined[]).filter(t => +new Date(t.purgeAt) > Date.now()); } catch { return []; } }
-function remember(update: (list: Joined[]) => Joined[]) { try { localStorage.setItem("capsules", JSON.stringify(update(joined()).slice(-30))); } catch { /* private browsing: bookmark is the only way back */ } }
+function saved(): Joined[] { try { return JSON.parse(localStorage.getItem("capsules") ?? "[]") as Joined[]; } catch { return []; } }
+function joined(): Joined[] { const gone = expiredIn(saved(), Date.now()); return saved().filter(t => !gone.includes(t.id)); }
+// The rows past their deletion stay until the top page forgets them with their keys (forgetTrip): dropped here, their keys would stay.
+function remember(update: (list: Joined[]) => Joined[]) { try { localStorage.setItem("capsules", JSON.stringify(update(saved()).slice(-30))); } catch { /* private browsing: bookmark is the only way back */ } }
+// What this browser put here for one trip: its memo key and seat keys, the setting to leave footprints, and its row in the list.
+async function forgetTrip(trip: string) {
+  await keyStore("readwrite", s => s.delete(trip)).catch(() => undefined);
+  await keyStore("readwrite", s => s.delete(`seat:${trip}`)).catch(() => undefined);
+  try { localStorage.removeItem(`auto-footprint:${trip}`); } catch { /* private browsing: nothing was kept */ }
+  remember(list => list.filter(t => t.id !== trip));
+  if (held?.trip === trip) held = undefined;
+  if (heldSeat?.trip === trip) heldSeat = undefined;
+  if (trip === id) { tripKey = undefined; tripKeyFrom = ""; }
+}
 // A sealed trip is listed on this browser by its plain dates only: its title stays out of localStorage (§4).
 async function reload() { await load(); if (id) remember(list => [...list.filter(t => t.id !== id), { id, title: view.sealed ? "暗号化した旅行" : view.spec.title, startsOn: view.spec.trip.startsOn, endsOn: view.spec.trip.endsOn, purgeAt: view.spec.lifecycle.purgeAt }]); }
 // The page a trip opens on is chosen once, on the first load: a press of a tab, a reload or the 20-second refresh keeps the one shown.
 async function load() {
+  loads++;
   view = id ? await api() : { ...await api("/v1/preview"), role: "owner", state: "draft" }; stale = false;
   await openAll(); await openSealed();
   if (!opened && !locked) { opened = true; tab = firstPage(pageModules(), view.state); }
   render();
+  await rekeyIfDue();
+}
+// A seat that held the key is gone (revoked, its invite rotated or revoked, or past its invite's end): the owner's browser
+// replaces the key at once (§8), on reading the trip and on taking the key back with the passkey. Once a page: a failure is told
+// and tried again on the next opening.
+async function rekeyIfDue() {
+  if (view.rekey === "auto" && view.role === "owner" && tripKey && !rekeying && !rekeyFailed) {
+    rekeying = true;
+    try { await rekeyTrip(); } catch (err) { rekeyFailed = true; notice((err as Error).message, true); } finally { rekeying = false; }
+  }
+  // After the owner invite was handed over or replaced (/recover), the new owner holding the key is asked once a page whether to
+  // replace it: a person who only changed devices need not; one who gave the old device away or handed the trip over should.
+  if (view.rekey === "ask" && view.role === "owner" && tripKey && !rekeyAsked) {
+    rekeyAsked = true;
+    modal("鍵を替えますか", `<p>前のオーナーの端末で読める鍵のままです。鍵を替えますか。同じ人が端末を替えただけなら、替えなくてかまいません。古い端末を手放す・別の人に渡したなら替えてください。</p><div class="admin-actions">${button("鍵を替える", "rekey", "primary")}${button("替えない", "rekey-keep", "secondary")}</div>`);
+  }
+}
+let rekeyAsked = false;
+// The trip key replaced with the next generation by this owner's browser (docs/design/trip-e2e.md §8): the trip as the host holds
+// it opened with the present key and sealed again with a new one (resealAll), the new key wrapped to every seat this seat reaches
+// by the edges and signed by this seat, all in one POST rekey. A seat not reached takes the key again by the codes. Another
+// member's change meanwhile (409) is read again once; a second one stops.
+let rekeying = false, rekeyFailed = false;
+async function rekeyTrip() {
+  for (let attempt = 0; ; attempt++) {
+    const raw = await api() as Omit<View, "footprints"> & { footprints: Array<{ id: string; point: string; by: string }> }, k = raw.seatKey, secret = await seatSecret();
+    if (!id || !raw.sealed || !k || !raw.self || !secret || !await owns(secret, k)) throw new Error("この端末には旅行の鍵がありません");
+    const grants = await api("grants") as Array<{ id: string; label: string; members: Array<{ id: string; label: string }> }>;
+    const old = await unwrapTripKey(k.wrapped, k.ephemeral, secret.x25519, id, k.generation, true), key = await newTripKey(), generation = raw.sealed.generation + 1;
+    const sealed = await resealAll(old, key, id, generation, { spec: raw.spec as unknown as SealedSpec, document: raw.document as unknown as SealedDocument, footprints: raw.footprints.map(p => ({ id: p.id, point: p.point, by: p.by })), members: grants.flatMap(g => g.members).map(m => ({ id: m.id, label: m.label })), grants: grants.map(g => ({ id: g.id, label: g.label })) });
+    const seats = raw.seats ?? [], reached = await reachableSeats({ id: raw.self.id, ed25519: k.ed25519 }, seats, id);
+    // This seat's own wrap goes to the key it just showed it holds, not to the one the list names.
+    const to = seats.filter(s => reached.has(s.id)).map(s => s.id === raw.self!.id ? { ...s, x25519: k.x25519 } : s);
+    const wraps = await Promise.all(to.map(async s => { const w = await wrapTripKey(key, s.x25519, id, generation); return { seat: s.id, ...w, signature: await signRekey(secret.ed25519, { capsuleId: id, generation, seat: s.id, x25519: s.x25519, ...w }) }; }));
+    try { await api("rekey", "POST", { generation, ...sealed, seats: wraps, confirm: true }, raw.document.revision); }
+    catch (err) { if ((err as { status?: number }).status === 409 && attempt === 0) continue; throw (err as { status?: number }).status === 409 ? new Error("鍵を替えられませんでした。開き直してください") : err; }
+    await keepGeneration(generation); await reload();
+    const left = seats.length - to.length;
+    notice(left ? `旅行の鍵を替えました。${left} 人は確認コードで鍵を受け取り直します。` : "旅行の鍵を替えました。");
+    return;
+  }
 }
 // A sealed trip (docs/design/trip-e2e.md §3, §4) is opened here, once, right after it is read: the rest of the screen draws the
 // plain trip as before. What did not open or did not pass the plain shape is left out and counted (`unreadable`). The opened words
 // live in `view` only, never in IndexedDB or localStorage. `locked`: why the plan cannot be shown on this browser.
-let locked = "";
+let locked = "", sealedNow: { spec: SealedSpec; document: SealedDocument } | undefined;
 async function openSealed() {
-  locked = ""; view.unreadable = [];
+  locked = ""; view.unreadable = []; sealedNow = undefined;
   if (!view.sealed) return;
-  if (!tripKey) { locked = "この旅行の旅程は暗号化されています。旅行の鍵を受け取ると読めます。"; return; }
+  if (!tripKey) { view.footprints = []; locked = keyRefused ? unverifiedKey : "オーナーかメンバーから鍵を受け取ってください"; return; }
   const t = await openTrip(tripKey, id!, view as unknown as { spec: SealedSpec; document: SealedDocument });
-  if (!t) { locked = "旅程を開けません（旅行の鍵が合いません）"; return; }
+  if (!t) { view.footprints = []; locked = "旅程を開けません（旅行の鍵が合いません）"; return; }
+  // The ciphertext as the host sent it, kept for a revise or an undo: a record left as it was is sent back as it came (resealTrip).
+  sealedNow = { spec: view.spec as unknown as SealedSpec, document: view.document as unknown as SealedDocument };
   view.spec = t.spec; view.document = t.document; view.unreadable = t.unreadable;
+  view.footprints = await openFootprints(view.footprints ?? []);
+  if (view.label !== undefined && view.self) view.label = await nameOf("member", view.self.id, view.label);
+  for (const w of view.waiting ?? []) w.label = await nameOf("member", w.id, w.label);
+  if (view.role === "owner" && !namesSealed) { namesSealed = true; void sealNames(); }
+}
+// A name in a sealed trip (docs/design/trip-e2e.md §3.1, the `Session`, `Grant` and `Audit` rows): a seat's or an invite's,
+// opened with the trip's key. One that is not ciphertext is the host's own (「自分用」「招待リンク」「オーナー」「メンバー3」) and
+// shows as it is. Every name the screen shows of a sealed trip goes through here: invites, members, who issued, the history
+// and the seats waiting for the key.
+async function nameOf(kind: "member" | "grant", rid: string, value: string) {
+  if (!view.sealed) return value;
+  return (tripKey && await openName(tripKey, id!, kind, rid, value)) ?? "（開けない名前）";
+}
+// The names the host gave the seats (「オーナー」「メンバー3」) are put back sealed by the owner's browser (§3.1), once a page and
+// whenever 招待とメンバー is opened, through members PATCH as a rename. A failure says nothing: the next opening tries again.
+// One pass at a time, each reading the names afresh, and a rename waits for the pass under way (`namesSealing`): a pass
+// holding names it read before must not put a seat's default name back over the owner's rename.
+const sealedForm = /^v1\.[1-9][0-9]{0,5}\.[A-Za-z0-9_-]+$/;
+let namesSealed = false, namesSealing: Promise<void> = Promise.resolve();
+function sealNames() {
+  return namesSealing = namesSealing.then(async () => {
+    if (!view.sealed || view.role !== "owner" || !tripKey) return;
+    const grants = await api("grants").catch(() => []) as Array<{ members: Array<{ id: string; label: string }> }>;
+    for (const m of grants.flatMap(g => g.members).filter(m => !sealedForm.test(m.label))) {
+      try { await api("members", "PATCH", { id: m.id, label: await sealName(tripKey, id!, view.sealed.generation, "member", m.id, m.label) }); } catch { /* next time */ }
+    }
+  });
+}
+// What a sealed trip sends as a name: sealed against its seat or invite. A plain trip's goes as it is.
+const nameFor = async (kind: "member" | "grant", rid: string, name: string) => view.sealed && tripKey ? sealName(tripKey, id!, view.sealed.generation, kind, rid, name) : name;
+const newGrantId = () => crypto.randomUUID().replaceAll("-", "");
+// A sealed trip's footprints (docs/design/trip-e2e.md §3.1, the footprint row), opened into the shape the plain trip's come in,
+// so the map, the list, the narrowing and `autoDue` draw them as before. One that does not open or is out of range (§4) is left
+// out and counted in `unreadable`, never drawn somewhere false. The opened points live in `view` only.
+async function openFootprints(list: HostFootprint[]): Promise<Footprint[]> {
+  if (!view.sealed) return list as Footprint[];
+  const out: Footprint[] = [];
+  for (const p of list) {
+    const point = "point" in p && tripKey ? await openPoint(tripKey, id!, p.id, p.point) : null, by = point && await openName(tripKey!, id!, "footprint", p.id, p.by);
+    if (point && by) out.push({ id: p.id, at: p.at, ...point, by, mine: p.mine, auto: p.auto });
+    else if (!view.unreadable?.includes(`footprint/${p.id}`)) view.unreadable = [...view.unreadable ?? [], `footprint/${p.id}`];
+  }
+  return out;
+}
+// Every footprint this browser leaves goes through here. A sealed trip's is checked against the range, then sealed under the
+// trip's key against an id chosen here, with this seat's name then as `by` (§3.1, §4); the host checks the rest.
+async function sendFootprint(point: PlainPoint, auto?: true): Promise<Footprint[]> {
+  const add = (body: object) => api("footprints", "PATCH", { type: "add", ...body, ...auto && { auto } }) as Promise<{ footprints: HostFootprint[] }>;
+  if (!view.sealed) return (await add(point)).footprints as Footprint[];
+  if (!tripKey) throw new Error("この端末には旅行の鍵がありません");
+  if (!pointSchema.safeParse(point).success) throw new Error("位置を確認してください");
+  const fid = crypto.randomUUID().replaceAll("-", ""), generation = view.sealed.generation;
+  const me = (view.self && await openName(tripKey, id!, "member", view.self.id, view.self.label)) || "（名前なし）";
+  return openFootprints((await add({ id: fid, point: await sealPoint(tripKey, id!, generation, fid, point), by: await sealName(tripKey, id!, generation, "footprint", fid, me) })).footprints);
 }
 // Every change to the trip's document goes through here. A sealed trip's is the same plain operation, checked and sealed under
 // the trip's key just before it is sent (§4): a word the plain trip would refuse is refused here, before anything leaves.
@@ -524,15 +695,19 @@ const assistCard = () => assistKey
   ? `<div class="card" data-assist-card><h2>ここで作る</h2><p>行き先・日程・人数・やりたいことを書くと、あなたの Anthropic API キーで旅程を作ります。できた旅程は、貼り付けたときと同じ画面で確認できます。確認して保存するまでは、旅行として残りません。</p><label>希望<textarea data-assist rows="5" placeholder="行き先・日程・人数・やりたいことを書いてください"></textarea></label><div class="admin-actions">${button("旅程を作る", "assist-run", "primary")}${button("API キーを削除", "assist-key-delete", "quiet danger-text")}</div><ul class="paste-problems assist-problems" hidden></ul><p class="muted">書いた希望は Anthropic に送られます。本名・予約番号は書かないでください。費用はあなたの Anthropic アカウントに請求されます。30 日使わないと、鍵はこのホストから自動で削除します。</p></div>`
   : `<div class="card" data-assist-card><h2>ここで作る</h2><p>あなたの Anthropic API キーで、この画面から旅程を作れます。費用はあなたの Anthropic アカウントに請求されます。鍵はこのホストに暗号化して保存し、画面には二度と表示しません。30 日使わないと、鍵はこのホストから自動で削除します。</p><form data-form="assist-key"><label>Anthropic API キー<input name="key" type="password" autocomplete="off" required placeholder="sk-ant-…"></label><button class="primary">鍵を登録</button></form></div>`;
 async function creationHome() {
+  for (const trip of expiredIn(saved(), Date.now())) await forgetTrip(trip);
   const account = await api("/v1/account"); canCreate = account.canCreate ?? account.signedIn; localOnly = account.localOnly; creatorLabel = account.creator?.label ?? ""; assistKey = Boolean(account.assistKey);
   const today = new Date().toISOString().slice(0, 10);
   const unowned: Array<{ id: string; title: string; startsOn: string; endsOn: string; purgeAt: string }> = creatorLabel ? await api("/v1/creators/trips", "POST", {}).catch(() => []) : [];
   app.innerHTML = `<header class="topbar"><a class="brand" href="/">旅のカプセル</a></header><main><section class="content"><span class="eyebrow">YOUR PRIVATE TRIP</span><h1>旅ごとに、<br>小さなしおりを。</h1><p>公開ページには誰の旅行も載せません。作成した旅行は、招待した人とだけ共有できます。</p>${joined().length ? `<div class="card"><h2>この端末で参加中の旅行</h2><div class="grant-list">${joined().reverse().map(t => `<div class="grant"><div><strong>${e(t.title)}</strong><small>${e(t.startsOn)}〜${e(t.endsOn)}</small></div><a class="button secondary" href="/c/${t.id}">開く</a></div>`).join("")}</div></div>` : ""}${!canCreate ? `<div class="card"><p>旅行のしおりは、受け取った招待リンクから開いてください。アカウント登録は不要です。</p></div><div class="card"><h2>旅行を作る方へ</h2>${passkeys ? `<p>作成者として登録済みの方は、パスキーでサインインしてください。</p><div class="admin-actions">${button("作成者としてサインイン", "creator-login", "secondary")}</div>` : '<p class="muted">このブラウザではパスキーが使えないため、作成者としてサインインできません。</p>'}</div>` : `${creatorLabel ? `<div class="card"><p>作成者: <strong>${e(creatorLabel)}</strong></p><p class="muted">作った旅行は、保存したときに、この端末をオーナーにするか、オーナーのリンクを受け取って別の端末・別の人に渡すかを選びます。</p><div class="admin-actions">${button("別の端末を追加", "creator-add-device", "quiet")}${button("サインアウト", "creator-signout", "quiet")}</div></div>` : ""}${unowned.length ? `<div class="card"><h2>オーナーを決めていない旅行</h2><p class="muted">保存したあと、オーナーを選ばずに閉じた旅行です。オーナーを決めるまで誰も開けません。削除予定日を過ぎると自動で消えます。「オーナーを決める」を押すと、前に受け取ったオーナーリンクは使えなくなります。</p><div class="grant-list">${unowned.map(t => `<div class="grant"><div><strong>${e(t.title)}</strong><small>${e(t.startsOn)}〜${e(t.endsOn)} · 削除予定 ${e(t.purgeAt.slice(0, 10))}</small></div><div>${button("オーナーを決める", "unowned-owner", "secondary", `data-id="${t.id}"`)}${button("削除", "unowned-purge", "quiet danger-text", `data-id="${t.id}" data-title="${e(t.title)}"`)}</div></div>`).join("")}</div></div>` : ""}<form data-form="create" class="card"><h2>新しい旅行を作成</h2>${localOnly ? '<p class="warning">開発用のローカル環境です。外部公開はしていません。</p>' : ""}<label>旅行のタイトル<input name="title" required maxlength="160" placeholder="週末の旅行"></label><label>行き先<input name="destination" required maxlength="160" placeholder="行き先を入力"></label><div class="form-grid"><label>初日<input name="start" type="date" required value="${today}"></label><label>最終日<input name="end" type="date" required value="${today}"></label></div><button class="primary">空のしおりを確認</button></form>${assistCard()}<div class="card"><h2>チャットで作って、貼り付ける</h2><p>「作り方をコピー」を押して、ChatGPTなどの使い慣れたアプリに貼り、旅行の希望を伝えてください。返ってきた答えを、前後の文ごとそのまま下に貼れます。</p><div class="admin-actions">${button("作り方をコピー", "copy-recipe", "secondary")}</div><label>チャットの返事<textarea data-paste rows="5" placeholder="返事をそのまま貼ってください（前後の文が混ざっていても大丈夫です）"></textarea></label><div class="admin-actions">${button("内容を確認する", "check-paste", "primary")}</div><ul class="paste-problems" hidden></ul><p class="muted">貼った内容は、確かめるためにこのサーバーへ送りますが、確認して保存するまでは残しません。本名・予約番号が混ざっていないか、取り込み前に確かめてください。</p><hr><h3>ファイルから取り込む</h3><label>旅程ファイル<input type="file" accept="application/json,.json" data-import="trip"></label></div>`}</section></main>`;
 }
+const unverifiedKey = "新しい鍵を確かめられません。オーナーかメンバーから鍵を受け取り直してください";
+const lastKey = "鍵を持つメンバーが他にいないため、交換すると旅程をだれも読めなくなります。先に別の端末かメンバーに鍵を渡してください";
 // Whether this browser holds the trip's key (#689). The plan is still plain; a seat that has none waits for another seat's hand-over.
 const keyStatus = () => !id || view.state === "draft" ? ""
   : tripKey ? `<span data-trip-key="held">この端末に鍵がある</span>`
-  : view.seatKey ? `<span data-trip-key="missing">この端末には旅行の鍵がありません</span>`
+  : keyRefused ? `<span data-trip-key="unverified">${unverifiedKey}</span>${button("鍵を受け取る", "receive-key", "quiet")}`
+  : view.seatKey && !(view.sealed && view.seatKey.generation !== view.sealed.generation) ? `<span data-trip-key="missing">この端末には旅行の鍵がありません</span>`
   : view.role !== "owner" || view.keyed ? `<span data-trip-key="waiting">鍵を待っています。鍵を持つメンバーと確認コードを伝え合うと受け取れます</span>${button("鍵を受け取る", "receive-key", "quiet")}` : "";
 // Seats that wait for the key, shown to a seat that holds it (any role): each with 「渡す」.
 const handoffWaiting = () => tripKey && view.waiting?.length ? view.waiting.map(w => `<span data-handoff-waiting="${e(w.id)}">${e(w.label)}が鍵を待っています</span>${button("渡す", "give-key", "quiet", `data-id="${e(w.id)}" data-label="${e(w.label)}"`)}`).join("") : "";
@@ -634,7 +809,7 @@ function savePrivateMarkdown() {
   const text = privateMarkdown(view.spec, opened, own().length - opened.length, new Date().toISOString());
   download(text, "text/markdown;charset=utf-8", `trip-${view.spec.trip.startsOn}-private.md`);
 }
-function download(text: string, type: string, name: string) {
+function download(text: BlobPart, type: string, name: string) {
   const link = document.createElement("a"); link.href = URL.createObjectURL(new Blob([text], { type })); link.download = name;
   document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(link.href), 60000);
 }
@@ -716,7 +891,7 @@ async function leaveFootprint(given?: GeolocationPosition) {
   const { latitude: lat, longitude: lng, accuracy } = position.coords;
   // Tenths of a kilometre rounded up, so that a fix just over the limit never reads as 約1.0 km.
   if (accuracy > 1000) return notice(`位置の精度が低い（約${(Math.ceil(accuracy / 100) / 10).toFixed(1)} km）ため残しませんでした。もう一度押してください。`, true);
-  await api("footprints", "PATCH", { type: "add", lat, lng, accuracy }); await reload(); notice("足あとを残しました。");
+  await sendFootprint({ lat, lng, accuracy }); await reload(); notice("足あとを残しました。");
 }
 // Turning it on is the one time the position is asked for: opening the page later only uses a permission already given.
 // Nothing is left now; the next opening is the first.
@@ -743,8 +918,8 @@ async function autoFootprint() {
     const latest = await api() as View;
     // Turned off or hidden while the fix or the read was on its way: nothing is sent.
     if (!autoStep || document.visibilityState !== "visible") return;
-    if (!autoDue(latest.footprints?.filter(p => p.mine).at(-1), Date.now(), { lat, lng })) return;
-    view.footprints = (await api("footprints", "PATCH", { type: "add", lat, lng, accuracy, auto: true }) as { footprints: Footprint[] }).footprints;
+    if (!autoDue((await openFootprints(latest.footprints ?? [])).filter(p => p.mine).at(-1), Date.now(), { lat, lng })) return;
+    view.footprints = await sendFootprint({ lat, lng, accuracy }, true);
     if (onFootprints() && !app.querySelector("form") && !dialog.open) render();
   } catch { /* left unsaid, as above */ } finally { autoStepping = false; }
 }
@@ -837,11 +1012,43 @@ function boundaryRows() {
   buttons.forEach((button, k) => { if (gaps[k]) { button.classList.add('boundary-wrapped'); button.style.setProperty('--wrapped-gaps', String(gaps[k])); } });
 }
 new ResizeObserver(boundaryRows).observe(app);
+// A plain trip is moved to the sealed form once, by its owner's browser at a press (docs/design/trip-e2e.md §5): until then it is
+// used as before. A trip published after the host's line (`mustSeal`) shows this alone. A browser without WebAuthn cannot move it.
+const moveBanner = () => !id || view.sealed || !["active", "reflection"].includes(view.state) ? ""
+  : view.role !== "owner" ? `<p class="muted" data-move="member">オーナーが開くと、この旅行は運用者にも読めない形になります</p>`
+  : !passkeys ? `<p class="warning" data-move="no-passkey">${view.mustSeal ? "この旅行は、パスキーの使えるブラウザでオーナーが移すまで開けません" : "このブラウザでは旅行を移せません。パスキーの使える別のブラウザ（Safari・Chrome など）で開いてください"}</p>`
+  : `<div class="preview-banner" data-move="owner"><div><strong>この旅行を、メンバーにだけ読める形に移します。</strong><p>移すと、運用者にも読めなくなります。</p></div>${button("移す", "move-trip", "primary")}</div>`;
+// The trip as the host has it now, with the step back (GET seal) and every member's and invite's name, sealed under the trip's key
+// and put back in one POST seal (src/trip-keys.ts sealMove), whose passkey check api() asks for (428). Too large with the step
+// back, it goes once more without it; too large still, it stays plain. A point or a seat added meanwhile: read again, once.
+let moving = false;
+async function moveTrip() {
+  if (moving) return; moving = true;
+  try {
+    await ensureTripKey();
+    const generation = view.seatKey?.generation;
+    if (!tripKey || !generation) { notice("この端末には旅行の鍵がありません", true); return; }
+    for (let attempt = 0; ; attempt++) {
+      const now = await api() as View, { previous } = await api("seal"), grants = await api("grants");
+      const input = { spec: now.spec, document: now.document, previous, footprints: (now.footprints ?? []).map(({ id, lat, lng, accuracy, by }) => ({ id, lat, lng, accuracy, by })), grants };
+      try {
+        try { await api("seal", "POST", await sealMove(tripKey, id!, generation, input), now.document.revision); }
+        catch (err) { if ((err as { status?: number }).status !== 413) throw err; await api("seal", "POST", await sealMove(tripKey, id!, generation, input, { dropPrevious: true }), now.document.revision); }
+        break;
+      } catch (err) {
+        if ((err as { status?: number }).status === 413) { notice("旅程が大きすぎて移せません。予定や投稿を減らしてください", true); return; }
+        if (attempt === 0 && (err as { status?: number }).status === 409 && (err as Error).message.endsWith("もう一度移してください")) continue;
+        throw err;
+      }
+    }
+    await reload(); notice("旅行を、メンバーにだけ読める形に移しました。");
+  } catch (err) { notice((err as Error).message, true); } finally { moving = false; }
+}
 function render() {
   mapCamera = unmountMap?.(); unmountMap = undefined; mapData = undefined;
-  if (locked) {
+  if (locked || view.mustSeal) {
     document.title = "旅のカプセル";
-    app.innerHTML = `<header class="topbar"><a class="brand" href="/" aria-label="ホーム（旅のカプセル）"><span class="brand-icon">旅</span> <span class="brand-name">旅のカプセル</span></a><div class="top-actions"><a class="button quiet" href="/">ホーム</a><span class="role">${roleNames[view.role]}</span>${button("再読込", "reload", "quiet")}</div></header><main><section class="content"><p class="warning" data-sealed="locked">${e(locked)}</p></section><footer>${passkeys ? button(view.passkey ? "パスキーを登録し直す" : "パスキーで戻れるようにする", "passkey-register", "quiet") : ""}${button("この端末からログアウト", "signout", "quiet")}${keyStatus()}${handoffWaiting()}</footer></main>`;
+    app.innerHTML = `<header class="topbar"><a class="brand" href="/" aria-label="ホーム（旅のカプセル）"><span class="brand-icon">旅</span> <span class="brand-name">旅のカプセル</span></a><div class="top-actions"><a class="button quiet" href="/">ホーム</a><span class="role">${roleNames[view.role]}</span>${button("再読込", "reload", "quiet")}</div></header><main><section class="content">${view.mustSeal ? moveBanner() || `<p class="warning" data-move="closed">共有が終わったため、この旅行は開けません</p>` : `<p class="warning" data-sealed="locked">${e(locked)}</p>`}</section><footer>${passkeys ? button(view.passkey ? "パスキーを登録し直す" : "パスキーで戻れるようにする", "passkey-register", "quiet") : ""}${button("この端末からログアウト", "signout", "quiet")}${keyStatus()}${handoffWaiting()}</footer></main>`;
     return;
   }
   document.title = `${view.spec.title} · 旅のカプセル`;
@@ -854,8 +1061,9 @@ function render() {
   if (!pages.some(m => m.id === tab)) tab = pages[0]!.id;
   const s = view.spec, d = view.document;
   const remaining = Math.max(0, Math.ceil((+new Date(s.lifecycle.purgeAt) - Date.now()) / 86400000));
-  app.innerHTML = `<header class="topbar"><a class="brand" href="/" aria-label="ホーム（旅のカプセル）"><span class="brand-icon">旅</span> <span class="brand-name">旅のカプセル</span> <span class="brand-en">TRIP CAPSULE</span></a><div class="top-actions">${id ? '<a class="button quiet" href="/">ホーム</a>' : ""}<span class="role">${roleNames[view.role]}</span>${id ? button("再読込", "reload", "quiet") : ""}${id && !view.sealed ? button("旅を保存", "save", "secondary") : ""}${id && !view.sealed && view.role === "editor" && editable() ? button("チャットで直す", "revise", "secondary") : ""}${id && (view.role === "owner" || view.role === "editor") ? button("共有・管理", "manage", "primary") : ""}</div></header>
-    <div class="lifecycle ${remaining <= 7 ? "urgent" : ""}"><span>● ${stateNames[view.state]}</span><span>${dateLabel(s.lifecycle.purgeAt.slice(0, 10))} に自動削除 · あと${remaining}日${remaining <= 7 && editor() && !view.sealed ? " — 削除前に「旅を保存」で書き出してください" : ""}</span></div>
+  app.innerHTML = `<header class="topbar"><a class="brand" href="/" aria-label="ホーム（旅のカプセル）"><span class="brand-icon">旅</span> <span class="brand-name">旅のカプセル</span> <span class="brand-en">TRIP CAPSULE</span></a><div class="top-actions">${id ? '<a class="button quiet" href="/">ホーム</a>' : ""}<span class="role">${roleNames[view.role]}</span>${id ? button("再読込", "reload", "quiet") : ""}${id ? button("旅を保存", "save", "secondary") : ""}${id && revisable() && view.role === "editor" && editable() ? button("チャットで直す", "revise", "secondary") : ""}${id && (view.role === "owner" || view.role === "editor") ? button("共有・管理", "manage", "primary") : ""}</div></header>
+    <div class="lifecycle ${remaining <= 7 ? "urgent" : ""}"><span>● ${stateNames[view.state]}</span><span>${dateLabel(s.lifecycle.purgeAt.slice(0, 10))} に自動削除 · あと${remaining}日${remaining <= 7 && editor() ? " — 削除前に「旅を保存」で書き出してください" : ""}</span></div>
+    ${moveBanner()}
     ${view.unreadable?.length ? `<p class="warning" data-unreadable="${view.unreadable.length}">この端末で開けない記録が ${view.unreadable.length} 件あります</p>` : ""}
     ${view.state === "draft" ? `<div class="preview-banner"><div><strong>このしおりは公開前のプレビューです。</strong><p>内容・表示名・削除期限を確認して保存します。保存しただけでは招待リンクは配られません。</p></div>${button("内容を確認して作成", "publish", "primary")}</div>` : ""}
     <main><section class="hero"><div class="hero-copy"><span class="eyebrow">${e(s.presentation?.kicker ?? "A LITTLE GETAWAY")}</span><h1>${e(s.title)}</h1><p>${e(s.summary ?? "")}</p><div class="trip-meta"><span>${dateLabel(s.trip.startsOn)} — ${dateLabel(s.trip.endsOn)}</span><span>${e(s.timezone)}</span></div><div class="people">${(s.presentation?.travelers ?? []).map(t => `<span>${e(t.name.slice(0, 1))}</span>`).join("")}<small>${(s.presentation?.travelers ?? []).map(t => e(t.name) + (t.note ? `（${e(t.note)}）` : "")).join("・")}</small></div></div><div class="postcard" aria-hidden="true"><div class="postcard-top">POSTCARD <span>${e(s.presentation?.postcardLabel ?? s.trip.destinations[0]!)}</span></div><div class="landscape"><div class="sun"></div><div class="island one"></div><div class="island two"></div><div class="sea"></div><div class="boat">⛵</div></div><div class="postcard-bottom">${e(s.presentation?.postcardCaption ?? "旅に、出かけよう。").replace(/\n/g, "<br>")}<span>TRIP<br>CAPSULE</span></div></div></section>
@@ -1013,23 +1221,42 @@ const saveNotes: Record<"markdown" | "json" | "ics" | "html", string> = {
 // Every member copies the trip as Markdown; the ZIP stays with the owner and editors, as the host has it (#355).
 // The share sheet opens only right after a tap (transient activation), so the trip page is fetched when the dialog opens and
 // kept at hand for the tap. A fetch that failed is forgotten, so the tap asks again.
+// A sealed trip's exports are made here from the trip this browser opened, with the host's own functions (src/export.ts,
+// docs/design/trip-e2e.md §4); a plain trip's come from the host as before.
+const exported = async (kind: "html" | "md") => view.sealed ? (kind === "html" ? tripHtml : tripMarkdown)(view.spec, view.document) : (await api(kind === "html" ? "export.html" : "export.md")).text as string;
 let savedPage: Promise<string> | undefined, pageText: string | undefined;
 function fetchPage() {
-  const fetched = savedPage = api("export.html").then(r => r.text as string);
+  const fetched = savedPage = exported("html");
   fetched.then(t => { if (savedPage === fetched) pageText = t; }, () => { if (savedPage === fetched) savedPage = undefined; });
   return fetched;
 }
 function saveModal() {
   pageText = undefined; fetchPage();
-  modal("旅を保存", `<h3>旅程のページを保存</h3><p>日ごとの旅程・準備・候補などを、ブラウザで開ける 1 つのファイル（HTML）で保存します。アプリが無くても開けます。スマホでは共有から「ファイルに保存」や LINE・メールに送って残せます。</p><div class="admin-actions">${button("旅程のページを保存", "save-page", "primary")}</div><hr><h3>Markdown をコピー</h3><p>旅程・準備・候補・費用メモ・メモ・思い出をテキストでコピーします。軽く、メモアプリなどに貼ればアプリ無しで読めます。</p><div class="admin-actions">${button("Markdown をコピー", "copy-markdown", "secondary")}</div>${editor() ? `<hr><h3>ZIP を保存</h3><p>旅行のファイルをまとめて保存します。スマホでは「ファイル」アプリ（iPhone）やファイルマネージャ（Android）で ZIP をタップすると展開されます。</p><ul>${view.spec.exports.map(x => `<li>${e(saveNotes[x])}</li>`).join("")}</ul><div class="admin-actions"><a class="button secondary" href="/v1/c/${id}/export">ZIP を保存</a></div>` : ""}`);
+  modal("旅を保存", `<h3>旅程のページを保存</h3><p>日ごとの旅程・準備・候補などを、ブラウザで開ける 1 つのファイル（HTML）で保存します。アプリが無くても開けます。スマホでは共有から「ファイルに保存」や LINE・メールに送って残せます。</p><div class="admin-actions">${button("旅程のページを保存", "save-page", "primary")}</div><hr><h3>Markdown をコピー</h3><p>旅程・準備・候補・費用メモ・メモ・思い出をテキストでコピーします。軽く、メモアプリなどに貼ればアプリ無しで読めます。</p><div class="admin-actions">${button("Markdown をコピー", "copy-markdown", "secondary")}</div>${editor() ? `<hr><h3>ZIP を保存</h3><p>旅行のファイルをまとめて保存します。スマホでは「ファイル」アプリ（iPhone）やファイルマネージャ（Android）で ZIP をタップすると展開されます。</p><ul>${view.spec.exports.map(x => `<li>${e(saveNotes[x])}</li>`).join("")}</ul><div class="admin-actions">${view.sealed ? button("ZIP を保存", "save-zip", "secondary") : `<a class="button secondary" href="/v1/c/${id}/export">ZIP を保存</a>`}</div>` : ""}${view.unreadable?.length ? `<p class="warning" data-unreadable-save>この端末で開けない記録 ${view.unreadable.length} 件は、保存する内容に入りません</p>` : ""}`);
 }
 // An editor gets the same dialog for the viewer invites it hands out (the host lists only those); the rest is the owner's.
 async function manage() {
   const owner = view.role === "owner";
-  const [grants, history] = await Promise.all([api("grants"), owner ? api("history") : []]) as [Array<{ id: string; role: Role; label: string; expires: number; revoked: number | null; seats: number; claimed: number; claimBy: number; issuedBy: { id: string; label: string } | null; members: Array<{ id: string; label: string; device: string; created: number; self: boolean; pending?: boolean; code?: string }> }>, Array<{ event: string; at: number; role?: Role; label?: string; by?: string; device?: string }>];
+  const [grants, history] = await Promise.all([api("grants"), owner ? api("history") : []]) as [Array<{ id: string; role: Role; label: string; expires: number; revoked: number | null; seats: number; claimed: number; claimBy: number; issuedBy: { id: string; label: string } | null; members: Array<{ id: string; label: string; device: string; created: number; self: boolean; pending?: boolean; code?: string }> }>, Array<{ event: string; at: number; role?: Role; label?: string; by?: string; device?: string; grant?: string; seat?: string; member?: string }>];
+  if (view.sealed) {
+    if (owner) await sealNames();
+    for (const g of grants) {
+      g.label = await nameOf("grant", g.id, g.label);
+      if (g.issuedBy) g.issuedBy.label = await nameOf("member", g.issuedBy.id, g.issuedBy.label);
+      for (const m of g.members) m.label = await nameOf("member", m.id, m.label);
+    }
+    // A sealed trip's history names by id (§3.1, `Audit`): put back into the places a plain line has its names, the invite
+    // or the member it was about as `label` and who did it as `by`, as the host's label() did before.
+    const seats = new Map(grants.flatMap(g => g.members.map(m => [m.id, m.label]))), invites = new Map(grants.map(g => [g.id, g.label]));
+    const seat = (sid: string) => seats.get(sid) ?? "（失効したメンバー）";
+    for (const a of history) {
+      if (a.member !== undefined) a.label = seat(a.member); else if (a.grant !== undefined) a.label = invites.get(a.grant) ?? "（失効した招待）";
+      if (a.seat !== undefined) a.by = seat(a.seat);
+    }
+  }
   const day = (t: number) => new Date(t).toLocaleDateString("ja");
-  const undo = owner && !view.sealed && view.state !== "frozen" && await api("undo").then(() => true, () => false);
-  modal(owner ? "招待とメンバー、旅の終わり" : "閲覧者の招待", `${owner ? "" : "<p>あなたが出した閲覧者の招待です。失効できるのは自分が出した招待だけです。</p>"}<p>招待リンクは人数分の席を持ち、開いたブラウザを1席ずつ登録します。定員に達するか受付期限を過ぎたリンクは使えなくなり、登録済みのブラウザだけが入れます。登録したブラウザの鍵（Cookie）が他人に渡ると、その人も入れます。</p><p>招待の発行・失効${owner ? "、共有終了、削除、期限の変更" : ""}の前に、この端末のパスキーで本人確認します（5 分間有効）。</p>${location.protocol === "http:" ? '<p class="warning">現在はこのPC内のローカル版です。別の端末から使うには、HTTPSの公開ホストへ配置してください。</p>' : ""}<form data-form="grant"><div class="form-grid"><label>権限<select name="role">${owner ? '<option value="participant">参加者：候補・チェック・思い出</option><option value="viewer">閲覧者：見るだけ</option><option value="editor">編集者：旅程も編集</option>' : '<option value="viewer">閲覧者：見るだけ</option>'}</select></label><label>リンク名（任意）<input name="label" maxlength="80" placeholder="空欄なら自動で付けます"></label><label>人数（席）<input name="seats" type="number" required min="1" max="50" value="1"></label><label>受付期限（日）<input name="claimDays" type="number" required min="1" max="30" value="3"></label>${owner ? '<label>参加の承認<select name="approval"><option value="auto">自動で参加（既定）</option><option value="owner">オーナーが確認コードで承認</option></select></label>' : ""}</div>${owner ? '<p class="muted">機密度の高い旅行向け。参加者の画面に出る 6 桁のコードを LINE などで聞いて照合します。</p>' : ""}<button class="primary" ${view.state === "frozen" ? "disabled" : ""}>招待リンクを発行</button></form><div class="grant-list">${grants.map(g => `<div class="grant"><div><strong>${e(g.label)}</strong><small>${roleNames[g.role]} · ${g.revoked ? "失効済み" : `登録 ${g.claimed}/${g.seats}席 · ${g.claimed >= g.seats ? "定員に達し受付終了" : g.claimBy <= Date.now() ? "受付期限切れ" : "受付 " + day(g.claimBy) + "まで"}`}</small>${owner ? `<small>発行: ${e(g.issuedBy?.label ?? "オーナー（発行時）")}</small>` : ""}${g.revoked ? "" : g.members.map(m => `<small class="member">${e(m.label)}${m.self ? "（この端末）" : ""} · ${e(m.device)} · ${day(m.created)}登録 ${m.pending ? `<strong>承認待ち · コード <span class="code">${e(m.code ?? "")}</span></strong> ${owner ? button("承認", "approve-member", "quiet", `data-id="${m.id}"`) + button("拒否", "reject-member", "quiet danger-text", `data-id="${m.id}"`) : ""}` : ""}${owner ? button("名前", "rename-member", "quiet", `data-id="${m.id}" data-label="${e(m.label)}"`) : ""}${g.role !== "owner" ? button("失効", "revoke-member", "quiet danger-text", `data-id="${m.id}"`) : ""}</small>`).join("")}</div>${!g.revoked && view.state !== "frozen" ? `<div>${button("交換", "rotate", "quiet", `data-id="${g.id}" data-role="${g.role}" data-label="${e(g.label)}"`)}${g.role !== "owner" ? button("失効", "revoke", "quiet danger-text", `data-id="${g.id}"`) : ""}</div>` : ""}</div>`).join("")}</div>${owner ? `<details class="history"><summary>招待とオーナーの履歴（${history.length} 件）</summary>${history.length ? `<ol>${history.map(a => `<li>${[`${day(a.at)} ${new Date(a.at).toLocaleTimeString("ja", { hour: "2-digit", minute: "2-digit" })}`, e(historyNames[a.event] ?? a.event), a.role ? roleNames[a.role] : "", a.label ? e(a.label) : "", a.by ? `${e(a.by)}${a.device ? `（${e(a.device)}）` : ""}` : ""].filter(Boolean).join(" · ")}</li>`).join("")}</ol>` : "<p>まだありません</p>"}</details><hr><p>自動削除：${e(new Date(view.spec.lifecycle.purgeAt).toLocaleString("ja"))}<br>削除前に『旅を保存』で書き出してください。</p>${view.sealed ? '<p class="muted" data-sealed="manage">暗号化した旅行では、書き出し・チャットで直す・1 つ前に戻すはまだ使えません。</p>' : ""}<div class="admin-actions">${view.sealed ? "" : button("旅を保存", "save", "secondary")}${view.sealed ? "" : button("チャットで直す", "revise", "secondary", view.state === "frozen" ? "disabled" : "")}${undo ? button("1 つ前に戻す", "undo", "secondary") : ""}${button("設定・期限の変更", "settings", "secondary", view.state === "frozen" ? "disabled" : "")}${button("共有を終了", "freeze", "secondary", view.state === "frozen" ? "disabled" : "")}${button("完全に削除", "purge", "danger")}</div><p class="muted">共有終了はオーナー以外のリンクを失効させます。完全削除すると元に戻せません。</p>` : ""}`);
+  const undo = owner && revisable() && view.state !== "frozen" && await api("undo").then(() => true, () => false);
+  modal(owner ? "招待とメンバー、旅の終わり" : "閲覧者の招待", `${owner ? "" : "<p>あなたが出した閲覧者の招待です。失効できるのは自分が出した招待だけです。</p>"}<p>招待リンクは人数分の席を持ち、開いたブラウザを1席ずつ登録します。定員に達するか受付期限を過ぎたリンクは使えなくなり、登録済みのブラウザだけが入れます。登録したブラウザの鍵（Cookie）が他人に渡ると、その人も入れます。</p><p>招待の発行・失効${owner ? "、共有終了、削除、期限の変更" : ""}の前に、この端末のパスキーで本人確認します（5 分間有効）。</p>${location.protocol === "http:" ? '<p class="warning">現在はこのPC内のローカル版です。別の端末から使うには、HTTPSの公開ホストへ配置してください。</p>' : ""}<form data-form="grant"><div class="form-grid"><label>権限<select name="role">${owner ? '<option value="participant">参加者：候補・チェック・思い出</option><option value="viewer">閲覧者：見るだけ</option><option value="editor">編集者：旅程も編集</option>' : '<option value="viewer">閲覧者：見るだけ</option>'}</select></label><label>リンク名（任意）<input name="label" maxlength="80" placeholder="空欄なら自動で付けます"></label><label>人数（席）<input name="seats" type="number" required min="1" max="50" value="1"></label><label>受付期限（日）<input name="claimDays" type="number" required min="1" max="30" value="3"></label>${owner ? '<label>参加の承認<select name="approval"><option value="auto">自動で参加（既定）</option><option value="owner">オーナーが確認コードで承認</option></select></label>' : ""}</div>${owner ? '<p class="muted">機密度の高い旅行向け。参加者の画面に出る 6 桁のコードを LINE などで聞いて照合します。</p>' : ""}<button class="primary" ${view.state === "frozen" ? "disabled" : ""}>招待リンクを発行</button></form><div class="grant-list">${grants.map(g => `<div class="grant"><div><strong>${e(g.label)}</strong><small>${roleNames[g.role]} · ${g.revoked ? "失効済み" : `登録 ${g.claimed}/${g.seats}席 · ${g.claimed >= g.seats ? "定員に達し受付終了" : g.claimBy <= Date.now() ? "受付期限切れ" : "受付 " + day(g.claimBy) + "まで"}`}</small>${owner ? `<small>発行: ${e(g.issuedBy?.label ?? "オーナー（発行時）")}</small>` : ""}${g.revoked ? "" : g.members.map(m => `<small class="member">${e(m.label)}${m.self ? "（この端末）" : ""} · ${e(m.device)} · ${day(m.created)}登録 ${m.pending ? `<strong>承認待ち · コード <span class="code">${e(m.code ?? "")}</span></strong> ${owner ? button("承認", "approve-member", "quiet", `data-id="${m.id}"`) + button("拒否", "reject-member", "quiet danger-text", `data-id="${m.id}"`) : ""}` : ""}${owner ? button("名前", "rename-member", "quiet", `data-id="${m.id}" data-label="${e(m.label)}"`) : ""}${g.role !== "owner" ? button("失効", "revoke-member", "quiet danger-text", `data-id="${m.id}"`) : ""}</small>`).join("")}</div>${!g.revoked && view.state !== "frozen" ? `<div>${button("交換", "rotate", "quiet", `data-id="${g.id}" data-role="${g.role}" data-label="${e(g.label)}"`)}${g.role !== "owner" ? button("失効", "revoke", "quiet danger-text", `data-id="${g.id}"`) : ""}</div>` : ""}</div>`).join("")}</div>${owner ? `<details class="history"><summary>招待とオーナーの履歴（${history.length} 件）</summary>${history.length ? `<ol>${history.map(a => `<li>${[`${day(a.at)} ${new Date(a.at).toLocaleTimeString("ja", { hour: "2-digit", minute: "2-digit" })}`, e(historyNames[a.event] ?? a.event), a.role ? roleNames[a.role] : "", a.label ? e(a.label) : "", a.by ? `${e(a.by)}${a.device ? `（${e(a.device)}）` : ""}` : ""].filter(Boolean).join(" · ")}</li>`).join("")}</ol>` : "<p>まだありません</p>"}</details><hr><p>自動削除：${e(new Date(view.spec.lifecycle.purgeAt).toLocaleString("ja"))}<br>削除前に『旅を保存』で書き出してください。</p>${revisable() ? "" : `<p class="muted" data-sealed="manage">${notRevisable}</p>`}<div class="admin-actions">${button("旅を保存", "save", "secondary")}${revisable() ? button("チャットで直す", "revise", "secondary", view.state === "frozen" ? "disabled" : "") : ""}${undo ? button("1 つ前に戻す", "undo", "secondary") : ""}${button("設定・期限の変更", "settings", "secondary", view.state === "frozen" ? "disabled" : "")}${button("共有を終了", "freeze", "secondary", view.state === "frozen" ? "disabled" : "")}${button("完全に削除", "purge", "danger")}</div><p class="muted">共有終了はオーナー以外のリンクを失効させます。完全削除すると元に戻せません。</p>` : ""}`);
 }
 function showLink(url: string, owner = false, openHere = owner) { modal(owner ? "オーナーとして使う端末で開いてください" : "招待リンクができました", `<p>${owner ? "このリンクは最初に開いて登録した1つのブラウザだけをオーナーにします。後から再表示できません。3日以内に、普段使う端末のブラウザで開いてください。" : "メンバーに送ってください。開いたブラウザが1席ずつ登録され、定員に達するか受付期限を過ぎると使えなくなります。"}</p><label>リンク<input id="issued-link" readonly value="${e(url)}"></label><div class="admin-actions">${button("コピー", "copy", "primary")}${openHere ? `<a class="button secondary" href="${e(url)}">カプセルを開く</a>` : ""}</div>`); }
 document.addEventListener("click", async event => {
@@ -1060,6 +1287,7 @@ document.addEventListener("click", async event => {
     if (action === "cancel-diary") { editingDiaryId = ""; render(); }
     if (action === "save-private") savePrivateMarkdown();
     if (action === "receive-key") void receiveKey();
+    if (action === "move-trip") void moveTrip();
     if (action === "give-key") void giveKey(b.dataset.id!, b.dataset.label ?? "メンバー");
     if (action === "handoff-submit") { const input = dialog.querySelector<HTMLInputElement>("[data-handoff-input]"); const typed = input?.value.trim() ?? ""; if (typed) { const resolve = codeResolver; codeResolver = undefined; resolve?.(typed); } else input?.focus(); }
     if (action === "read-private") try { await readWithPasskey(); await openAll(); if (dialog.open) dialog.close(); render(); notice("自分だけのメモを読めるようにしました。"); } catch (err) { passkeyError(err); }
@@ -1094,7 +1322,7 @@ document.addEventListener("click", async event => {
       }
     }
     // An editor comes here from the header, not from 共有・管理, so one step back is offered here — when the host allows it.
-    const editorUndo = action === "revise" && view.role === "editor" && !view.sealed && await api("undo").then(() => true, () => false);
+    const editorUndo = action === "revise" && view.role === "editor" && await api("undo").then(() => true, () => false);
     // Two ways to ask: write here and copy (paste and send as it is), or copy and write in the chat. The written request is
     // what a chat sent from the host would be given one day (docs/design/host-side-generation.md), and never goes to the host.
     if (action === "revise") modal("チャットで直す", `<p>今の旅程と直し方をコピーしてチャットに貼ると、チャットが直した旅程を返します。候補・相談は本文だけ含めます。書いた人の名前、思い出、メンバー・招待の情報は含めません。</p>${view.role === "editor" ? "<p>編集者が直せるのは予定・候補・相談・準備リスト・メモ・費用メモです。題・日程・期限・ページなどの設定は今のまま残ります。</p>" : ""}${hostRevise()}<h3>1. チャットに渡す</h3><label>直してほしいこと（任意）<textarea data-revise-request maxlength="2000" rows="3" placeholder="例: 2日目の夕食を18:30にして、3日目の朝に散歩を足す"></textarea></label><p class="muted">書くと、コピーする文の最初に付きます。空のままコピーして、チャットで書いても構いません。予約番号・パスワードなどは書かないでください。</p><div class="admin-actions">${button("今の旅程と直し方をコピー", "copy-revise", "primary")}${editorUndo ? button("1 つ前に戻す", "undo", "secondary") : ""}</div><hr><h3>2. チャットの返事を貼る</h3><label>チャットの返事<textarea data-revise-paste rows="5" placeholder="返事をそのまま貼ってください（前後の文が混ざっていても大丈夫です）"></textarea></label><div class="admin-actions">${button("差分を見る", "revise-check", "primary")}</div><ul class="paste-problems" hidden></ul><div class="revise-diff" hidden></div><p class="muted">差分を見て反映するまで、旅行は変わりません。</p>`);
@@ -1102,7 +1330,9 @@ document.addEventListener("click", async event => {
       // As in creatorAddDevice: Safari keeps the tap's permission to write the clipboard only if the write starts before the request returns.
       const request = document.querySelector<HTMLTextAreaElement>("[data-revise-request]")?.value.trim() ?? "";
       // The request goes first: were the text cut short where it is pasted, the request would be the part lost (#306).
-      const text = api("revise").then(r => request ? `## 直してほしいこと\n\n${request}\n\n---\n\n${r.text}` : r.text as string);
+      // A sealed trip's text is made here from the trip this browser opened, as the host makes a plain one's (§4).
+      const made: Promise<string> = view.sealed ? Promise.resolve(reviseText(view.spec, view.document, view.role !== "owner")) : api("revise").then(r => r.text as string);
+      const text = made.then(t => request ? `## 直してほしいこと\n\n${request}\n\n---\n\n${t}` : t);
       try { await navigator.clipboard.write([new ClipboardItem({ "text/plain": text.then(t => new Blob([t], { type: "text/plain" })) })]); notice(request ? "今の旅程と直し方に、直してほしいことを付けてコピーしました。チャットに貼って、そのまま送ってください。" : "今の旅程と直し方をコピーしました。チャットに貼って、直してほしいことを書いてください。"); }
       catch {
         const value = await text;
@@ -1122,9 +1352,14 @@ document.addEventListener("click", async event => {
       if (!shared) download(text, "text/html;charset=utf-8", name);
       notice("旅程のページを保存しました。ブラウザで開くと旅のしおりとして読めます。");
     }
+    // A sealed trip's ZIP: the same files the host makes, made here from the opened trip.
+    if (action === "save-zip") {
+      download(new Uint8Array(zip(await exportFiles(id!, view.spec, view.document, view.updated ?? new Date().toISOString()))), "application/zip", `trip-${view.spec.trip.startsOn}.zip`);
+      notice("ZIP を保存しました。");
+    }
     if (action === "copy-markdown") {
       // The same shape as copy-revise: the write starts before the request returns, so Safari keeps the tap's permission.
-      const text = api("export.md").then(r => r.text as string);
+      const text = exported("md");
       try { await navigator.clipboard.write([new ClipboardItem({ "text/plain": text.then(t => new Blob([t], { type: "text/plain" })) })]); notice("旅程を Markdown でコピーしました。メモアプリなどに貼って残してください。"); }
       catch {
         const value = await text;
@@ -1149,7 +1384,7 @@ document.addEventListener("click", async event => {
     if (action === "check-paste") await checkPaste();
     if (action === "assist-run") await runAssist();
     if (action === "revise-assist") await reviseAssist();
-    if (action === "revise-key-delete" && confirm("登録した API キーを削除しますか？もう一度登録すれば、また使えます。")) { await api("key", "DELETE", {}); await reload(); app.querySelector<HTMLElement>('[data-action="revise"]')?.click(); notice("API キーを削除しました。"); }
+    if (action === "revise-key-delete" && confirm("登録した API キーを削除しますか？もう一度登録すれば、また使えます。")) { await api("key", "DELETE", {}); await reload(); redrawHostRevise(); notice("API キーを削除しました。"); }
     if (action === "assist-key-delete" && confirm("登録した API キーを削除しますか？もう一度登録すれば、また使えます。")) { await api("/v1/account/key", "DELETE"); await creationHome(); notice("API キーを削除しました。"); }
     if (action === "passkey-register") try { await registerPasskey(); } catch (err) { passkeyError(err); }
     if (action === "passkey-login") try { await passkeyLogin(); } catch (err) { passkeyError(err); }
@@ -1168,13 +1403,26 @@ document.addEventListener("click", async event => {
     if (action === "signout" && confirm(`この端末からログアウトしますか？${view.passkey ? "登録したパスキーで、この旅行の「パスキーで戻る」から戻れます。" : `パスキーを登録していないため、ログアウトすると、${view.role === "owner" ? "運用者によるオーナーリンクの出し直し（aws/recover.ts）" : "オーナーの再招待"}が要ります。`}`)) {
       await api("signout", "POST", { confirm: true }); remember(list => list.filter(t => t.id !== id)); location.href = "/";
     }
+    if (action === "rekey") { await stepUp(); dialog.close(); await rekeyTrip(); }
+    if (action === "rekey-keep") { await stepUp(); await api("keys", "PATCH", { type: "keep" }); dialog.close(); await reload(); notice("鍵はそのままです"); }
     if (action === "approve-member") { await api("approve", "POST", { member: b.dataset.id, approve: true, confirm: true }); await manage(); }
     if (action === "reject-member" && confirm("拒否しますか？席は戻りません")) { await api("approve", "POST", { member: b.dataset.id, approve: false, confirm: true }); await manage(); }
     if (action === "pending-reload") location.reload();
-    if (action === "revoke-member" && confirm("この端末の登録を失効させますか？席は戻りません。再参加には新しい招待リンクが必要です。")) { await api("revoke", "POST", { member: b.dataset.id, confirm: true }); await manage(); }
-    if (action === "rename-member") { const label = prompt("メンバーの表示名", b.dataset.label)?.trim(); if (label) { await api("members", "PATCH", { id: b.dataset.id, label }); await manage(); } }
-    if (action === "revoke" && confirm("この招待リンクと、そこから登録した全員を失効させますか？")) { await api("revoke", "POST", { id: b.dataset.id, confirm: true }); await manage(); }
-    if (action === "rotate" && confirm("新しいリンクに交換し、古いリンクを直ちに失効させますか？")) { const v = await api("grants", "POST", { role: b.dataset.role, label: b.dataset.label, expiresAt: view.spec.lifecycle.purgeAt, confirm: true, rotate: b.dataset.id }); showLink(v.url, b.dataset.role === "owner"); }
+    // A seat that held the key is gone: reading the trip again lets the owner's browser replace the key (load) before the list is shown.
+    if (action === "revoke-member" && confirm("この端末の登録を失効させますか？席は戻りません。再参加には新しい招待リンクが必要です。")) { await api("revoke", "POST", { member: b.dataset.id, confirm: true }); await reload(); await manage(); }
+    if (action === "rename-member") { const label = prompt("メンバーの表示名", b.dataset.label)?.trim(); if (label) { await namesSealing; await api("members", "PATCH", { id: b.dataset.id, label: await nameFor("member", b.dataset.id!, label) }); await manage(); } }
+    if (action === "revoke" && confirm("この招待リンクと、そこから登録した全員を失効させますか？")) { await api("revoke", "POST", { id: b.dataset.id, confirm: true }); await reload(); await manage(); }
+    // The owner invite handed over takes its seat's key with it: with no other seat holding the present one, the trip would be
+    // read by nobody (§8 (4)). The same rule as the host's (409 last-key), on the seats that hold a key and do not wait for one.
+    if (action === "rotate" && b.dataset.role === "owner" && view.sealed && !(view.seats ?? []).some(s => s.id !== view.self?.id && !view.waiting?.some(w => w.id === s.id))) notice(lastKey, true);
+    else if (action === "rotate" && confirm(`新しいリンクに交換し、古いリンクを直ちに失効させますか？${b.dataset.role === "owner" && view.sealed ? "新しいオーナーは、鍵を持つメンバーと確認コードを合わせて鍵を受け取ります。" : ""}`)) {
+      // The new invite keeps the name: the host's own as it is, one of the members' sealed against the new invite's id.
+      const gid = newGrantId(), host = b.dataset.label === "自分用" || b.dataset.label === "招待リンク";
+      const v = await api("grants", "POST", { role: b.dataset.role, label: host ? b.dataset.label : await nameFor("grant", gid, b.dataset.label!), ...view.sealed && { id: gid }, expiresAt: view.spec.lifecycle.purgeAt, confirm: true, rotate: b.dataset.id });
+      // An owner invite handed over takes this seat with it: there is nothing left to read again (the new owner is asked, §8).
+      if (b.dataset.role !== "owner") await reload();
+      showLink(v.url, b.dataset.role === "owner");
+    }
     if (action === "freeze" && confirm("共有を終了し、オーナー以外のリンクをすべて失効させますか？以降は読み取り専用です。")) { await api("freeze", "POST", { confirm: true }); dialog.close(); await reload(); }
     if (action === "purge") modal("完全に削除", `<form data-form="purge"><p>旅程・投稿・すべてのリンクを削除します。取り消せません。必要なZIPは先に保存してください。</p><label>確認のため「${e(view.spec.title)}」を入力<input name="title" required autocomplete="off"></label><button class="danger">完全に削除する</button></form>`);
     if (action === "settings") modal("設定・期限の変更", `<form data-form="settings"><label>タイトル<input name="title" value="${e(view.spec.title)}" required maxlength="160"></label><label>行き先<input name="destination" value="${e(view.spec.trip.destinations.join("、"))}" required maxlength="160"></label><div class="form-grid"><label>初日<input name="start" type="date" required value="${view.spec.trip.startsOn}"></label><label>最終日<input name="end" type="date" required value="${view.spec.trip.endsOn}"></label></div><label>テーマ<select name="theme">${["paper", "postcard", "minimal", "night"].map(x => `<option ${x === view.spec.theme.preset ? "selected" : ""}>${x}</option>`).join("")}</select></label><label>自動削除日（日本時間0時）<input name="purge" type="date" required value="${view.spec.lifecycle.purgeAt.slice(0, 10)}"></label><p>旅行後の追記期間：${view.spec.lifecycle.reflectionDays}日。期限は作成から最大180日で、最終日より後にしてください。登録済みの予定は新しい日程の範囲内に収まっている必要があります。</p><button class="primary">変更内容を確認</button></form>`);
@@ -1199,7 +1447,7 @@ document.addEventListener("submit", async event => {
   const form = event.target as HTMLFormElement; if (!form.dataset.form) return; event.preventDefault();
   const f = formValues(form), submit = form.querySelector<HTMLButtonElement>('button[type="submit"],button:not([type])'); if (submit) submit.disabled = true;
   try {
-    if (form.dataset.form === "revise-key") { await api("key", "PUT", { key: f.key }); await reload(); app.querySelector<HTMLElement>('[data-action="revise"]')?.click(); notice("API キーを登録しました。"); }
+    if (form.dataset.form === "revise-key") { if (view.sealed) await wrapAssistKey(f.key ?? ""); else await api("key", "PUT", { key: f.key }); await reload(); redrawHostRevise(); notice("API キーを登録しました。"); }
     if (form.dataset.form === "assist-key") { await api("/v1/account/key", "PUT", { key: f.key }); await creationHome(); notice("API キーを登録しました。"); }
     if (form.dataset.form === "create") {
       if (!canCreate) throw new Error("旅行の発行権限が必要です");
@@ -1258,7 +1506,7 @@ document.addEventListener("submit", async event => {
       await savePrivate({ type: "put", entry: await sealEntry(key, entry) });
       if (!item) { diaryDay = f.day!; editingDiaryId = ""; render(); }
     }
-    if (form.dataset.form === "grant") { const v = await api("grants", "POST", { role: f.role, label: f.label!.trim() || `${roleNames[f.role as Role]}の招待 ${new Date().toLocaleDateString("ja", { month: "numeric", day: "numeric" })}`, seats: Number(f.seats), claimDays: Number(f.claimDays), approval: f.approval ?? "auto", expiresAt: view.spec.lifecycle.purgeAt, confirm: true }); showLink(v.url); }
+    if (form.dataset.form === "grant") { const gid = newGrantId(), v = await api("grants", "POST", { role: f.role, label: await nameFor("grant", gid, f.label!.trim() || `${roleNames[f.role as Role]}の招待 ${new Date().toLocaleDateString("ja", { month: "numeric", day: "numeric" })}`), ...view.sealed && { id: gid }, seats: Number(f.seats), claimDays: Number(f.claimDays), approval: f.approval ?? "auto", expiresAt: view.spec.lifecycle.purgeAt, confirm: true }); showLink(v.url); }
     if (form.dataset.form === "revise-private" && revisingPrivate) {
       // Sealed here, every entry, and sent in one apply: the host takes all of them or none.
       const d = revisingPrivate, key = await memoKey(); if (!key) throw new Error("自分だけのメモの鍵を開けませんでした。もう一度「チャットで直す」から開いてください。");
@@ -1278,17 +1526,17 @@ document.addEventListener("submit", async event => {
     }
     if (form.dataset.form === "revise" && revising) {
       // The text and version are the ones the diff on screen was computed from, so what is applied is what was shown.
-      try { await api("revise", "POST", { text: revising.text, confirm: true, ...(f.title !== undefined ? { title: f.title } : {}) }, revising.revision); }
+      try { await api("revise", "POST", revising.next ? await resealed(revising.next, revising.large, f.title) : { text: revising.text, confirm: true, ...(f.title !== undefined ? { title: f.title } : {}) }, revising.revision); }
       catch (err) { if ((err as { status?: number }).status !== 409) throw err; notice("別の人が更新しました。差分を出し直します。", true); await checkRevise(); return; }
       revising = undefined; dialog.close(); await reload(); notice(`反映しました。「${view.role === "owner" ? "共有・管理" : "チャットで直す"}」から 1 つ前に戻せます。`);
     }
     if (form.dataset.form === "undo" && undoing) {
-      try { await api("undo", "POST", { confirm: true, ...(f.title !== undefined ? { title: f.title } : {}) }, undoing.revision); }
+      try { await api("undo", "POST", undoing.next ? await resealed(undoing.next, undoing.large, f.title, undoing.step) : { confirm: true, ...(f.title !== undefined ? { title: f.title } : {}) }, undoing.revision); }
       catch (err) { if ((err as { status?: number }).status !== 409) throw err; notice("別の人が更新しました。差分を出し直します。", true); await showUndo(); return; }
       undoing = undefined; dialog.close(); await reload(); notice("1 つ前に戻しました。");
     }
     // A sealed trip's title is compared here: the host cannot read it (§4).
-    if (form.dataset.form === "purge") { if (view.sealed && !sameTitle(f.title, view.spec.title)) throw new Error("確認用のタイトルが一致しません"); await api("purge", "POST", { title: view.sealed ? "" : f.title }); dialog.close(); unmountMap?.(); unmountMap = undefined; app.innerHTML = '<main class="empty"><h1>カプセルを削除しました。</h1><p>すべてのリンクが失効しました。</p><a href="/">プレビューに戻る</a></main>'; }
+    if (form.dataset.form === "purge") { if (view.sealed && !sameTitle(f.title, view.spec.title)) throw new Error("確認用のタイトルが一致しません"); await api("purge", "POST", { title: view.sealed ? "" : f.title }); await forgetTrip(id!); dialog.close(); unmountMap?.(); unmountMap = undefined; app.innerHTML = '<main class="empty"><h1>カプセルを削除しました。</h1><p>すべてのリンクが失効しました。</p><a href="/">プレビューに戻る</a></main>'; }
     if (form.dataset.form === "settings") {
       if (confirm(`タイトル：${view.spec.title} → ${f.title}\n日程：${view.spec.trip.startsOn}〜${view.spec.trip.endsOn} → ${f.start}〜${f.end}\nテーマ：${view.spec.theme.preset} → ${f.theme}\n削除日：${view.spec.lifecycle.purgeAt.slice(0, 10)} → ${f.purge}\nこの変更を反映しますか？`)) { const spec = structuredClone(view.spec); spec.title = f.title!; spec.trip = { startsOn: f.start!, endsOn: f.end!, destinations: f.destination!.split(/[、,]/).map(x => x.trim()).filter(Boolean) }; spec.theme.preset = f.theme as Spec["theme"]["preset"]; spec.lifecycle.purgeAt = `${f.purge}T00:00:00+09:00`;
         // A sealed trip's settings go sealed: the words checked as a plain Spec first, then its title, destinations and labels sealed.
@@ -1375,23 +1623,64 @@ function renderDiff(d: Diff) {
 }
 // A large change asks for the trip's title, as deleting does; a small one for one check.
 const approval = (form: string, d: Diff, label: string) => `<form data-form="${form}">${d.large ? `<p class="warning">大きな変更です（題か日程が変わる、今の予定の半分以上が削除・変更される、または今ある候補・相談が変更・削除されます）。</p><label>確認のため、今の題「${e(view.spec.title)}」を入力${d.title ? "（変更後の題ではありません）" : ""}<input name="title" required autocomplete="off"></label>` : `<label class="check"><input type="checkbox" required><span>この差分で${e(label)}</span></label>`}<button class="primary">${e(label)}</button></form>`;
-let revising: { text: string; revision: number } | undefined;
-let undoing: { revision: number } | undefined;
+// `next` (a sealed trip): the trip the diff on screen was made from here, sent sealed when it is applied.
+type Next = { spec: Spec; document: Document };
+let revising: { text: string; revision: number; next?: Next; large?: boolean } | undefined;
+let undoing: { revision: number; next?: Next; large?: boolean; step?: { spec: SealedSpec; document: Partial<SealedDocument> } } | undefined;
+// A sealed trip with a record this browser cannot open is not revised or undone here: the trip sent back would drop it.
+const revisable = () => !view.unreadable?.length;
+const notRevisable = "この端末で開けない記録があるため、チャットで直す・1 つ前に戻すは使えません（反映すると、その記録が消えるため）。";
+// The next sealed trip, as POST revise and POST undo take it (§4). The title of a large change is compared here, as the host
+// compares a plain trip's. A record left as it was keeps its ciphertext; the Spec of an editor's revise is the trip's own and an
+// undo's is the step's, as they came; memories are not revised and go back as they came.
+async function resealed(next: Next, large: boolean | undefined, title: string | undefined, step?: { spec: SealedSpec; document: Partial<SealedDocument> }) {
+  if (large && !sameTitle(title, view.spec.title)) throw new Error("確認用のタイトルが一致しません。今の題を入力してください");
+  if (!tripKey || !sealedNow) throw new Error("この端末には旅行の鍵がありません");
+  // The 20-second refresh may have brought one since the diff was made.
+  if (!revisable()) throw new Error(notRevisable);
+  const t = await resealTrip(tripKey, id!, view.sealed!.generation, step ? [step, sealedNow] : [sealedNow], next);
+  return { spec: step ? step.spec : view.role === "owner" ? t.spec : sealedNow.spec, document: { ...t.document, reflections: sealedNow.document.reflections }, confirm: true as const };
+}
+// A sealed trip's step back is opened here (GET undo gives it sealed) and set against the trip as this browser opened it (§4).
+async function sealedUndo(): Promise<{ diff: Diff; revision: number; next?: Next; step?: { spec: SealedSpec; document: Partial<SealedDocument> } }> {
+  const got = await api("undo") as { previous: Previous<SealedSpec, SealedDocument>; revision: number };
+  if (got.revision !== view.document.revision) await reload();
+  if (!revisable()) throw new Error(notRevisable);
+  // What the step does not hold is the trip's as it stands.
+  const opened = tripKey && sealedNow ? await openTrip(tripKey, id!, { spec: got.previous.spec, document: { ...sealedNow.document, ...got.previous.document } }) : null;
+  if (!opened || opened.unreadable.length) throw new Error("1 つ前の旅程をこの端末で開けません");
+  const { items, checklist, notes, budget, suggestions, comments } = opened.document, has = got.previous.document;
+  const previous: Previous<Spec, Document> = { spec: opened.spec, document: { items, checklist, notes, budget, ...(has.suggestions ? { suggestions } : {}), ...(has.comments ? { comments } : {}) }, ...(got.previous.revisedIds ? { revisedIds: got.previous.revisedIds } : {}) };
+  const r = undoTrip({ spec: view.spec, document: view.document }, previous, { created: view.created!, keepSpec: view.role !== "owner" });
+  if (!r.ok) throw new Error(r.reason === "spec" ? "設定も戻るため、オーナーだけが戻せます" : r.reason === "none" ? "戻せる旅程がありません" : "1 つ前の旅程に戻せません");
+  return { diff: r.diff, revision: got.revision, next: r.next, step: got.previous };
+}
 async function showUndo() {
-  const back = await api("undo") as { diff: Diff; revision: number };
-  undoing = { revision: back.revision };
+  const back = view.sealed ? await sealedUndo() : await api("undo") as { diff: Diff; revision: number; next?: Next; step?: undefined };
+  undoing = { revision: back.revision, next: back.next, large: back.diff.large, step: back.step };
   modal("1 つ前に戻す", `<p>最後に「チャットで直す」で反映する前の旅程（${view.role === "owner" ? "設定と" : ""}予定・候補・相談・準備リスト・メモ・費用メモ）に戻します。反映の後に手で直した予定・メモ${view.role === "owner" ? "・設定" : ""}も戻ります（下の差分に出ます）。反映の後に書かれた候補・相談・思い出とチェックの状態は残ります。戻せるのは 1 回だけです。</p><h3>戻すと変わるところ</h3>${renderDiff(back.diff) || "<p>今の旅程から変わるところはありません。</p>"}${approval("undo", back.diff, "戻す")}`);
 }
 // Revising on the host with this member's own Anthropic API key (#658). The key is the seat's alone: it is sent once, kept sealed,
 // and never shown again; nobody else in the trip, nor the creator, can use it.
-const hostRevise = () => (view as { assistKey?: boolean }).assistKey
-  ? `<h3>自分の API キーで、ここで直す</h3><p class="muted">下の「直してほしいこと」を、あなた自身の Anthropic API キーで直します。できた案は、同じ差分の確認に出ます。費用はあなたの Anthropic アカウントに請求されます。旅程と書いた内容は Anthropic に送られます。</p><div class="admin-actions">${button("ここで直す（1 分ほどかかります）", "revise-assist", "primary")}${button("API キーを削除", "revise-key-delete", "quiet danger-text")}</div><hr>`
-  : `<h3>自分の API キーで、ここで直す</h3><p class="muted">自分の Anthropic API キーを登録すると、コピーして貼る手間なしに、ここで直せます。鍵はあなたの席だけのもので、ほかのメンバーや作成者は使えません。暗号化して保管し、画面には二度と表示しません。費用はあなたの Anthropic アカウントに請求されます。</p><form data-form="revise-key"><label>Anthropic API キー<input name="key" type="password" autocomplete="off" required placeholder="sk-ant-…"></label><button class="primary">鍵を登録</button></form><hr>`;
+const sentDirect = () => view.sealed ? "鍵はこの端末のパスキーで包んで置き、旅程と鍵はこの端末から Anthropic に直接送ります（このサービスには届きません）。" : "";
+const hostRevise = () => `<div data-host-revise>${view.assistKey
+  ? `<h3>自分の API キーで、ここで直す</h3><p class="muted">下の「直してほしいこと」を、あなた自身の Anthropic API キーで直します。できた案は、同じ差分の確認に出ます。費用はあなたの Anthropic アカウントに請求されます。旅程と書いた内容は Anthropic に送られます。${sentDirect()}</p><div class="admin-actions">${button("ここで直す（1 分ほどかかります）", "revise-assist", "primary")}${button("API キーを削除", "revise-key-delete", "quiet danger-text")}</div><hr>`
+  : `<h3>自分の API キーで、ここで直す</h3><p class="muted">自分の Anthropic API キーを登録すると、コピーして貼る手間なしに、ここで直せます。鍵はあなたの席だけのもので、ほかのメンバーや作成者は使えません。暗号化して保管し、画面には二度と表示しません。費用はあなたの Anthropic アカウントに請求されます。${sentDirect()}</p><form data-form="revise-key"><label>Anthropic API キー<input name="key" type="password" autocomplete="off" required placeholder="sk-ant-…"></label><button class="primary">鍵を登録</button></form><hr>`}</div>`;
+// The key's part of the open チャットで直す, drawn again once a key is put or removed: the dialog may have come from the header or
+// from 共有・管理, so it is redrawn where it is rather than opened again.
+const redrawHostRevise = () => { const box = document.querySelector("#dialog [data-host-revise]"); if (box) box.outerHTML = hostRevise(); };
 async function reviseAssist() {
   const request = document.querySelector<HTMLTextAreaElement>("[data-revise-request]"), paste = document.querySelector<HTMLTextAreaElement>("[data-revise-paste]"), run = document.querySelector<HTMLButtonElement>('[data-action="revise-assist"]');
   if (!request || !paste || !run) return;
   const label = run.textContent; run.disabled = true; run.textContent = "作成中…（1 分ほどかかります）";
   try {
+    if (view.sealed) {
+      const out = await sealedAssist(request.value).catch((err: Error) => ({ failed: err.message }));
+      if (!run.isConnected) return;
+      if ("failed" in out) { problems([out.failed]); notice(out.failed, true); return; }
+      if (out.text === undefined) { problems([pasteReasons["cut-off"].replace("チャットの返事を最後まで貼ってください。", "直してほしいことを短くしてもう一度試してください。")]); notice("できた案を確認してください。", true); return; }
+      paste.value = out.text; await checkRevise(); return;
+    }
     const job = await api("revise/assist", "POST", { instruction: request.value }) as { id: string };
     for (const end = Date.now() + 380_000; Date.now() < end;) {
       await new Promise(r => setTimeout(r, 3000));
@@ -1407,17 +1696,70 @@ async function reviseAssist() {
   } catch (err) { notice((err as Error).message, true); }
   finally { run.disabled = false; run.textContent = label; }
 }
+// A sealed trip's 「ここで直す」 (#692, 回答 B; docs/design/trip-e2e.md §4): this browser sends the trip it opened and the request
+// to Anthropic itself, under the member's own key, so the host never holds either in plain. The key is checked with Anthropic and
+// kept on the seat wrapped with the passkey's PRF, as a memo key is; opened, it stays in memory only (a reload asks the passkey
+// again). The call and the one repair are the host's own (generate in src/assist.ts), with no job to poll: the page waits.
+// Kept with the wrapped value it came from: another tab may have put another key on the seat since.
+let assistKeyOpened: { wrapped: string; key: string } | undefined;
+const anthropic = (apiKey: string, timeout?: number) => new Anthropic({ apiKey, dangerouslyAllowBrowser: true, maxRetries: 0, ...(timeout ? { timeout } : {}) });
+const assistPrf = async () => { const prf = await prfAssertion(); if (!prf) throw new Error(noPrf); return assistSealingKey(prf, id!); };
+async function wrapAssistKey(key: string) {
+  const refused = "この API キーは使えません。Anthropic Console で発行した鍵を貼ってください";
+  if (!/^sk-ant-/.test(key) || key.length < 20 || key.length > 256) throw new Error(refused);
+  try { await anthropic(key, 10_000).models.list(); }
+  catch (err) { throw new Error(err instanceof Anthropic.AuthenticationError || err instanceof Anthropic.PermissionDeniedError ? refused : "Anthropic に接続できませんでした。時間をおいて再試行してください"); }
+  const wrapped = await sealWords(await assistPrf(), key, `${id}/assist`);
+  await api("key", "PUT", { wrapped });
+  assistKeyOpened = { wrapped, key };
+}
+// The answer's text, or no text when it was cut off; a failure throws the words the host's runAssist says.
+async function sealedAssist(request: string): Promise<{ text?: string }> {
+  // Built as the host builds a plain trip's (revise/assist): today's date first, in the trip's time zone (#658).
+  const text = `${todayLine(localDay(Date.now(), view.spec.timezone))}${reviseText(view.spec, view.document, view.role !== "owner")}${request.trim() ? `\n## 直してほしいこと\n\n${request.trim()}\n` : ""}`;
+  if (new TextEncoder().encode(text).length > REVISE_LIMIT) throw new Error("旅程が長すぎて、ここでは直せません。「チャットで直す」でコピーして使ってください");
+  if (!view.assistWrapped) throw new Error("Anthropic の API キーを登録してください");
+  if (assistKeyOpened?.wrapped !== view.assistWrapped) assistKeyOpened = { wrapped: view.assistWrapped, key: await openWords(await assistPrf(), view.assistWrapped, `${id}/assist`) };
+  const client = anthropic(assistKeyOpened.key), model = view.assistModel!;
+  const problemsOf = async (answer: string) => { const r = await sealedCheck(answer); return r.ok ? [] : r.messages?.length ? r.messages : r.reason ? [pasteReasons[r.reason]] : []; };
+  try {
+    let out = await generate(client, model, text, REVISE_SYSTEM, undefined, 170_000);
+    // What the check refuses is told back once; if the repair fails, the first answer stands (as on the host).
+    if (out.kind === "text" && out.text.trim()) {
+      const problems = await problemsOf(out.text);
+      if (problems.length) try { const again = await generate(client, model, text, REVISE_SYSTEM, { answer: out.text, problems: problems.slice(0, 10) }, 100_000); if (again.kind === "text" && again.text.trim()) out = again; } catch { /* keep the first answer */ }
+    }
+    if (out.kind === "refused") throw new Error("この希望からは旅程を作れませんでした。内容を変えて試してください");
+    return out.kind === "text" ? { text: out.text } : {};
+  } catch (e) {
+    if (!(e instanceof Anthropic.APIError)) throw e;
+    const status = e.status, kind = (e as { error?: { error?: { type?: string } } }).error?.error?.type;
+    if (status === 401 || status === 403) { assistKeyOpened = undefined; throw new Error("登録した API キーが Anthropic に拒否されました。鍵を登録し直してください"); }
+    if (status === 429) throw new Error("Anthropic の利用上限に達しています。時間をおいて試してください");
+    throw new Error(assistFailed + (e instanceof Anthropic.APIConnectionError ? "（原因: Anthropic に接続できないか、時間内に答えが返りませんでした）" : status !== undefined ? `（原因: ${status}${kind ? ` ${kind}` : ""}。${String(e.message).replace(/\s+/g, " ").slice(0, 200)}）` : ""));
+  }
+}
 async function checkRevise() {
   const field = document.querySelector<HTMLTextAreaElement>("[data-revise-paste]"), out = document.querySelector<HTMLElement>(".revise-diff"); if (!field || !out) return;
   out.hidden = true; revising = undefined; problems([]);
-  const result = await api("revise/check", "POST", { text: field.value }) as { ok: boolean; reason?: keyof typeof pasteReasons; messages?: string[]; diff?: Diff; revision?: number };
+  const result = view.sealed ? await sealedCheck(field.value) : await api("revise/check", "POST", { text: field.value }) as { ok: boolean; reason?: keyof typeof pasteReasons; messages?: string[]; diff?: Diff; revision?: number; next?: Next };
   if (!result.ok) { problems(result.reason ? [pasteReasons[result.reason]] : result.messages ?? []); notice("貼った内容を確認してください。", true); return; }
   // The title asked for is the trip's as the host has it: someone may have renamed it since this page loaded.
   if (result.revision !== view.document.revision) await reload();
-  revising = { text: field.value, revision: result.revision! };
+  revising = { text: field.value, revision: result.revision!, next: result.next, large: result.diff!.large };
   const d = result.diff!, rows = renderDiff(d);
   out.innerHTML = !rows ? "<p>今の旅程から変わるところはありません。</p>" : `<h3>反映すると変わるところ</h3>${rows}${approval("revise", d, "反映する")}`;
   out.hidden = false; out.scrollIntoView({ block: "start", behavior: "smooth" });
+}
+// A sealed trip's answer is checked here, as the host checks a plain one's in revise/check (§4): the same function, against the
+// trip as this browser opened it. A paste that is too long or not a trip is refused before anything is sent.
+async function sealedCheck(text: string) {
+  if (stale || view.document.revision !== (await api() as View).document.revision) await reload();
+  // A reload may have brought a record this browser cannot open: an answer applied now would drop it.
+  if (!revisable()) return { ok: false, messages: [notRevisable] };
+  const now = Date.now(), r = reviseTrip({ spec: view.spec, document: view.document }, text, { author: view.label ?? "", at: new Date(now).toISOString(), created: view.created!, now, keepSpec: view.role !== "owner" });
+  if (!r.ok) return "tooLong" in r ? { ok: false, messages: ["貼り付けが長すぎます。旅程の部分だけを貼ってください"] } : { ok: false, reason: r.reason, messages: r.messages };
+  return { ok: true, diff: r.diff, revision: view.document.revision, next: r.next };
 }
 let joinSecret = "";
 // A member of an owner-approved invite sees only this until the owner approves: the code to tell the owner by another route.
@@ -1440,8 +1782,13 @@ async function boot() {
   } catch (err) {
     // The link stays in the address bar until it is redeemed, so it can still be handed to the real browser.
     if (id && (err as { pending?: boolean }).pending) return pendingScreen((err as unknown as { code: string }).code);
-    if (secret && (err as { status?: number }).status === 401) { joinSecret = secret; return joinScreen(); }
-    if (id && [401, 404, 410].includes((err as { status?: number }).status ?? 0)) remember(list => list.filter(t => t.id !== id)); app.innerHTML = `<main class="empty"><h1>しおりを開けませんでした。</h1><p>${e((err as Error).message)}</p>${id && (err as { status?: number }).status === 401 ? `<p>30 日使わなかったか、ログアウトしたか、失効しました。${passkeys ? "パスキーを登録していれば「パスキーで戻る」、なければ" : ""}オーナーに新しい招待を頼んでください。</p>${returnByPasskey}` : "<p>共有されたリンクから開き直してください。</p>"}</main>`; }
+    // A seat or a trip that is gone takes this browser's keys for it along (before a new invite may take a seat); a cookie only
+    // unused for 30 days keeps them for the passkey.
+    const { status, gone } = err as { status?: number; gone?: boolean };
+    if (id && ([404, 410].includes(status ?? 0) || status === 401 && gone)) await forgetTrip(id);
+    if (secret && status === 401) { joinSecret = secret; return joinScreen(); }
+    if (id && status === 401) remember(list => list.filter(t => t.id !== id));
+    app.innerHTML = `<main class="empty"><h1>しおりを開けませんでした。</h1><p>${e((err as Error).message)}</p>${id && (err as { status?: number }).status === 401 ? `<p>30 日使わなかったか、ログアウトしたか、失効しました。${passkeys ? "パスキーを登録していれば「パスキーで戻る」、なければ" : ""}オーナーに新しい招待を頼んでください。</p>${returnByPasskey}` : "<p>共有されたリンクから開き直してください。</p>"}</main>`; }
 }
 void boot();
 document.addEventListener("visibilitychange", () => void autoFootprint());
@@ -1450,9 +1797,10 @@ addEventListener("hashchange", () => { if (!id && new URLSearchParams(location.h
 setInterval(async () => {
   if (!id || !view || document.hidden || dialog.open || dragging) return;
   // Asked again after the request: a grip pressed while it was in flight must not have its day redrawn under the finger.
-  // An answer asked for before this page saved something can arrive after it: older than what is shown, it shows nothing.
+  // An answer asked for before this page read the trip again (a save, ここにいる, 再読込) can arrive after it: older than what is
+  // shown, it shows nothing, whatever its revision (footprints move no revision).
   // Footprints move no revision: on their page, the map and the story, a point left or removed by another member redraws it too.
-  try { const latest = await api() as View; if (dragging || ordering || latest.document.revision < view.document.revision) return;
+  try { const asked = loads, latest = await api() as View; if (asked !== loads || dragging || ordering || latest.document.revision < view.document.revision) return;
     const stepped = onFootprints() && (latest.footprints?.length !== view.footprints?.length || latest.footprints?.at(-1)?.id !== view.footprints?.at(-1)?.id);
     const handoffKey = (v: View) => JSON.stringify([(v.waiting ?? []).map(w => w.id), Boolean(v.seatKey)]);
     const handoffs = handoffKey(latest) !== handoffKey(view);

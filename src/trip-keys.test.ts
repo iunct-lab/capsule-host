@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { open, seal } from "./private-entries";
 import { testTrip } from "./test-fixture";
 import { sealedOperationSchema, type Document } from "./schema";
-import { confirmationCodes, openField, openTrip, sealOperation, sealTrip, matchesCommitment, newAttempt, newHandoffKeys, newSeatKeys, newTripKey, signEdge, verifyEdge, seatPublic, unwrapSeatSecret, unwrapTripKey, wrapSeatSecret, wrapTripKey } from "./trip-keys";
+import { confirmationCodes, openField, openName, openPoint, openTrip, sealField, sealName, sealPoint, resealTrip, sealOperation, sealTrip, sealMove, matchesCommitment, newAttempt, newHandoffKeys, newSeatKeys, newTripKey, signEdge, verifyEdge, seatPublic, unwrapSeatSecret, unwrapTripKey, wrapSeatSecret, wrapTripKey, acceptRekey, reachableSeats, resealAll, signRekey, signSuccession, type KeyedSeat, type SeatKeys } from "./trip-keys";
 
 const prf = () => crypto.getRandomValues(new Uint8Array(32));
 const shape = /^v1\.[A-Za-z0-9_-]+$/;
@@ -171,6 +171,28 @@ describe("sealed trip records", () => {
     // Without a generation it is not a trip's ciphertext.
     await expect(openField(key, "trip-a", "notes", "notes", "body", sealed.document.notes.replace(/^v1\.1\./, "v1."))).rejects.toThrow();
   });
+  test("reseal keeps unchanged records", async () => {
+    const key = await newTripKey(), t = fullTrip(), sealed = await sealTrip(key, "trip-a", 1, t);
+    sealed.document.suggestions[0]!.seat = "seat-a";
+    // The answer writes the item's fields in another order and changes one item's title only.
+    const next = structuredClone(t); next.document.items = next.document.items.map(i => i.id === "walk" ? { ...i, title: "別の散歩" } : Object.fromEntries(Object.entries(i).reverse()) as typeof i);
+    const again = await resealTrip(key, "trip-a", 1, [sealed], next);
+    const fields = (x: typeof sealed) => JSON.stringify(x, (k, v) => k === "items" ? v.map((i: { id: string; sealed: string }) => i.id === "walk" ? "" : i.sealed) : v);
+    expect(fields(again)).toBe(fields(sealed));
+    expect(again.document.items.find(i => i.id === "walk")!.sealed).not.toBe(sealed.document.items.find(i => i.id === "walk")!.sealed);
+    expect((await openTrip(key, "trip-a", again))!.document.items.find(i => i.id === "walk")!.title).toBe("別の散歩");
+    // A record found in a later `from` keeps that one's ciphertext; a new post has no seat, the host gives it one.
+    const step = await sealTrip(key, "trip-a", 1, { spec: { ...t.spec, title: "前の題" }, document: t.document });
+    next.document.suggestions.push({ id: "s2", author: "新しい人", body: "新しい候補", createdAt: "2026-09-21T00:00:00.000Z", promoted: false });
+    const back = await resealTrip(key, "trip-a", 1, [sealed, step], { ...next, spec: { ...t.spec, title: "前の題" } });
+    expect(back.spec.title).toBe(step.spec.title); expect(back.spec.summary).toBe(sealed.spec.summary);
+    expect(back.document.suggestions.map(x => x.seat)).toEqual(["seat-a", undefined]);
+    // Ids are unique within a list only: a comment with a suggestion's id keeps its own seat, not the suggestion's.
+    const twin = structuredClone(t); twin.document.comments[0]!.id = "s1";
+    const both = await sealTrip(key, "trip-a", 1, twin); both.document.suggestions[0]!.seat = "seat-a"; both.document.comments[0]!.seat = "seat-b";
+    const kept = await resealTrip(key, "trip-a", 1, [both], twin);
+    expect([kept.document.suggestions[0]!.seat, kept.document.comments[0]!.seat]).toEqual(["seat-a", "seat-b"]);
+  });
   test("危ない URL: a link that is not public https is dropped after opening; words past the limits are left out", async () => {
     const key = await newTripKey(), t = fullTrip();
     t.document.items[0]!.place!.publicUrl = "javascript:alert(1)";
@@ -210,5 +232,192 @@ describe("sealed trip records", () => {
     await expect(sealOperation(key, "trip-a", 1, { type: "checklist", checklist: [{ id: "c1", title: "" }] }, doc)).rejects.toThrow();
     await expect(sealOperation(key, "trip-a", 1, { type: "budget", budget: [{ id: "b1", title: "宿", amount: -1, description: "" }] }, doc)).rejects.toThrow();
     await expect(sealOperation(key, "trip-a", 1, { type: "promote", id: "nope", day: doc.items[0]!.day }, doc)).rejects.toThrow();
+  });
+});
+
+describe("sealed footprints and names", () => {
+  const at = { lat: 35.6812, lng: 139.7671, accuracy: 12 };
+  test("足あとの往復: sealPoint → openPoint gives the point back, and the ciphertext holds no coordinate", async () => {
+    const key = await newTripKey(), sealed = await sealPoint(key, "trip-a", 1, "fp1", at);
+    expect(sealed).toMatch(/^v1\.1\.[A-Za-z0-9_-]+$/);
+    expect(sealed).not.toContain("35.6812");
+    expect(await openPoint(key, "trip-a", "fp1", sealed)).toEqual(at);
+  });
+  test("足あとの範囲: a point out of range is not sealed, and one sealed directly does not open", async () => {
+    const key = await newTripKey();
+    for (const bad of [{ ...at, lat: 91 }, { ...at, lng: -181 }, { ...at, accuracy: 1001 }]) {
+      await expect(sealPoint(key, "trip-a", 1, "fp1", bad)).rejects.toThrow();
+      expect(await openPoint(key, "trip-a", "fp1", await sealField(key, "trip-a", 1, "footprint", "fp1", "point", JSON.stringify(bad)))).toBeNull();
+    }
+    expect(await openPoint(key, "trip-a", "fp1", await sealField(key, "trip-a", 1, "footprint", "fp1", "point", "not json"))).toBeNull();
+  });
+  test("足あとの入れ替え: a point moved to another footprint, trip or field does not open", async () => {
+    const key = await newTripKey(), sealed = await sealPoint(key, "trip-a", 1, "fp1", at);
+    expect(await openPoint(key, "trip-a", "fp2", sealed)).toBeNull();
+    expect(await openPoint(key, "trip-b", "fp1", sealed)).toBeNull();
+    expect(await openName(key, "trip-a", "footprint", "fp1", sealed)).toBeNull();
+    expect(await openPoint(key, "trip-a", "fp1", await sealName(key, "trip-a", 1, "footprint", "fp1", "花子"))).toBeNull();
+    expect(await openPoint(await newTripKey(), "trip-a", "fp1", sealed)).toBeNull();
+  });
+  test("名前: sealName → openName, bound to its seat or invite; the host's plain names pass through", async () => {
+    const key = await newTripKey(), sealed = await sealName(key, "trip-a", 1, "member", "seat1", "  花子  ");
+    expect(sealed).not.toContain("花子");
+    expect(await openName(key, "trip-a", "member", "seat1", sealed)).toBe("花子");
+    expect(await openName(key, "trip-a", "grant", "seat1", sealed)).toBeNull();
+    expect(await openName(key, "trip-a", "member", "seat2", sealed)).toBeNull();
+    expect(await openName(key, "trip-a", "footprint", "fp1", await sealName(key, "trip-a", 1, "footprint", "fp1", "太郎"))).toBe("太郎");
+    for (const plain of ["メンバー3", "自分用", "招待リンク", "オーナー"]) expect(await openName(key, "trip-a", "member", "seat1", plain)).toBe(plain);
+    await expect(sealName(key, "trip-a", 1, "grant", "g1", "あ".repeat(81))).rejects.toThrow("名前は1〜80字です");
+    await expect(sealName(key, "trip-a", 1, "grant", "g1", "   ")).rejects.toThrow("名前は1〜80字です");
+    expect(await openName(key, "trip-a", "grant", "g1", await sealField(key, "trip-a", 1, "grant", "g1", "label", "あ".repeat(81)))).toBeNull();
+  });
+});
+
+describe("move", () => {
+  const plain = () => {
+    const t = fullTrip();
+    return {
+      spec: t.spec, document: t.document,
+      previous: { spec: { ...t.spec, title: "前の題の言葉" }, document: { items: t.document.items, notes: "前のメモの言葉", checklist: t.document.checklist, budget: t.document.budget }, revisedIds: { suggestions: ["s1"], comments: [] } },
+      footprints: [{ id: "fp1", lat: 35.6812, lng: 139.7671, accuracy: 12, by: "足あとの人" }, { id: "fp2", lat: -33.8568, lng: 151.2153, accuracy: 30, by: "オーナー" }],
+      grants: [
+        { id: "g-own", label: "自分用", members: [{ id: "seat-o", label: "オーナー" }] },
+        { id: "g-a", label: "家族への招待", members: [{ id: "seat-a", label: "名前を変えた人" }, { id: "seat-b", label: "メンバー2" }] },
+        { id: "g-b", label: "招待リンク", members: [] },
+      ],
+    };
+  };
+  test("往復: sealMove → openTrip, openPoint and openName give the trip back", async () => {
+    const key = await newTripKey(), input = plain(), body = await sealMove(key, "trip-a", 1, input);
+    expect(body).toMatchObject({ generation: 1, confirm: true });
+    expect(await openTrip(key, "trip-a", body)).toEqual({ spec: input.spec, document: input.document, unreadable: [] });
+    const prev = (await openTrip(key, "trip-a", { spec: body.previous!.spec, document: { ...body.document, ...body.previous!.document } }))!;
+    expect(prev.spec.title).toBe("前の題の言葉"); expect(prev.document.notes).toBe("前のメモの言葉");
+    expect(body.previous!.revisedIds).toEqual({ suggestions: ["s1"], comments: [] });
+    expect(body.footprints.map(p => p.id)).toEqual(["fp1", "fp2"]);
+    for (const [i, p] of body.footprints.entries()) {
+      const { id, by, ...point } = input.footprints[i]!;
+      expect(await openPoint(key, "trip-a", id, p.point)).toEqual(point);
+      expect(await openName(key, "trip-a", "footprint", id, p.by)).toBe(by);
+    }
+    expect(Object.keys(body.members).sort()).toEqual(["seat-a", "seat-b", "seat-o"]);
+    for (const m of input.grants.flatMap(g => g.members)) expect(await openName(key, "trip-a", "member", m.id, body.members[m.id]!)).toBe(m.label);
+    expect(await openName(key, "trip-a", "grant", "g-a", body.grants["g-a"]!)).toBe("家族への招待");
+  });
+  test("平文が無い: none of the trip's words, points or names are in the body, but the host's invite names", async () => {
+    const body = await sealMove(await newTripKey(), "trip-a", 1, plain()), stored = JSON.stringify(body);
+    for (const w of [...words, "前の題の言葉", "前のメモの言葉", "35.6812", "139.7671", "足あとの人", "名前を変えた人", "家族への招待", "オーナー", "メンバー2"]) expect(stored).not.toContain(w);
+    expect(body.grants).toMatchObject({ "g-own": "自分用", "g-b": "招待リンク" });
+  });
+  test("previous を捨てる: with dropPrevious or no previous, the body has no previous", async () => {
+    const key = await newTripKey();
+    expect("previous" in await sealMove(key, "trip-a", 1, plain(), { dropPrevious: true })).toBe(false);
+    expect("previous" in await sealMove(key, "trip-a", 1, { ...plain(), previous: null })).toBe(false);
+  });
+  test("範囲の外: a footprint out of range is not sealed", async () => {
+    const input = plain(); input.footprints[0]!.lat = 91;
+    await expect(sealMove(await newTripKey(), "trip-a", 1, input)).rejects.toThrow("Too big: expected number to be <=90");
+  });
+});
+
+describe("rekey", () => {
+  const cap = "trip-a";
+  const generations = (v: unknown) => [...JSON.stringify(v).matchAll(/v1\.(\d+)\./g)].map(m => m[1]);
+  // A seat with its own keys, edges to sign later, and its public form as GET "" lists it.
+  type Seat = { id: string; role: KeyedSeat["role"]; keys: SeatKeys; pub: { x25519: string; ed25519: string }; edges: KeyedSeat["edges"]; since?: KeyedSeat["since"] };
+  const seat = async (id: string, role: KeyedSeat["role"] = "participant"): Promise<Seat> => { const keys = await newSeatKeys(); return { id, role, keys, pub: await seatPublic(keys), edges: [] }; };
+  const edge = async (from: Seat, to: Seat) => { from.edges.push({ seat: to.id, signature: await signEdge(from.keys.ed25519.privateKey, { seat: to.id, ...to.pub }, cap) }); };
+  const root = (s: Seat) => ({ id: s.id, ed25519: s.pub.ed25519 });
+  const listed = (...seats: Seat[]): KeyedSeat[] => seats.map(s => ({ id: s.id, role: s.role, ...s.pub, edges: s.edges.map(e => ({ ...e })), ...(s.since ? { since: { ...s.since } } : {}) }));
+  // The pair made again, as after a passkey registered later: `since` signed with the old key, and its own edges signed anew.
+  const remake = async (s: Seat, others: Seat[]) => {
+    const keys = await newSeatKeys(), pub = await seatPublic(keys);
+    s.since = await signSuccession(s.keys.ed25519.privateKey, s.pub, { capsuleId: cap, seat: s.id, ...pub });
+    s.keys = keys; s.pub = pub; s.edges = [];
+    for (const o of others) await edge(s, o);
+  };
+
+  test("世代: resealAll seals everything under the next generation, and the old key opens none of it", async () => {
+    const oldKey = await newTripKey(), newKey = await newTripKey(), t = fullTrip();
+    const sealed = await sealTrip(oldKey, cap, 1, t);
+    sealed.document.suggestions[0]!.seat = "seat-a";
+    const footprints = [{ id: "fp1", point: await sealPoint(oldKey, cap, 1, "fp1", { lat: 35.6812, lng: 139.7671, accuracy: 12 }), by: await sealName(oldKey, cap, 1, "footprint", "fp1", "足あとの人") }];
+    const members = [{ id: "seat-o", label: await sealName(oldKey, cap, 1, "member", "seat-o", "オーナーの名前") }, { id: "seat-b", label: "メンバー2" }];
+    const grants = [{ id: "g-own", label: "自分用" }, { id: "g-a", label: await sealName(oldKey, cap, 1, "grant", "g-a", "家族への招待") }];
+    const out = await resealAll(oldKey, newKey, cap, 2, { ...sealed, footprints, members, grants });
+    expect(generations(out).length).toBeGreaterThan(20);
+    expect(new Set(generations(out))).toEqual(new Set(["2"]));
+    expect("previous" in out).toBe(false);
+    expect(await openTrip(newKey, cap, out)).toEqual({ spec: t.spec, document: t.document, unreadable: [] });
+    expect(out.document.suggestions[0]!.seat).toBe("seat-a");
+    expect(await openPoint(newKey, cap, "fp1", out.footprints[0]!.point)).toEqual({ lat: 35.6812, lng: 139.7671, accuracy: 12 });
+    expect(await openName(newKey, cap, "footprint", "fp1", out.footprints[0]!.by)).toBe("足あとの人");
+    expect(await openName(newKey, cap, "member", "seat-o", out.members[0]!.label)).toBe("オーナーの名前");
+    expect(out.members[1]).toEqual({ id: "seat-b", label: "メンバー2" });
+    expect(out.grants[0]).toEqual({ id: "g-own", label: "自分用" });
+    expect(await openName(newKey, cap, "grant", "g-a", out.grants[1]!.label)).toBe("家族への招待");
+    // The old generation's key, as a revoked member's browser keeps it, opens nothing new.
+    await expect(openField(oldKey, cap, "notes", "notes", "body", out.document.notes)).rejects.toThrow();
+    await expect(openField(oldKey, cap, "item", out.document.items[0]!.id, "sealed", out.document.items[0]!.sealed)).rejects.toThrow();
+    expect(await openTrip(oldKey, cap, out)).toBeNull();
+    expect(await openPoint(oldKey, cap, "fp1", out.footprints[0]!.point)).toBeNull();
+    // What does not open with the old key stops the replacement rather than vanish.
+    const broken = structuredClone(sealed); broken.document.notes = await sealField(newKey, cap, 1, "notes", "notes", "body", "別の鍵");
+    await expect(resealAll(oldKey, newKey, cap, 2, { ...broken, footprints, members, grants })).rejects.toThrow("開けない記録があります（1 件）");
+    await expect(resealAll(oldKey, newKey, cap, 2, { ...sealed, footprints: [{ ...footprints[0]!, point: await sealPoint(newKey, cap, 1, "fp1", { lat: 1, lng: 1, accuracy: 1 }) }], members, grants })).rejects.toThrow("開けない記録があります（1 件）");
+    await expect(resealAll(await newTripKey(), newKey, cap, 2, { ...sealed, footprints, members, grants })).rejects.toThrow("旅程を開けません");
+  });
+
+  test("たどる: edges lead from the root while their signatures hold, through `since` for one generation of pairs", async () => {
+    const owner = await seat("o", "owner"), a = await seat("a"), c = await seat("c");
+    await edge(owner, a); await edge(a, c);
+    expect([...await reachableSeats(root(owner), listed(owner, a, c), cap)].sort()).toEqual(["a", "c", "o"]);
+    // A revoked seat is not passed through, and an unknown root reaches nothing.
+    expect([...await reachableSeats(root(owner), listed(owner, c), cap)]).toEqual(["o"]);
+    expect(await reachableSeats({ id: "x", ed25519: owner.pub.ed25519 }, listed(owner, a, c), cap)).toEqual(new Set());
+    // One character of a signature changed breaks the edge.
+    const tampered = listed(owner, a, c); const sig = tampered[0]!.edges[0]!.signature;
+    tampered[0]!.edges[0]!.signature = (sig[0] === "A" ? "B" : "A") + sig.slice(1);
+    expect([...await reachableSeats(root(owner), tampered, cap)]).toEqual(["o"]);
+    // A's pair made again: owner's edge was signed over A's old keys, and `since` carries it on; A's own edges are signed anew.
+    await remake(a, [c]);
+    expect([...await reachableSeats(root(owner), listed(owner, a, c), cap)].sort()).toEqual(["a", "c", "o"]);
+    // A `since` not signed by the old key does not.
+    const forged = listed(owner, a, c); forged[1]!.since!.signature = (await signSuccession((await newSeatKeys()).ed25519.privateKey, a.since!, { capsuleId: cap, seat: "a", ...a.pub })).signature;
+    expect([...await reachableSeats(root(owner), forged, cap)]).toEqual(["o"]);
+    // Made again twice: `since` names only the pair before, so owner's edge over the first pair no longer leads to A.
+    await remake(a, [c]);
+    expect([...await reachableSeats(root(owner), listed(owner, a, c), cap)]).toEqual(["o"]);
+  });
+
+  test("owner 以外の世代: a member's browser takes a new generation only when an owner seat it reaches signed that wrap", async () => {
+    const owner = await seat("o", "owner"), a = await seat("a"), b = await seat("b"), stranger = await seat("s", "owner");
+    await edge(owner, a); await edge(a, owner); await edge(a, b); await edge(b, a);
+    const seats = listed(owner, a, b, stranger), trip = await newTripKey();
+    const wrapTo = async (to: Seat, signer: Seat, generation = 2) => {
+      const w = await wrapTripKey(trip, to.pub.x25519, cap, generation);
+      return { generation, ...w, x25519: to.pub.x25519, rekey: { seat: signer.id, signature: await signRekey(signer.keys.ed25519.privateKey, { capsuleId: cap, generation, seat: to.id, x25519: to.pub.x25519, ...w }) } };
+    };
+    const accept = (self: Seat, seatKey: Awaited<ReturnType<typeof wrapTo>> | Omit<Awaited<ReturnType<typeof wrapTo>>, "rekey">, known = 1, list = seats) => acceptRekey({ self: root(self), known, capsuleId: cap, seats: list, seatKey });
+    expect(await accept(b, await wrapTo(b, owner))).toBe(true);
+    expect(await accept(owner, await wrapTo(owner, owner))).toBe(true);
+    // Signed by a participant, by an owner seat B does not reach (the operator's own, as after /recover), or by nobody.
+    expect(await accept(b, await wrapTo(b, a))).toBe(false);
+    expect(await accept(b, await wrapTo(b, stranger))).toBe(false);
+    const { rekey: _, ...unsigned } = await wrapTo(b, owner);
+    expect(await accept(b, unsigned)).toBe(false);
+    // The wrap changed after the owner signed it.
+    const swapped = await wrapTo(b, owner); swapped.wrapped = (await wrapTripKey(await newTripKey(), b.pub.x25519, cap, 2)).wrapped;
+    expect(await accept(b, swapped)).toBe(false);
+    // The owner reached only through A: once A is gone, B does not take it.
+    expect(await accept(b, await wrapTo(b, owner), 1, listed(owner, b, stranger))).toBe(false);
+    // The host lists B's seat with another key and edges it signed itself, to an owner seat of its own: B starts from the key it holds.
+    const forger = await seat("b"), fakeOwner = await seat("f", "owner"); await edge(forger, fakeOwner);
+    const forgedList = [...listed(owner, a, fakeOwner), ...listed(forger)];
+    expect([...await reachableSeats(root(b), forgedList, cap)]).toEqual(["b"]);
+    expect(await accept(b, await wrapTo(b, fakeOwner), 1, forgedList)).toBe(false);
+    // A generation already taken here is taken without a signature.
+    expect(await accept(b, unsigned, 2)).toBe(true);
+    expect(await accept(b, { ...unsigned, generation: 1 }, 1)).toBe(true);
   });
 });

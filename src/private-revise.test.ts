@@ -58,6 +58,9 @@ test("what cannot be applied is said with where to fix it", () => {
   expect(messages(answer([{ ...mine[0], endsAt: "2026-09-25T07:00:00+09:00" }]))).toEqual(["1 つめの自分の予定・日記の終了時刻: 終了時刻が開始時刻より前です"]);
   expect(messages(answer([{ ...mine[0], place: { label: "" } }]))).toEqual(["1 つめの自分の予定・日記の場所の名前: 1 文字以上で指定してください"]);
   expect(messages(answer([{ ...mine[0], place: { label: "駅", publicUrl: "http://example.com/" } }]))).toEqual(["1 つめの自分の予定・日記の場所の公開URL: 公開HTTPS URLのみ使用できます"]);
+  // zod 4 reports a missing choice as a wrong one; it still reads as under zod 3 (#833).
+  expect(messages(answer([{ ...mine[1], kind: undefined }]))).toEqual(["1 つめの自分の予定・日記の種類: 指定してください"]);
+  expect(messages(answer([{ ...mine[1], kind: "memo" }]))).toEqual(["1 つめの自分の予定・日記の種類: 次のいずれかを指定してください: item | diary"]);
   expect(messages(answer([{ ...mine[0], owner: "x" }]))).toEqual(["1 つめの自分の予定・日記: 知らない項目があります: 'owner'"]);
   expect(messages(answer([mine[1], { ...mine[1], body: "別" }]))).toEqual(["同じ id（d1）の項目が 2 つあります。1 つにしてください。"]);
   expect(messages(JSON.stringify({ schemaVersion: 1, spec, document }))).toContain("旅程全体: 知らない項目があります: 'spec', 'document'");

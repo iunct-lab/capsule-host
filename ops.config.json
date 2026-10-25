@@ -13,5 +13,5 @@
     "origin": {"name": "元要望", "pattern": "^(#[0-9]+([^0-9].*)?|なし[（(].+[）)].*)$", "hint": "`#N（要望のどの部分か）` か `なし（理由）`"}
   },
   "storyPoints": [1, 2, 3, 5, 8],
-  "publicSync": { "target": "iunct-lab/capsule-host", "exclude": ["docs/releases.md", "scripts/local-ci.ts", "scripts/local-ci.test.ts", ".github/workflows/labels.yml", ".github/labels.yml"], "rewrite": ["SECURITY.md"] }
+  "publicSync": { "target": "iunct-lab/capsule-host", "versioning": "independent", "exclude": ["docs/releases.md", "scripts/local-ci.ts", "scripts/local-ci.test.ts", ".github/workflows/labels.yml", ".github/labels.yml"], "rewrite": ["SECURITY.md"] }
 }

@@ -6,7 +6,7 @@ import { InvokeCommand, LambdaClient } from "@aws-sdk/client-lambda";
 const store = new AwsStore(process.env.CAPSULE_TABLE!);
 const lambda = new LambdaClient({});
 const origin = process.env.CAPSULE_ORIGIN!;
-export const host = new CloudHost({ STORE: store, KEYS: new SsmKeyStore(process.env.CAPSULE_KEY_PREFIX ?? "/capsule-host/unset/creator-key"), CAPSULE_HMAC_KEY: process.env.CAPSULE_HMAC_KEY!, CAPSULE_ORIGIN: origin, CAPSULE_CLAIM_COUNTRIES: process.env.CAPSULE_CLAIM_COUNTRIES ?? "", CAPSULE_DISABLED_ACTIONS: process.env.CAPSULE_DISABLED_ACTIONS ?? "", CAPSULE_ASSIST_MODEL: process.env.CAPSULE_ASSIST_MODEL,
+export const host = new CloudHost({ STORE: store, KEYS: new SsmKeyStore(process.env.CAPSULE_KEY_PREFIX ?? "/capsule-host/unset/creator-key"), CAPSULE_HMAC_KEY: process.env.CAPSULE_HMAC_KEY!, CAPSULE_ORIGIN: origin, CAPSULE_CLAIM_COUNTRIES: process.env.CAPSULE_CLAIM_COUNTRIES ?? "", CAPSULE_DISABLED_ACTIONS: process.env.CAPSULE_DISABLED_ACTIONS ?? "", CAPSULE_SEALED_FROM: process.env.CAPSULE_SEALED_FROM, CAPSULE_ASSIST_MODEL: process.env.CAPSULE_ASSIST_MODEL,
   // A generation outlasts an HTTP request, so it is started as an Event (no retry: template.yaml) on the Event Function: the one running
   // this code, or the one named by CAPSULE_EVENT_FUNCTION when the Web Function (which only serves HTTP) is the caller.
   ASSIST: { generate: anthropicGenerate, dispatch: async id => { await lambda.send(new InvokeCommand({ FunctionName: process.env.CAPSULE_EVENT_FUNCTION ?? process.env.AWS_LAMBDA_FUNCTION_NAME!, InvocationType: "Event", Payload: JSON.stringify({ source: "capsule.assist", id }) })); } } });

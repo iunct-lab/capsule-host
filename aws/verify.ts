@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomInt } from "node:crypto";
 import { invoke } from "./invoke";
 import { fakeAuthenticator, testTrip } from "../src/test-fixture";
 import { regionsOf } from "../src/mapdata";
-import { openTrip, sealOperation, sealTrip, confirmationCodes, matchesCommitment, newAttempt, newHandoffKeys, newSeatKeys, newTripKey, seatPublic, signEdge, unwrapSeatSecret, unwrapTripKey, wrapSeatSecret, wrapTripKey } from "../src/trip-keys";
-import { newMemoKey, open as openEntryText, openEntry, seal as sealText, sealEntry, unwrapMemoKey, wrapMemoKey, wrappingKey, type SealedEntry } from "../src/private-entries";
+import { openName, openPoint, sealName, sealPoint, openTrip, resealTrip, sealOperation, sealMove, confirmationCodes, matchesCommitment, newAttempt, newHandoffKeys, newSeatKeys, newTripKey, seatPublic, signEdge, unwrapSeatSecret, unwrapTripKey, wrapSeatSecret, wrapTripKey, acceptRekey, openField, reachableSeats, resealAll, signRekey, type SeatKeys } from "../src/trip-keys";
+import { assistSealingKey, newMemoKey, open as openEntryText, openEntry, seal as sealText, sealEntry, unwrapMemoKey, wrapMemoKey, wrappingKey, type SealedEntry } from "../src/private-entries";
 
 // Publishes a disposable fictional capsule through IAM Lambda Invoke, verifies it through CloudFront, then purges it.
 // Never prints capability links/cookies. Run from a country listed in the stack's ClaimCountries.
@@ -16,8 +16,10 @@ let capsuleId = "", owner = "";
 const started = Date.now() - 60000, secrets: string[] = [];
 // The second disposable capsule, published to be terminated: if a check fails before that, `finally` terminates it.
 let spare = "";
-// The third, sealed under its trip key (#691), and its owner's cookie (for the scene): if a check fails before its purge, `finally` terminates it by id.
+// The third, sealed under its trip key (#691), then the fourth, the plain one moved (#694), and its owner's cookie (for the scene): if a check fails before its purge, `finally` terminates it by id.
 let sealedId = "", sealedOwner = "";
+// The third's id kept past its purge: after the line, the log check looks for its 403 and 429 (#893).
+let sealedTripId = "";
 // Owner links not yet redeemed, newest last: if a check fails before the owner seat is taken, `finally` takes it to purge.
 const unredeemed: string[] = [];
 const title = "AWS動作確認用（自動削除）";
@@ -35,9 +37,9 @@ async function join(url: string) {
 // and verify:ui; here a software authenticator for this origin registers the owner browser's first passkey (which counts as the
 // check) or checks with it.
 const devices = new Map<string, ReturnType<typeof fakeAuthenticator>>();
-async function stepUp() {
-  const { challenge } = await (await request(api("/passkey/challenge"), "POST", {}, "")).json(), device = devices.get(owner), fresh = fakeAuthenticator({ origin });
-  const r = device ? await request(api("/passkey/verify"), "POST", { challenge, id: device.id, ...device.assert(challenge) }) : await request(api("/passkey"), "POST", { challenge, ...fresh.register(challenge) });
+async function stepUp(ui = "") {
+  const { challenge } = await (await request(api("/passkey/challenge") + ui, "POST", {}, "")).json(), device = devices.get(owner), fresh = fakeAuthenticator({ origin });
+  const r = device ? await request(api("/passkey/verify") + ui, "POST", { challenge, id: device.id, ...device.assert(challenge) }) : await request(api("/passkey") + ui, "POST", { challenge, ...fresh.register(challenge) });
   assert.equal(r.status, 200); if (!device) devices.set(owner, fresh);
 }
 const cliIn = async (where: string, ...args: string[]) => {
@@ -62,12 +64,23 @@ const stackName = await cli("lambda", "get-function", "--function-name", functio
 if (!stackName) throw new Error("この関数は CloudFormation のスタックに属していません");
 const webEndpoint = await cli("cloudformation", "describe-stacks", "--stack-name", stackName, "--query", "Stacks[0].Outputs[?OutputKey=='WebEndpoint'].OutputValue | [0]") as string | null;
 if (!webEndpoint) throw new Error("スタック出力 WebEndpoint がありません。aws/template.yaml を配置してください");
+// The line (SealedFrom, aws/README.md) is read from the Host's own settings, never passed in. After it, the plain trip this run
+// publishes opens to nothing but its owner's move (docs/design/trip-e2e.md §5): its scenes give way to checks of the line, and
+// the sealed and moved trips' scenes keep to what such a trip allows before its move (#893). Its time is not printed.
+const sealedFrom = await cli("lambda", "get-function-configuration", "--function-name", functionName, "--query", "Environment.Variables.CAPSULE_SEALED_FROM") as string | null;
+if (sealedFrom && Number.isNaN(Date.parse(sealedFrom))) throw new Error("CAPSULE_SEALED_FROM は時刻として読めません（Host も起動のときに断ります）");
+const afterLine = Boolean(sealedFrom) && Date.parse(sealedFrom!) <= Date.now(), ui = afterLine ? "?ui=2" : "";
+console.log(afterLine ? "SealedFrom: set (trips published by this run are after the line)" : sealedFrom ? "SealedFrom: set, not reached yet (trips published by this run are before the line)" : "SealedFrom: not set");
 try {
   const page = await request("/"); assert.equal(page.status, 200); assert.match(await page.text(), /app.js/);
   assert.match(page.headers.get("Content-Security-Policy")!, /frame-ancestors 'none'/);
+  // The only outside origin the page may reach: Anthropic, for a sealed trip's 「ここで直す」 sent by the browser (#692).
+  assert.match(page.headers.get("Content-Security-Policy")!, /(^|; )connect-src 'self' https:\/\/api\.anthropic\.com(;|$)/);
   // CloudFront's page lets the trip use the position (足あと) and keeps the camera and microphone closed, as the host does.
   assert.equal(page.headers.get("Permissions-Policy"), "camera=(), microphone=(), geolocation=(self)");
   for (const path of ["/app.js", "/app.css"]) { const r = await request(path); assert.equal(r.status, 200); assert.ok((await r.text()).length > 1000); }
+  // The page script carries its packages' licence notices, as aws/build.ts puts them (#841).
+  assert.ok((await (await request("/app.js")).text()).startsWith("/*! app.js carries:\n"), "app.js does not start with its notices");
   // The footprint map's parts and map data come from this origin only; the browser reads the PMTiles a range at a time.
   for (const path of ["/map.js", "/maplibre-worker.mjs", "/map.css"]) { const r = await request(path); assert.equal(r.status, 200, path); assert.ok((await r.text()).length > 1000, path); }
   assert.match((await request("/maplibre-worker.mjs")).headers.get("Content-Type")!, /javascript/);
@@ -129,16 +142,22 @@ try {
   // The owner seat is bound to the first browser; the same link is dead for anyone else.
   assert.equal((await redeem(retried.body.url)).status, 401);
   assert.equal((await redeem(retried.body.url, owner)).status, 200);
+  const invite = { role: "participant", label: "AWS確認用", seats: 2, expiresAt: seed.spec.lifecycle.purgeAt, confirm: true };
+  const here = { type: "add", lat: 35.6812, lng: 139.7671, accuracy: 20 };
+  // The plain trip's members, made in the first of its scenes and used in the second.
+  let participant = "", second = "", editor = "", viewerLink = "", g: any, listed: any;
+  // The plain trip's scenes, in two parts around the sealed and moved trips' (not indented, so the diff keeps to what changed).
+  plainScenes: {
+  if (afterLine) break plainScenes;
   const get = await request(api("")); assert.equal(get.status, 200); assert.equal(get.headers.get("ETag"), '"1"');
   // The owner's cookie alone does not hand out a seat; after the passkey check it does.
-  const invite = { role: "participant", label: "AWS確認用", seats: 2, expiresAt: seed.spec.lifecycle.purgeAt, confirm: true };
   const unchecked = await request(api("/grants"), "POST", invite); assert.equal(unchecked.status, 428); assert.equal((await unchecked.json()).error, "パスキーで本人確認してください");
   await stepUp();
   const issued = await request(api("/grants"), "POST", invite);
-  assert.equal(issued.status, 201); const g = await issued.json(); const participant = await join(g.url), second = await join(g.url);
+  assert.equal(issued.status, 201); g = await issued.json(); participant = await join(g.url); second = await join(g.url);
   // A viewer's invite for the footprint check, taken after the minute below: joining counts against the login limit.
-  const viewerLink = (await (await request(api("/grants"), "POST", { ...invite, role: "viewer", label: "AWS確認用（閲覧）", seats: 1 })).json()).url as string;
-  const editor = await join((await (await request(api("/grants"), "POST", { ...invite, role: "editor", label: "AWS確認用（編集）", seats: 1 })).json()).url);
+  viewerLink = (await (await request(api("/grants"), "POST", { ...invite, role: "viewer", label: "AWS確認用（閲覧）", seats: 1 })).json()).url as string;
+  editor = await join((await (await request(api("/grants"), "POST", { ...invite, role: "editor", label: "AWS確認用（編集）", seats: 1 })).json()).url);
   // Owner-only actions are refused to the roles below it, each by its own cookie.
   assert.equal((await request(api("/spec"), "PATCH", { spec: seed.spec, confirm: true }, editor)).status, 403);
   assert.equal((await request(api("/members"), "PATCH", { id: "x", label: "x" }, editor)).status, 403);
@@ -151,7 +170,7 @@ try {
   const swapped = await request(api("/passkey"), "POST", { challenge: swap.challenge, ...thief.register(swap.challenge) });
   assert.equal(swapped.status, 401); assert.equal((await swapped.json()).error, "パスキーで本人確認してください");
   assert.equal((await redeem(g.url)).status, 401);
-  const listed = (await (await request(api("/grants"))).json()).find((x: any) => x.id === g.grantId);
+  listed = (await (await request(api("/grants"))).json()).find((x: any) => x.id === g.grantId);
   assert.equal(listed.claimed, 2); assert.equal(listed.members.length, 2);
   assert.equal((await request(api("/document"), "PATCH", { type: "notes", body: "unauthorized" }, participant)).status, 403);
   // The 準備 list, the 費用メモ and the 候補・相談 posts are changed by the owner and editors only (refused before the post is
@@ -239,7 +258,6 @@ try {
   // A footprint (#480): a participant leaves one during the trip, and the owner one as the page leaves it on opening (#481,
   // `auto`; another seat, so the minute's limit is not met); the owner reads both, and no revision moves. A viewer is refused
   // after the minute below. They go with the capsule at the purge.
-  const here = { type: "add", lat: 35.6812, lng: 139.7671, accuracy: 20 };
   assert.equal((await request(api("/footprints"), "PATCH", here, participant)).status, 200);
   assert.equal((await request(api("/footprints"), "PATCH", { ...here, lat: 35.6813, auto: true })).status, 200);
   // The same seat again within the minute: a 429 that is not the login limit, so the logs get one without spending it (#608).
@@ -261,6 +279,17 @@ try {
     for (const needle of keyNeedles) assert.equal(found(needle), 0, "a trip key or a seat's private key is readable in DynamoDB");
     assert.equal(found(marker), 0, "the private entry's words are readable in DynamoDB"); assert.ok(found(title) >= 1, "the scan did not find this trip's own title: the decoding is wrong");
   }
+  }
+  // After the line, the plain trip just published is checked for it instead (src/cloud-host.ts mustSeal): an older screen is asked
+  // to reload, and the new one gets the owner's view marked mustSeal but no invite, edit or footprint; the operator's list says so.
+  if (afterLine) {
+    const line = async (path: string, method = "GET", body?: unknown) => { const r = await request(path, method, body); return [r.status, (await r.json()).error]; };
+    assert.deepEqual(await line(api("")), [409, "画面を更新してください"]);
+    const fresh = await request(api("") + ui); assert.equal(fresh.status, 200); assert.equal((await fresh.json()).mustSeal, true);
+    for (const [action, method, body] of [["/grants", "POST", invite], ["/document", "PATCH", { type: "check", id: "c3", done: true }], ["/footprints", "PATCH", here]] as const) assert.deepEqual(await line(api(action) + ui, method, body), [409, "オーナーがこの旅行を移すまで開けません"], action);
+    assert.equal((await invoke(functionName, profile, region, { path: "/v1/capsules/list", payload: {} })).body.find((c: { id: string }) => c.id === capsuleId).mustSeal, true);
+    console.log("plain trip after the line: 409 画面を更新してください without ui=2, 409 オーナーがこの旅行を移すまで開けません for an invite, an edit and a footprint, mustSeal for the owner and in the operator's list");
+  }
   // The trip sealed under the trip's key (#691, docs/design/trip-e2e.md §3): a third disposable capsule whose title, an item and
   // a suggestion carry a marker. Its owner puts the trip key on the seat, seals the plan it reads with src/trip-keys.ts and posts
   // it after the passkey check; the plan opens back the same, a participant may post (sealed) but not add an item, theme.css and
@@ -270,8 +299,8 @@ try {
   const sealedMarker = `sealed-marker-${randomBytes(8).toString("hex")}`, sealedSeed = testTrip();
   sealedSeed.spec.title = `${title} ${sealedMarker}`; sealedSeed.spec.trip.endsOn = seed.spec.trip.endsOn; sealedSeed.spec.lifecycle.purgeAt = seed.spec.lifecycle.purgeAt;
   sealedSeed.document.items[0]!.title = sealedMarker; sealedSeed.document.suggestions = [{ id: "s1", author: "AWS確認", body: sealedMarker, createdAt: new Date().toISOString(), promoted: false }];
-  const sealedMade = await invoke(functionName, profile, region, { payload: { ...sealedSeed, confirm: true } }); assert.equal(sealedMade.statusCode, 201); sealedId = sealedMade.body.id;
-  const sAt = (action: string) => `/v1/c/${sealedId}${action}`;
+  const sealedMade = await invoke(functionName, profile, region, { payload: { ...sealedSeed, confirm: true } }); assert.equal(sealedMade.statusCode, 201); sealedTripId = sealedId = sealedMade.body.id;
+  const sAt = (action: string) => `/v1/c/${sealedId}${action}?ui=2`;  // as the new screen sends them (a sealed trip refuses an older one)
   const enter = async (url: string) => {
     const secret = new URLSearchParams(new URL(url).hash.slice(1)).get("k")!; secrets.push(secret);
     const r = await request(sAt("/sessions"), "POST", { secret }, ""); assert.equal(r.status, 200);
@@ -283,13 +312,15 @@ try {
   assert.equal((await request(sAt("/passkey"), "POST", { challenge: sealedChallenge, ...sealedDevice.register(sealedChallenge) }, sealedOwner)).status, 200);
   const sSeat = await newSeatKeys(), sPub = await seatPublic(sSeat), sTrip = await newTripKey(), sWrap = await wrapTripKey(sTrip, sPub.x25519, sealedId, 1);
   assert.equal((await request(sAt("/keys"), "PATCH", { type: "seat", ...sPub, ephemeral: sWrap.ephemeral, generation: 1, wrapped: sWrap.wrapped }, sealedOwner)).status, 200);
-  const sMember = await enter((await (await request(sAt("/grants"), "POST", { ...invite, seats: 1 }, sealedOwner)).json()).url);
+  // After the line the trip takes no one before its seal: the participant is invited after it, under a sealed name (below).
+  let sMember = afterLine ? "" : await enter((await (await request(sAt("/grants"), "POST", { ...invite, seats: 1 }, sealedOwner)).json()).url);
   const plainView = await (await request(sAt(""), "GET", undefined, sealedOwner)).json();
   const theme = async () => { const r = await request(sAt("/theme.css"), "GET", undefined, sealedOwner); assert.equal(r.status, 200); const css = await r.text(); assert.match(css, /--accent:#/); return css; };
   const listedOf = async () => { const { updated: _updated, ...rest } = (await invoke(functionName, profile, region, { path: "/v1/capsules/list", payload: {} })).body.find((c: { id: string }) => c.id === sealedId); return rest; };
   const [themeBefore, listedBefore] = [await theme(), await listedOf()];
-  const sealedBody = await sealTrip(sTrip, sealedId, 1, { spec: plainView.spec, document: plainView.document });
-  assert.equal((await request(sAt("/seal"), "POST", { generation: 1, ...sealedBody, confirm: true }, sealedOwner, plainView.document.revision)).status, 200);
+  const sealedBody = await sealMove(sTrip, sealedId, 1, { spec: plainView.spec, document: plainView.document, previous: null, footprints: plainView.footprints, grants: await (await request(sAt("/grants"), "GET", undefined, sealedOwner)).json() });
+  assert.equal((await request(sAt("/seal"), "POST", sealedBody, sealedOwner, plainView.document.revision)).status, 200);
+  if (afterLine) { const id = randomBytes(16).toString("hex"); sMember = await enter((await (await request(sAt("/grants"), "POST", { ...invite, seats: 1, id, label: await sealName(sTrip, sealedId, 1, "grant", id, "AWS確認用") }, sealedOwner)).json()).url); }
   const sealedView = await (await request(sAt(""), "GET", undefined, sealedOwner)).json(), sealedText = JSON.stringify(sealedView);
   assert.equal(sealedView.sealed.generation, 1); assert.ok(!sealedText.includes(sealedMarker), "the host returns a plain word of the sealed trip");
   const reopened = await openTrip(sTrip, sealedId, sealedView);
@@ -297,17 +328,182 @@ try {
   const sOp = (op: object) => sealOperation(sTrip, sealedId, 1, op, reopened!.document);
   assert.equal((await request(sAt("/document"), "PATCH", await sOp({ type: "item", item: { id: "sealed-new", kind: "meal", status: "proposed", title: "x", day: plainView.document.items[0].day, revision: 1 } }), sMember, sealedView.document.revision)).status, 403);
   assert.equal((await request(sAt("/document"), "PATCH", await sOp({ type: "suggest", author: "参加者", body: sealedMarker }), sMember, sealedView.document.revision)).status, 200);
-  assert.equal(await theme(), themeBefore); assert.deepEqual(await listedOf(), listedBefore);
-  assert.equal((await request(sAt("/export"), "GET", undefined, sealedOwner)).status, 409);
+  assert.equal(await theme(), themeBefore); assert.deepEqual(await listedOf(), { ...listedBefore, sealed: true, ...(afterLine ? { mustSeal: false, grants: listedBefore.grants + 1, members: listedBefore.members + 1 } : {}) });  // only whether it is sealed changes (after the line, also whether it must be, and the participant invited after the seal is counted)
+  // A revise of the sealed trip as the browser sends it (#786): the next trip sealed, records left as they were keeping their
+  // ciphertext. One step back is then held by the host as ciphertext (GET undo), and opens to the trip before the revise (#783).
+  const beforeRevise = await (await request(sAt(""), "GET", undefined, sealedOwner)).json(), openedBefore = await openTrip(sTrip, sealedId, beforeRevise);
+  assert.ok(openedBefore && !openedBefore.unreadable.length, "the sealed trip did not open before the revise");
+  const nextTrip = structuredClone({ spec: openedBefore.spec, document: openedBefore.document }); nextTrip.document.items[0]!.title = "AWS確認で直した予定";
+  const resealed = await resealTrip(sTrip, sealedId, 1, [beforeRevise], nextTrip);
+  assert.equal((await request(sAt("/revise"), "POST", { ...resealed, document: { ...resealed.document, reflections: beforeRevise.document.reflections }, confirm: true }, sealedOwner, beforeRevise.document.revision)).status, 200);
+  const undoResponse = await request(sAt("/undo"), "GET", undefined, sealedOwner); assert.equal(undoResponse.status, 200);
+  const undoText = await undoResponse.text(), stepBack = JSON.parse(undoText).previous;
+  assert.ok(!undoText.includes(sealedMarker) && /^v1\./.test(stepBack.spec.title), "GET undo of the sealed trip holds a plain word");
+  const reopenedBack = await openTrip(sTrip, sealedId, { spec: stepBack.spec, document: { ...beforeRevise.document, ...stepBack.document } });
+  assert.equal(reopenedBack?.document.items[0]!.title, sealedMarker, "GET undo did not hold the sealed trip before the revise");
+  // The host's exports of a sealed trip give nothing (the screen makes them, #785).
+  for (const path of ["/export", "/export.md", "/export.html"]) {
+    const r = await request(sAt(path), "GET", undefined, sealedOwner); assert.equal(r.status, 409, `${path} of the sealed trip`);
+    assert.ok(!(await r.text()).includes(sealedMarker), `${path} of the sealed trip holds a plain word`);
+  }
+  // The owner's Anthropic key, wrapped by the browser with the passkey's PRF (random bytes stand in for it): kept on the seat as it
+  // came; a plain key is refused (#784, #787).
+  const assistWrapped = await sealText(await assistSealingKey(randomBytes(32), sealedId), `sk-ant-aws-verify-${randomBytes(16).toString("hex")}`, `${sealedId}/assist`);
+  assert.equal((await request(sAt("/key"), "PUT", { key: `sk-ant-aws-verify-${randomBytes(16).toString("hex")}` }, sealedOwner)).status, 400);
+  assert.equal((await request(sAt("/key"), "PUT", { wrapped: assistWrapped }, sealedOwner)).status, 204);
+  assert.equal((await (await request(sAt(""), "GET", undefined, sealedOwner)).json()).assistWrapped, assistWrapped);
+  console.log("sealed trip: exports hold no plain words, GET undo holds the step back sealed, the assist key is wrapped by the browser, CSP allows api.anthropic.com only");
+  // Footprints, names and the history of the sealed trip (#693, docs/design/trip-e2e.md §3.1): a participant's point and name
+  // sealed against the id the browser chose open back the same, the same seat within the minute is 429 and a viewer 403; the
+  // owner names the participant and an invite in ciphertext only, and the history lines name the invite and the seats by id.
+  const nameMarker = `sealed-name-${randomBytes(6).toString("hex")}`, point = { lat: Number(`35.68${randomInt(10, 100)}7`), lng: 139.7671, accuracy: 20 };
+  const gid = () => randomBytes(16).toString("hex");
+  const sCheck = async () => { const { challenge } = await (await request(sAt("/passkey/challenge"), "POST", {}, "")).json(); assert.equal((await request(sAt("/passkey/verify"), "POST", { challenge, id: sealedDevice.id, ...sealedDevice.assert(challenge) }, sealedOwner)).status, 200); };
+  const leave = async (cookie: string) => { const id = gid(); return request(sAt("/footprints"), "PATCH", { type: "add", id, point: await sealPoint(sTrip, sealedId, 1, id, point), by: await sealName(sTrip, sealedId, 1, "footprint", id, nameMarker) }, cookie); };
+  assert.equal((await request(sAt("/footprints"), "PATCH", { type: "add", ...point }, sMember)).status, 400);
+  assert.equal((await leave(sMember)).status, 200);
+  const stepView = await (await request(sAt(""), "GET", undefined, sealedOwner)).json(), [left] = stepView.footprints;
+  assert.deepEqual([await openPoint(sTrip, sealedId, left.id, left.point), await openName(sTrip, sealedId, "footprint", left.id, left.by), left.mine], [point, nameMarker, false]);
+  assert.ok(!JSON.stringify(stepView).includes(String(point.lat)) && !JSON.stringify(stepView).includes(nameMarker), "the host returns a plain point or name of the sealed trip");
+  assert.equal((await leave(sMember)).status, 429);
+  await sCheck();
+  const memberSeat = (await (await request(sAt(""), "GET", undefined, sMember)).json()).self.id as string;
+  assert.equal((await request(sAt("/members"), "PATCH", { id: memberSeat, label: nameMarker }, sealedOwner)).status, 400);
+  assert.equal((await request(sAt("/members"), "PATCH", { id: memberSeat, label: await sealName(sTrip, sealedId, 1, "member", memberSeat, nameMarker) }, sealedOwner)).status, 200);
+  const viewerGrant = gid(), viewerMade = await request(sAt("/grants"), "POST", { role: "viewer", id: viewerGrant, label: await sealName(sTrip, sealedId, 1, "grant", viewerGrant, nameMarker), seats: 1, expiresAt: sealedSeed.spec.lifecycle.purgeAt, confirm: true }, sealedOwner);
+  assert.equal(viewerMade.status, 201); const sViewer = await enter((await viewerMade.json()).url);
+  assert.equal((await leave(sViewer)).status, 403);
+  const sGrantsText = await (await request(sAt("/grants"), "GET", undefined, sealedOwner)).text();
+  assert.ok(!sGrantsText.includes(nameMarker), "the grants list holds a plain name of the sealed trip");
+  assert.equal(await openName(sTrip, sealedId, "grant", viewerGrant, JSON.parse(sGrantsText).find((g: { id: string }) => g.id === viewerGrant).label), nameMarker);
+  const sHistory = await (await request(sAt("/history"), "GET", undefined, sealedOwner)).json() as Array<Record<string, unknown>>;
+  assert.deepEqual([sHistory[0]!.event, sHistory[0]!.grant, typeof sHistory[0]!.seat, sHistory[1]!.event, sHistory[1]!.grant], ["sessions", viewerGrant, "string", "grants", viewerGrant]);
+  assert.ok(sHistory.slice(0, 2).every(h => !("label" in h) && !("by" in h)), "a sealed trip's history line holds a name");
+  console.log("sealed trip: a footprint and the names sealed by the browser open back, 429 within the minute, 403 for a viewer; the history holds the invite's and the seats' ids");
   if (stackName === "capsule-host-dev") {
     const stored = await storedPayloads(), mine = stored.filter(p => p.includes(`"id":"${sealedId}"`));
     console.log(`scan (sealed): ${mine.length} payload of the sealed capsule found, marker in ${stored.filter(p => p.includes(sealedMarker)).length}`);
     assert.equal(mine.length, 1, "the scan did not find the sealed capsule's payload: the decoding is wrong");
     assert.equal(stored.filter(p => p.includes(sealedMarker)).length, 0, "a sealed trip's words are readable in DynamoDB");
     console.log("trip sealed by the owner's trip key (no plain words in the table's stored payloads on dev)");
+    console.log(`scan (sealed footprints and names): point in ${stored.filter(p => p.includes(String(point.lat))).length}, name in ${stored.filter(p => p.includes(nameMarker)).length}`);
+    assert.equal(stored.filter(p => p.includes(String(point.lat)) || p.includes(nameMarker)).length, 0, "a sealed trip's point or name is readable in DynamoDB");
+    console.log("footprints and names sealed by the trip key (no plain point or name in the table's stored payloads on dev)");
   }
+  // The trip key replaced (#695, docs/design/trip-e2e.md §8) in the same sealed trip: the owner hands the key to the participant (A)
+  // and to a second participant (B) by the handoff, as the browsers do (the codes are the screens' and are not compared here). B is
+  // revoked: the owner's GET says to replace the key, the owner's browser seals the trip again under generation 2 and wraps it to
+  // the seats it reaches (POST rekey). A opens it and takes it as the owner's; B's key of generation 1 opens none of it, and B's
+  // cookie is refused. On dev the stored payload holds generation 2 only. Then /recover: the new owner takes the key from A, is
+  // asked (rekey: ask), and keeps the key. The joins and the checks start in a fresh minute of the login limit.
+  await new Promise(r => setTimeout(r, 61000 - Date.now() % 60000));
+  const ownerSeat = { cookie: sealedOwner, id: (await (await request(sAt(""), "GET", undefined, sealedOwner)).json()).self.id as string, seat: sSeat, pub: sPub };
+  type Holder = { cookie: string; id: string; seat: SeatKeys; pub: { x25519: string; ed25519: string } };
+  const handTo = async (giver: Holder, cookie: string, key: CryptoKey, generation: number): Promise<Holder> => {
+    const seat = await newSeatKeys(), pub = await seatPublic(seat), attempt = await newAttempt(pub, sealedId), h = await newHandoffKeys();
+    const att = (await (await request(sAt("/keys"), "PATCH", { type: "wait", commitment: attempt.commitment }, cookie)).json()).handoff.attempt as string;
+    const id = (await (await request(sAt(""), "GET", undefined, cookie)).json()).self.id as string;
+    // As the two screens do: the giver keeps the commitment it read before its own values are put, the member keeps the giver's.
+    const commitment = (await (await request(sAt(""), "GET", undefined, giver.cookie)).json()).waiting.find((w: { id: string }) => w.id === id).handoff.commitment as string;
+    assert.equal((await request(sAt("/keys"), "PATCH", { type: "give", seat: id, attempt: att, ephemeral: h.ephemeral }, giver.cookie)).status, 200);
+    const shown = (await (await request(sAt(""), "GET", undefined, cookie)).json()).handoff.giver;
+    assert.equal((await request(sAt("/keys"), "PATCH", { type: "reveal", attempt: att, ...pub, nonce: attempt.nonce }, cookie)).status, 200);
+    const revealed = (await (await request(sAt(""), "GET", undefined, giver.cookie)).json()).waiting.find((w: { id: string }) => w.id === id).handoff.reveal;
+    assert.ok(await matchesCommitment(commitment, { x25519: revealed.x25519, ed25519: revealed.ed25519 }, revealed.nonce, sealedId), "the member's values do not match its commitment");
+    assert.deepEqual(await confirmationCodes({ capsuleId: sealedId, giver: { ephemeral: h.ephemeral, ...giver.pub }, member: revealed }), await confirmationCodes({ capsuleId: sealedId, giver: shown, member: { ...pub, nonce: attempt.nonce } }), "the two screens' codes differ");
+    assert.equal((await request(sAt("/keys"), "PATCH", { type: "wrap", seat: id, attempt: att, wrapped: (await wrapTripKey(key, pub.x25519, sealedId, generation, h.pair)).wrapped }, giver.cookie)).status, 200);
+    assert.equal((await request(sAt("/keys"), "PATCH", { type: "edge", seat: id, signature: await signEdge(giver.seat.ed25519.privateKey, { seat: id, ...pub }, sealedId) }, giver.cookie)).status, 200);
+    assert.equal((await request(sAt("/keys"), "PATCH", { type: "edge", seat: giver.id, signature: await signEdge(seat.ed25519.privateKey, { seat: giver.id, ...giver.pub }, sealedId) }, cookie)).status, 200);
+    return { cookie, id, seat, pub };
+  };
+  const keyA = await handTo(ownerSeat, sMember, sTrip, 1);
+  const bGrant = gid(), bMade = await request(sAt("/grants"), "POST", { role: "participant", id: bGrant, label: await sealName(sTrip, sealedId, 1, "grant", bGrant, "AWS確認用"), seats: 1, expiresAt: sealedSeed.spec.lifecycle.purgeAt, confirm: true }, sealedOwner);
+  assert.equal(bMade.status, 201); const keyB = await handTo(ownerSeat, await enter((await bMade.json()).url), sTrip, 1);
+  await sCheck();
+  assert.equal((await request(sAt("/revoke"), "POST", { member: keyB.id, confirm: true }, sealedOwner)).status, 200);
+  const toReplace = await (await request(sAt(""), "GET", undefined, sealedOwner)).json(), sGrants = await (await request(sAt("/grants"), "GET", undefined, sealedOwner)).json() as Array<{ id: string; label: string; members: Array<{ id: string; label: string }> }>;
+  assert.equal(toReplace.rekey, "auto"); assert.equal((await (await request(sAt(""), "GET", undefined, sMember)).json()).rekey, null);
+  const nextKey = await newTripKey(), resealedAll = await resealAll(sTrip, nextKey, sealedId, 2, { spec: toReplace.spec, document: toReplace.document, footprints: toReplace.footprints.map((p: { id: string; point: string; by: string }) => ({ id: p.id, point: p.point, by: p.by })), members: sGrants.flatMap(g => g.members).map(m => ({ id: m.id, label: m.label })), grants: sGrants.map(g => ({ id: g.id, label: g.label })) });
+  const reached = await reachableSeats({ id: ownerSeat.id, ed25519: sPub.ed25519 }, toReplace.seats, sealedId);
+  assert.deepEqual([...reached].sort(), [ownerSeat.id, keyA.id].sort());
+  const rekeyed = await Promise.all(toReplace.seats.filter((x: { id: string }) => reached.has(x.id)).map(async (x: { id: string; x25519: string }) => { const w = await wrapTripKey(nextKey, x.x25519, sealedId, 2); return { seat: x.id, ...w, signature: await signRekey(sSeat.ed25519.privateKey, { capsuleId: sealedId, generation: 2, seat: x.id, x25519: x.x25519, ...w }) }; }));
+  assert.equal((await request(sAt("/rekey"), "POST", { generation: 2, ...resealedAll, seats: rekeyed, confirm: true }, sealedOwner, toReplace.document.revision)).status, 200);
+  const aView = await (await request(sAt(""), "GET", undefined, sMember)).json();
+  const aKey = await unwrapTripKey(aView.seatKey.wrapped, aView.seatKey.ephemeral, keyA.seat.x25519.privateKey, sealedId, 2, true);  // A hands it on below
+  assert.equal((await openTrip(aKey, sealedId, aView))?.spec.title, sealedSeed.spec.title, "the remaining participant does not read the trip of the next generation");
+  assert.equal(await acceptRekey({ self: { id: keyA.id, ed25519: keyA.pub.ed25519 }, known: 1, capsuleId: sealedId, seats: aView.seats, seatKey: aView.seatKey }), true);
+  await assert.rejects(openField(sTrip, sealedId, "spec", "spec", "title", aView.spec.title), "the revoked participant's key of generation 1 opens the new title");
+  assert.equal((await request(sAt(""), "GET", undefined, keyB.cookie)).status, 401);
+  if (stackName === "capsule-host-dev") {
+    const mine = (await storedPayloads()).find(p => p.includes(`"id":"${sealedId}"`))!, kept = JSON.parse(mine);
+    const generations = new Set([...mine.matchAll(/v1\.(\d+)\./g)].map(m => m[1]));
+    console.log(`scan (rekey): generations ${[...generations].join(",")}, sealed ${kept.sealed.generation}`);
+    assert.deepEqual([[...generations], kept.sealed.generation, "departed" in kept, "previous" in kept], [["2"], 2, false, false], "the stored payload holds ciphertext of another generation, or what was replaced");
+  }
+  // /recover: the publisher replaces the owner invite; the new owner takes the key from A and is asked, then keeps it.
+  const recoveredSealed = await invoke(functionName, profile, region, { path: `/v1/c/${sealedId}/recover`, payload: { confirm: true } }); assert.equal(recoveredSealed.statusCode, 201);
+  assert.equal((await request(sAt(""), "GET", undefined, sealedOwner)).status, 401);
+  sealedOwner = await enter(recoveredSealed.body.url);
+  const recoveredHolder = await handTo(keyA, sealedOwner, aKey, 2), recoveredView = await (await request(sAt(""), "GET", undefined, sealedOwner)).json();
+  const recoveredKey = await unwrapTripKey(recoveredView.seatKey.wrapped, recoveredView.seatKey.ephemeral, recoveredHolder.seat.x25519.privateKey, sealedId, 2);
+  assert.equal((await openTrip(recoveredKey, sealedId, recoveredView))?.spec.title, sealedSeed.spec.title, "the new owner after recover does not read the trip");
+  assert.equal((await (await request(sAt(""), "GET", undefined, sealedOwner)).json()).rekey, "ask");
+  const recoveredDevice = fakeAuthenticator({ origin }), { challenge: recoveredChallenge } = await (await request(sAt("/passkey/challenge"), "POST", {}, "")).json();
+  assert.equal((await request(sAt("/passkey"), "POST", { challenge: recoveredChallenge, ...recoveredDevice.register(recoveredChallenge) }, sealedOwner)).status, 200);
+  assert.equal((await request(sAt("/keys"), "PATCH", { type: "keep" }, sealedOwner)).status, 200);
+  assert.equal((await (await request(sAt(""), "GET", undefined, sealedOwner)).json()).rekey, null);
+  console.log("trip key replaced: after a member's revocation the owner sealed the trip again under generation 2 (the remaining member reading it, the revoked member's key opening none of it); after recover the new owner was asked and kept the key");
   assert.equal((await request(sAt("/purge"), "POST", { title: "" }, sealedOwner)).status, 200);
   assert.equal((await request(sAt(""), "GET", undefined, sealedOwner)).status, 410); sealedId = "";
+  // Moving a plain trip (#694, docs/design/trip-e2e.md §5): a fourth disposable capsule, plain, whose title, an item, a post, the
+  // participant's name and an invite's name carry a marker, and where the participant and the owner each leave a point. The owner
+  // reads it (GET "", GET seal, GET grants), seals all of it with src/trip-keys.ts sealMove and posts it after the passkey check:
+  // it opens back the same, a request without the new screen's mark (ui=2) is asked to reload, the operator's list says sealed,
+  // and on dev no stored payload holds the marker or the point. The joins start in a fresh minute of the login limit.
+  await new Promise(r => setTimeout(r, 61000 - Date.now() % 60000));
+  const moveMarker = `move-marker-${randomBytes(8).toString("hex")}`, moveSeed = testTrip();
+  moveSeed.spec.title = `${title} ${moveMarker}`; moveSeed.spec.trip.endsOn = seed.spec.trip.endsOn; moveSeed.spec.lifecycle.purgeAt = seed.spec.lifecycle.purgeAt;
+  moveSeed.document.items[0]!.title = moveMarker; moveSeed.document.suggestions = [{ id: "s1", author: "AWS確認", body: moveMarker, createdAt: new Date().toISOString(), promoted: false }];
+  const moveMade = await invoke(functionName, profile, region, { payload: { ...moveSeed, confirm: true } }); assert.equal(moveMade.statusCode, 201); sealedId = moveMade.body.id;
+  sealedOwner = await enter(moveMade.body.url);
+  const moveDevice = fakeAuthenticator({ origin }), moveCheck = async (register = false) => {
+    const { challenge } = await (await request(sAt("/passkey/challenge"), "POST", {}, "")).json();
+    assert.equal((await request(sAt(register ? "/passkey" : "/passkey/verify"), "POST", register ? { challenge, ...moveDevice.register(challenge) } : { challenge, id: moveDevice.id, ...moveDevice.assert(challenge) }, sealedOwner)).status, 200);
+  };
+  await moveCheck(true);
+  const mSeat = await newSeatKeys(), mPub = await seatPublic(mSeat), mTrip = await newTripKey(), mWrap = await wrapTripKey(mTrip, mPub.x25519, sealedId, 1);
+  assert.equal((await request(sAt("/keys"), "PATCH", { type: "seat", ...mPub, ephemeral: mWrap.ephemeral, generation: 1, wrapped: mWrap.wrapped }, sealedOwner)).status, 200);
+  // After the line the owner alone may come in before the move: no member, name or point to carry over.
+  const mMember = afterLine ? "" : await enter((await (await request(sAt("/grants"), "POST", { role: "participant", label: moveMarker, seats: 1, expiresAt: moveSeed.spec.lifecycle.purgeAt, confirm: true }, sealedOwner)).json()).url);
+  if (mMember) {
+  const mMemberSeat = (await (await request(sAt(""), "GET", undefined, mMember)).json()).self.id as string;
+  assert.equal((await request(sAt("/members"), "PATCH", { id: mMemberSeat, label: moveMarker }, sealedOwner)).status, 200);
+  }
+  const movePoint = { lat: Number(`35.67${randomInt(10, 100)}3`), lng: 139.7671, accuracy: 20 };
+  for (const cookie of mMember ? [mMember, sealedOwner] : []) assert.equal((await request(sAt("/footprints"), "PATCH", { type: "add", ...movePoint }, cookie)).status, 200);
+  const moveFrom = await (await request(sAt(""), "GET", undefined, sealedOwner)).json(), { previous: movePrevious } = await (await request(sAt("/seal"), "GET", undefined, sealedOwner)).json();
+  const moveBody = await sealMove(mTrip, sealedId, 1, { spec: moveFrom.spec, document: moveFrom.document, previous: movePrevious, footprints: moveFrom.footprints, grants: await (await request(sAt("/grants"), "GET", undefined, sealedOwner)).json() });
+  await moveCheck();
+  assert.equal((await request(sAt("/seal"), "POST", moveBody, sealedOwner, moveFrom.document.revision)).status, 200);
+  const movedView = await (await request(sAt(""), "GET", undefined, sealedOwner)).json();
+  assert.equal(movedView.sealed.generation, 1); assert.ok(!JSON.stringify(movedView).includes(moveMarker) && !JSON.stringify(movedView).includes(String(movePoint.lat)), "the host returns a plain word or point of the moved trip");
+  assert.deepEqual(await openTrip(mTrip, sealedId, movedView), { spec: moveFrom.spec, document: { ...moveFrom.document, revision: moveFrom.document.revision + 1 }, unreadable: [] });
+  for (const p of movedView.footprints) assert.deepEqual(await openPoint(mTrip, sealedId, p.id, p.point), movePoint);
+  const olderScreen = await request(`/v1/c/${sealedId}`, "GET", undefined, sealedOwner);
+  assert.deepEqual([olderScreen.status, (await olderScreen.json()).error], [409, "画面を更新してください"]);
+  const movedListed = (await invoke(functionName, profile, region, { path: "/v1/capsules/list", payload: {} })).body.find((c: { id: string }) => c.id === sealedId);
+  assert.deepEqual([movedListed.sealed, movedListed.mustSeal], [true, false]);
+  if (stackName === "capsule-host-dev") {
+    const stored = await storedPayloads(), mine = stored.filter(p => p.includes(`"id":"${sealedId}"`));
+    console.log(`scan (moved): ${mine.length} payload of the moved capsule found, marker in ${stored.filter(p => p.includes(moveMarker)).length}, point in ${stored.filter(p => p.includes(String(movePoint.lat))).length}`);
+    assert.equal(mine.length, 1, "the scan did not find the moved capsule's payload: the decoding is wrong");
+    assert.equal(stored.filter(p => p.includes(moveMarker) || p.includes(String(movePoint.lat))).length, 0, "a moved trip's words, names or points are readable in DynamoDB");
+    console.log("plain trip moved by its owner (no plain words or points left in the table on dev)");
+  } else console.log("plain trip moved by its owner (the table's scan: dev だけで行う)");
+  assert.equal((await request(sAt("/purge"), "POST", { title: "" }, sealedOwner)).status, 200);
+  assert.equal((await request(sAt(""), "GET", undefined, sealedOwner)).status, 410); sealedId = "";
+  plainScenesAfter: {
+  if (afterLine) break plainScenesAfter;
   // Revising with a chat: the owner copies the trip without anyone's posts, a pasted answer shows its change and writes
   // nothing, applying needs the version it was shown against, and one step back restores it. Nobody else may do any of it.
   assert.equal((await request(api("/document"), "PATCH", { type: "suggest", author: "AWS確認", body: "星を見に行きたい" }, participant, 2)).status, 200);
@@ -379,12 +575,17 @@ try {
   await stepUp();
   assert.equal((await request(api("/revoke"), "POST", { member: listed.members[0].id, confirm: true })).status, 200);
   assert.deepEqual([(await request(api(""), "GET", undefined, participant)).status, (await request(api(""), "GET", undefined, second)).status].sort(), [200, 401]);
+  // The revoked seat's 401 says the seat is gone (#842: the screen then forgets the trip's keys); the text is the one before.
+  const goneOne = (await request(api(""), "GET", undefined, participant)).status === 401 ? participant : second;
+  assert.deepEqual(await (await request(api(""), "GET", undefined, goneOne)).json(), { error: "この端末の登録は失効したか、期限が切れました", seat: "gone" });
   assert.equal((await redeem(g.url)).status, 401);
   // The member left signs out: the cookie is cleared, and a copy of it kept from before is refused.
   const remaining = (await request(api(""), "GET", undefined, participant)).status === 200 ? participant : second;
   const signedOut = await request(api("/signout"), "POST", { confirm: true }, remaining);
   assert.equal(signedOut.status, 200); assert.match(signedOut.headers.get("Set-Cookie")!, /Max-Age=0/);
-  assert.equal((await request(api(""), "GET", undefined, remaining)).status, 401);
+  // Signing out keeps the seat (its passkey brings it back), so the copy's 401 does not say the seat is gone.
+  const copy = await request(api(""), "GET", undefined, remaining); assert.equal(copy.status, 401);
+  assert.deepEqual(await copy.json(), { error: "この端末の登録は失効したか、期限が切れました" });
   // Lost owner browser: the publisher replaces the owner invite and the old browser is cut off.
   const recovered = await invoke(functionName, profile, region, { path: api("/recover"), payload: { confirm: true } }); assert.equal(recovered.statusCode, 201);
   assert.equal((await request(api(""))).status, 401); owner = await join(recovered.body.url);
@@ -402,14 +603,6 @@ try {
   // ("もう一度やり直してください"). Both refusals are 401; only the message tells a missing check ("パスキーで本人確認してください") apart.
   const first = await request(api("/passkey"), "POST", { challenge: "A".repeat(72), clientDataJSON: "AAAA", authenticatorData: "AAAA", publicKey: "AAAA", algorithm: -7 });
   assert.equal(first.status, 401); assert.equal((await first.json()).error, "もう一度やり直してください");
-  // How to make a trip is shown to a signed-in creator only: without the sign-in, the instructions and the paste check are closed.
-  assert.equal((await request("/v1/recipe", "GET", undefined, "")).status, 401);
-  assert.equal((await request("/v1/check", "POST", { text: "すみません、旅程は作れませんでした。" }, "")).status, 401);
-  assert.deepEqual(await (await request("/v1/account", "GET", undefined, "")).json(), { signedIn: false, canCreate: false, creator: null, localOnly: false, assistKey: false });
-  // Generating with a creator's own API key, and registering one, are closed the same way; no key's prefix may reach the logs.
-  assert.equal((await request("/v1/assist", "POST", { text: "京都 2泊3日" }, "")).status, 401);
-  assert.equal((await request("/v1/account/key", "PUT", { key: "sk-ant-" + "x".repeat(40) }, "")).status, 401);
-  secrets.push("sk-ant-");
   // The owner replaces the 費用メモ as a whole, at the version the trip is at now, and reads it back.
   const at = Number(JSON.parse((await request(api(""))).headers.get("ETag")!)), budget = [{ id: "b1", title: "宿", amount: 24000, description: "確認用" }];
   assert.equal((await request(api("/document"), "PATCH", { type: "budget", budget }, owner, at)).status, 200);
@@ -466,6 +659,15 @@ try {
   assert.deepEqual(ownerList.find((x: any) => x.id === h.grantId).issuedBy, { id: editorSeat.id, label: editorSeat.label });
   assert.equal((await request(api("/revoke"), "POST", { id: h.grantId, confirm: true }, viewer)).status, 403);
   assert.equal((await request(api("/revoke"), "POST", { id: h.grantId, confirm: true }, editor)).status, 200);
+  }
+  // How to make a trip is shown to a signed-in creator only: without the sign-in, the instructions and the paste check are closed.
+  assert.equal((await request("/v1/recipe", "GET", undefined, "")).status, 401);
+  assert.equal((await request("/v1/check", "POST", { text: "すみません、旅程は作れませんでした。" }, "")).status, 401);
+  assert.deepEqual(await (await request("/v1/account", "GET", undefined, "")).json(), { signedIn: false, canCreate: false, creator: null, localOnly: false, assistKey: false });
+  // Generating with a creator's own API key, and registering one, are closed the same way; no key's prefix may reach the logs.
+  assert.equal((await request("/v1/assist", "POST", { text: "京都 2泊3日" }, "")).status, 401);
+  assert.equal((await request("/v1/account/key", "PUT", { key: "sk-ant-" + "x".repeat(40) }, "")).status, 401);
+  secrets.push("sk-ant-");
   // Creators: the passkey logic is covered by unit tests; here, that the endpoints are behind CloudFront, refuse nonsense
   // without writing, and that only the IAM publisher lists them. No creator is enrolled, so nothing needs cleaning up.
   const creatorChallenge = await request("/v1/creators/challenge", "POST", {}, ""); assert.equal(creatorChallenge.status, 200);
@@ -515,10 +717,12 @@ try {
   const edgeRows = (rows: Array<Record<string, unknown>>) => rows.map(r => ({ ...r, ip: r["c-ip"], path: r["cs-uri-stem"], status: r["sc-status"], requestTime: r.timestamp }));
   // A line is JSON: CloudFront's own record, or the Web Function's wrapper (time, level, request id) around what console.log wrote.
   const json = (lines: string[]) => lines.flatMap(l => { try { const o = JSON.parse(l.slice(l.indexOf("{"))) as Record<string, unknown>; return [typeof o.message === "string" && o.message.startsWith("{") ? JSON.parse(o.message) as Record<string, unknown> : o]; } catch { return []; } });
+  // After the line the plain trip refuses no one with a 403 or a 429: the sealed trip's are looked for. CloudFront's path holds no query (ui=2).
+  const refusing = afterLine ? `/v1/c/${sealedTripId}` : api("");
   const wanted = (rows: Array<Record<string, unknown>>) => ({
     login: rows.find(r => r.path === api("/sessions") && r.status === "401"),
-    forbidden: rows.find(r => String(r.path).startsWith(api("")) && r.status === "403"),
-    limited: rows.find(r => r.path === api("/footprints") && r.status === "429"),
+    forbidden: rows.find(r => String(r.path).startsWith(refusing) && r.status === "403"),
+    limited: rows.find(r => r.path === `${refusing}/footprints` && r.status === "429"),
   });
   let access: string[] = [], hostLog: string[] = [], lines = { login: undefined as unknown, forbidden: undefined as unknown, limited: undefined as unknown };
   // A line the Host wrote for a request it refused, with the viewer's address (CloudFront-Viewer-Address); the 401 is the one for this capsule's sessions.
@@ -551,11 +755,13 @@ try {
   })();
   assert.ok(edge !== true, "the access log holds a CloudFront edge's address, not the viewer's");
   console.log(`access log address: ${edge === undefined ? "unknown" : "not an edge (viewer)"}`);
-  console.log("AWS verification passed: a trip sealed under the owner's trip key (opened back the same, a participant's sealed post taken and item refused, theme.css and the operator's list as before, export 409, purged without a title), function URL direct 403 (always), generation and key registration closed without a creator, no CORS, OPTIONS refused, a cookie moved to another capsule refused, viewer/editor owner-only actions refused; CloudFront's access log and the Host's refused lines (401 / 403 / 429 with IP, path and status; no cookie, invite secret, #k= or title), owner approval, assets, IAM-only publish, idempotent publish (a fresh owner link while the seat is free), edge-only API, seat binding, per-member revoke, permissions, the owner's history of invites (not the editor's), an editor's own viewer invites (another role refused, issued, listed, named in the owner's list, revoked by it and not by a viewer), Origin, revision conflicts, ZIP, the trip page as one file (every role, no private entry), owner recovery, passkey endpoints, paste endpoints closed without a creator, creator endpoints, the build read by the publisher only, operator list and terminate (IAM only, no title, 410 after), revising and undo, editors revising without the settings, reordering a day (the host's time a placeholder, the end carried along; an item without a time given one), an item's end (saved, refused before its start), an item added after another (placed there, its time fitted; another day refused), the 準備 list and 費用メモ changed by the owner (not by a participant), a participant's 候補 rewritten and removed by the owner (not by the participant), a passkey check before the owner's important actions (428 on the cookie alone; reading and editing not asked), no passkey swapped in on the cookie alone, a member signing out (a copy of the cookie refused), creator sign-out closed without a cookie, trip keys put by the owner's browser (wrapped only; not in the table's stored payloads on dev; a participant refused), trip key handed over by confirmation codes (wrapped only), a member's own entry sealed as the screen seals it and read back by that member only (not in the owner's trip or the ZIP; on dev, not in the table's stored payloads either), the page's Permissions-Policy (the position open, the camera and microphone closed), the page files compressed (br / gzip), the footprint map's parts and both map files by range (206), a footprint left by a participant and an automatic one by the owner, read by the owner (no revision moved; the automatic one marked), refused to a viewer, who reads both after the participant's seat was revoked.");
+  // After the line, the plain trip's scenes were not run (the dev run without the line goes through them): the summary says what was.
+  if (afterLine) console.log("AWS verification passed (after the line): the plain trip published after it (409 画面を更新してください without ui=2; 409 オーナーがこの旅行を移すまで開けません for an invite, an edit and a footprint; mustSeal for the owner and in the operator's list), a plain trip moved by its owner alone (opened back the same, an older screen asked to reload, listed as sealed), the trip key replaced after a member's revocation (every ciphertext of the next generation in the stored payload, the remaining member reading it, the revoked member's old key not opening it), the new owner asked after recover and keeping the key, a trip sealed under the owner's trip key and its participant invited after the seal (opened back the same, a participant's sealed post taken and item refused, theme.css as before, the operator's list sealed and no longer mustSeal, export 409, a footprint and names sealed, 429 within the minute, 403 for a viewer, purged without a title), function URL direct 403 (always), generation and key registration closed without a creator, no CORS, OPTIONS refused, a cookie moved to another capsule refused; CloudFront's access log and the Host's refused lines (401 / 403 / 429 with IP, path and status; no cookie, invite secret, #k= or title), assets (app.js carrying its packages' notices), IAM-only publish, idempotent publish (a fresh owner link while the seat is free), edge-only API, seat binding, paste endpoints closed without a creator, creator endpoints, the build read by the publisher only, operator list and terminate (IAM only, no title, 410 after), the page's Permissions-Policy, the page files compressed (br / gzip), both map files by range (206), the plain trip purged by its owner with the new screen's mark.");
+  else console.log("AWS verification passed: a plain trip moved by its owner (its points and names sealed with it, opened back the same, an older screen asked to reload, listed as sealed), the trip key replaced after a member's revocation (every ciphertext of the next generation in the stored payload, the remaining member reading it, the revoked member's old key not opening it), the new owner asked after recover and keeping the key, a trip sealed under the owner's trip key (opened back the same, a participant's sealed post taken and item refused, theme.css and the operator's list as before, export 409, purged without a title), function URL direct 403 (always), generation and key registration closed without a creator, no CORS, OPTIONS refused, a cookie moved to another capsule refused, viewer/editor owner-only actions refused; CloudFront's access log and the Host's refused lines (401 / 403 / 429 with IP, path and status; no cookie, invite secret, #k= or title), owner approval, assets (app.js carrying its packages' notices), IAM-only publish, idempotent publish (a fresh owner link while the seat is free), edge-only API, seat binding, per-member revoke (its 401 saying the seat is gone, a signed-out copy's not), permissions, the owner's history of invites (not the editor's), an editor's own viewer invites (another role refused, issued, listed, named in the owner's list, revoked by it and not by a viewer), Origin, revision conflicts, ZIP, the trip page as one file (every role, no private entry), owner recovery, passkey endpoints, paste endpoints closed without a creator, creator endpoints, the build read by the publisher only, operator list and terminate (IAM only, no title, 410 after), revising and undo, editors revising without the settings, reordering a day (the host's time a placeholder, the end carried along; an item without a time given one), an item's end (saved, refused before its start), an item added after another (placed there, its time fitted; another day refused), the 準備 list and 費用メモ changed by the owner (not by a participant), a participant's 候補 rewritten and removed by the owner (not by the participant), a passkey check before the owner's important actions (428 on the cookie alone; reading and editing not asked), no passkey swapped in on the cookie alone, a member signing out (a copy of the cookie refused), creator sign-out closed without a cookie, trip keys put by the owner's browser (wrapped only; not in the table's stored payloads on dev; a participant refused), trip key handed over by confirmation codes (wrapped only), a member's own entry sealed as the screen seals it and read back by that member only (not in the owner's trip or the ZIP; on dev, not in the table's stored payloads either), the page's Permissions-Policy (the position open, the camera and microphone closed), the page files compressed (br / gzip), the footprint map's parts and both map files by range (206), a footprint left by a participant and an automatic one by the owner, read by the owner (no revision moved; the automatic one marked), refused to a viewer, who reads both after the participant's seat was revoked.");
 } finally {
   // A failure here must not keep the first capsule from its purge below.
   if (sealedId) try { const r = await invoke(functionName, profile, region, { path: `/v1/c/${sealedId}/terminate`, payload: { id: sealedId, confirm: true } }); console.log([200, 410].includes(r.statusCode) ? "The sealed disposable capsule was terminated." : `The sealed disposable capsule was not terminated (${r.statusCode}); check it with aws/capsules.ts list.`); } catch (e) { console.log(`The sealed disposable capsule was not terminated: ${(e as Error).message}`); }
   if (spare) try { const r = await invoke(functionName, profile, region, { path: `/v1/c/${spare}/terminate`, payload: { id: spare, confirm: true } }); console.log([200, 410].includes(r.statusCode) ? "The second disposable capsule was terminated." : `The second disposable capsule was not terminated (${r.statusCode}); check it with aws/capsules.ts list.`); } catch (e) { console.log(`The second disposable capsule was not terminated (${e instanceof Error ? e.message : e}); check it with aws/capsules.ts list.`); }
   for (const url of unredeemed.reverse()) { if (!capsuleId || owner) break; try { owner = await join(url); } catch { /* replaced by the retry */ } }
-  if (capsuleId && owner) { await stepUp(); const purged = await request(api("/purge"), "POST", { title }); assert.equal(purged.status, 200); assert.equal((await request(api(""))).status, 410); console.log("Disposable test capsule removed; subsequent access returns 410."); }
+  if (capsuleId && owner) { await stepUp(ui); const purged = await request(api("/purge") + ui, "POST", { title }); assert.equal(purged.status, 200); assert.equal((await request(api(""))).status, 410); console.log("Disposable test capsule removed; subsequent access returns 410."); }
 }

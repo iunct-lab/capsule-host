@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { notice, packageOf } from "./notices";
+import { banner, notice, packageOf } from "./notices";
 
 test("the package a bundled file comes from, scoped names whole", () => {
   expect(packageOf("node_modules/maplibre-gl/dist/maplibre-gl.js")).toBe("maplibre-gl");
@@ -25,3 +25,16 @@ test("a notice carries the licence text the package ships, or says it ships none
     }
   } finally { rmSync(dir, { recursive: true }); }
 });
+
+test("every package a build takes in is named in its banner", async () => {
+  const root = join(import.meta.dir, "../");
+  for (const [entry, target, file] of [["client.ts", "browser", "app.js"], ["aws-handler.ts", "node", "index.mjs"], ["aws-web.ts", "node", "index.mjs"], ["map.ts", "browser", "map.js"]] as const) {
+    const inputs = Object.keys((await Bun.build({ entrypoints: [root + "src/" + entry], target, metafile: true })).metafile!.inputs);
+    const packages = new Set(inputs.filter(i => i.includes("node_modules/")).map(packageOf));
+    const text = banner(file, root, inputs);
+    expect(packages.size).toBeGreaterThan(0);
+    expect(text.startsWith(`/*! ${file} carries:\n`)).toBe(true);
+    for (const name of packages) expect(text).toMatch(new RegExp(`\\n${name.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&")} \\S+ \\(`));
+  }
+  expect(banner("none.js", root, ["src/schema.ts"])).toBe("");
+}, 60_000);

@@ -61,7 +61,7 @@ export function showMap(el: HTMLElement, data: MapData, onSpot: (ids: string[]) 
     const layers = list.flatMap(f => mapLayers(`map:${f.name}`));
     for (const layer of [...layers.filter(l => l.type !== "symbol"), ...layers.filter(l => l.type === "symbol")]) map.addLayer(layer, "track");
   });
-  map.addControl(new AttributionControl({ compact: false, customAttribution: "© OpenStreetMap contributors" }));
+  map.addControl(new AttributionControl({ compact: false, customAttribution: '<a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">© OpenStreetMap contributors</a>' }));
   for (const spot of data.spots) {
     const button = document.createElement("button");
     button.type = "button"; button.className = "spot"; button.dataset.ids = spot.ids.join(" ");

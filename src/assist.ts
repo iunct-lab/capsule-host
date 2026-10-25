@@ -3,6 +3,33 @@ import { recipe } from "./recipe";
 
 // What a creator may ask for in one generation, in bytes (not characters: the bytes bound the tokens).
 export const ASSIST_LIMIT = 6000;
+// The model when CAPSULE_ASSIST_MODEL names none. The host and, for a sealed trip, the browser call the same one (#692).
+export const ASSIST_MODEL = "claude-haiku-5-5";
+// Revising a trip (#658): the bytes of the trip and the request one call may carry, and what the model is told. The host uses
+// these for a plain trip; a sealed trip's browser sends the same to Anthropic itself (docs/design/trip-e2e.md §4).
+export const REVISE_LIMIT = 120_000;
+// The recipe is written for a chat that may ask what it needs. A call here has one answer and nobody to ask (#658): what is missing
+// is decided and said in the notes. This overrides the recipe's "ask" in both uses; the date rule is for a new trip only.
+export const ONE_SHOT = `- 上の作り方の「聞く」は、ここでは聞かずに、次のとおりにする: 質問や確認はせず、足りない情報は妥当な仮定で決めて、旅程の JSON だけを返してください（JSON のほかの文は書かない）
+- 人数・好み・出発地が書かれていなければ、一般的な観光客を想定して決める
+- 仮定したことは document.notes に短く書く（予約番号など秘密は書かない）`;
+// The model does not know the date, so the host puts it first in what it sends.
+export const todayLine = (day: string) => `今日は ${day} です。\n\n`;
+// The recipe with its example, so the answer is shaped as the check wants it, then what this call is for.
+export const REVISE_SYSTEM = `${recipe.text}
+
+# この呼び出しの役割
+あとに示す「今の旅程」を、「直してほしいこと」のとおりに直して、旅程の JSON だけを返してください。
+- 直してほしいことが旅の計画を立てる依頼なら、予定（document.items）を具体的に作ってください。空のままにしない。日付は今の旅程の日付の中に収める
+- 候補・相談の本文は body に書く（title は使えません）。使える項目は上の作り方のとおりです
+- 旅程の JSON のほかの文は書かない
+${ONE_SHOT}`;
+// What the generation of a new trip is told (the top page's 「ここで作る」): the recipe, and that there is nobody to ask.
+export const GENERATE_SYSTEM = `${recipe.text}
+
+${ONE_SHOT}
+- 「今日は …です」の日付が文の先頭にある。希望に日付が無いときは、希望の月の最初の週末のうち今日以降のもの（その月が過ぎていれば来年のその月）に決める。月も無ければ今日から近い週末
+- 旅の計画を立てる依頼なので、予定（document.items）を具体的に、時刻つきで作る。空のままにしない`;
 // A second turn: the answer the model gave and what the host's own check found wrong with it, so it can put that right once.
 export type Follow = { answer: string; problems: string[] };
 export type Generated = { kind: "text"; text: string } | { kind: "cut-off" } | { kind: "refused" };

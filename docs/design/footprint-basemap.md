@@ -6,7 +6,7 @@
 
 ## 0. 結論
 
-- **CSP は今の文字列のまま足すものが無い**: `default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'`。`worker-src` も `blob:` も要らない（§2）
+- **CSP は今の文字列のまま足すものが無い**（地図のためには。`connect-src` には後に、暗号化した旅行の「ここで直す」のため `https://api.anthropic.com` だけを足した。#692。地図は今も外部のドメインにつながらない）: `default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'`。`worker-src` も `blob:` も要らない（§2）
 - **文字は手元のフォントで描く**: style に `glyphs` を書かない。MapLibre 6.13 は `glyphs` の無い style の文字を全部ブラウザのフォントで描く（日本語・英数字・ハングル）。`localIdeographFontFamily: "sans-serif"`、層の `text-font: ["sans-serif"]`。glyph の PBF もフォントのファイルも置かない（§3）
 - **style は自前の層 10 個**を、`world` と `japan` の 2 つの source に同じ関数 `mapLayers(source)` で当てる。`@protomaps/basemaps` は足さない（§4）
 - **大きさ**: `map.js` 1,066,086 B（gzip 290,179 B）、`maplibre-worker.mjs` 508,314 B（gzip 143,415 B）、`map.css` 83,290 B（gzip 10,486 B）。`app.js` は今 195,993 B（gzip 57,188 B）で、地図の部品を別ファイルにすれば増えない（§5）
@@ -18,7 +18,7 @@
 | `maplibre-gl` | 6.13.0（npm の latest） | BSD-3-Clause |
 | `pmtiles` | 4.5.0（npm の latest） | BSD-3-Clause |
 | `go-pmtiles`（`pmtiles extract`。地図データを作る道具で、リポジトリには入れない） | 1.31.2 | BSD-3-Clause |
-| 地図データ | `https://build.protomaps.com/20261011.pmtiles`（Protomaps Basemap 4.15.2、OpenStreetMap 由来、ODbL） | ODbL（画面に「© OpenStreetMap contributors」） |
+| 地図データ | `https://build.protomaps.com/20261011.pmtiles`（Protomaps Basemap 4.15.2、OpenStreetMap 由来、ODbL） | ODbL（画面に「© OpenStreetMap contributors」。著作権のページへのリンク） |
 
 地図データは作業ディレクトリ（`mktemp -d`）に切り出した:
 
@@ -42,6 +42,8 @@ new Map({ container, center, zoom, maxZoom: 15, attributionControl: false, local
 map.addControl(new AttributionControl({ compact: false, customAttribution: "© OpenStreetMap contributors" }));
 ```
 
+今の `src/map.ts` は、この帰属を OpenStreetMap の著作権とライセンスのページ（`https://www.openstreetmap.org/copyright`）へのリンクにしている（別のタブで開く。`rel="noopener"`。#841）。押したときに開くだけで、CSP は変えない。
+
 source の `maxzoom` は書かなくてよい（`pmtiles://` の source は PMTiles のヘッダーから minzoom / maxzoom / bounds を読む）。
 
 ## 2. CSP
@@ -53,7 +55,7 @@ source の `maxzoom` は書かなくてよい（`pmtiles://` の source は PMTi
 - `map.css`: `<link rel="stylesheet">` の同じ配信元のファイルなので `style-src 'self'` で通る。css の中のコントロールのアイコンは `data:` の SVG で、`img-src data:` で通る。要素の位置は CSSOM（`element.style`）で書くので `style-src` に `'unsafe-inline'` は要らない
 - 対照: `connect-src 'none'` にすると `Connecting to '…/map/world.pmtiles' violates the following Content Security Policy directive: "connect-src 'none'"` が出て背景が描かれない。違反は同じ方法で見えている
 
-よって #566 の CSP の変更は、文字列を変えずに、`connect-src` と `img-src` が `'self'`（と `data:`）だけで外部のドメインを含まないことをテストに足し、#439 の答え A を書いたコメントを直すことになる（PBI の受け入れ条件 5「MapLibre に要る分だけを足している」は、足す分が 0）。
+よって #566 の CSP の変更は、文字列を変えずに、`connect-src` と `img-src` が `'self'`（と `data:`）だけで外部のドメインを含まないことをテストに足し（`connect-src` は #692 で `https://api.anthropic.com` を足した。地図のための外部のドメインは今も無い）、#439 の答え A を書いたコメントを直すことになる（PBI の受け入れ条件 5「MapLibre に要る分だけを足している」は、足す分が 0）。
 
 ## 3. 文字の出し方
 

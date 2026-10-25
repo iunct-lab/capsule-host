@@ -73,21 +73,23 @@ function place(path: string): string {
 }
 // zod's own wording is English and reaches the screen unchanged; these are the ones this schema produces. Anything
 // else is shown as it came, so a message is never swallowed.
-const reasons: Array<[RegExp, string]> = [
-  [/^Required$/, "指定してください"],
-  [/^Invalid$/, "形式が正しくありません"],
+const reasons: Array<[RegExp, string | ((match: string, ...groups: string[]) => string)]> = [
+  [/^Invalid input: expected \w+, received undefined$/, "指定してください"],
   [/^Invalid input$/, "形式が正しくありません"],
-  [/^Invalid url$/, "URL の形式が正しくありません"],
-  [/^Invalid datetime$/, "日時の形式が正しくありません（例 2026-11-21T10:30:00+09:00）"],
-  [/^Invalid literal value, expected (.+)$/, "$1 のみ指定できます"],
-  [/^Expected (\w+), received (\w+)$/, "$1 で指定してください（いまは $2）"],
-  [/^String must contain at least (\d+) character\(s\)$/, "$1 文字以上で指定してください"],
-  [/^String must contain at most (\d+) character\(s\)$/, "$1 文字以内で指定してください"],
-  [/^Array must contain at least (\d+) element\(s\)$/, "$1 件以上必要です"],
-  [/^Array must contain at most (\d+) element\(s\)$/, "$1 件以内にしてください"],
-  [/^Number must be greater than or equal to (-?\d+)$/, "$1 以上で指定してください"],
-  [/^Number must be less than or equal to (-?\d+)$/, "$1 以下で指定してください"],
-  [/^Unrecognized key\(s\) in object: (.+)$/, "知らない項目があります: $1"],
+  [/^Invalid string: must match pattern .+$/, "形式が正しくありません"],
+  [/^Invalid URL$/, "URL の形式が正しくありません"],
+  [/^Invalid date-time$/, "日時の形式が正しくありません（例 2026-11-21T10:30:00+09:00）"],
+  [/^Invalid input: expected int, received number$/, "integer で指定してください（いまは float）"],
+  [/^Invalid input: expected (\w+), received (\w+)$/, "$1 で指定してください（いまは $2）"],
+  [/^Invalid input: expected (.+)$/, "$1 のみ指定できます"],
+  [/^Too small: expected string to have >=(\d+) characters$/, "$1 文字以上で指定してください"],
+  [/^Too big: expected string to have <=(\d+) characters$/, "$1 文字以内で指定してください"],
+  [/^Too small: expected array to have >=(\d+) items$/, "$1 件以上必要です"],
+  [/^Too big: expected array to have <=(\d+) items$/, "$1 件以内にしてください"],
+  [/^Too small: expected number to be >=(-?\d+)$/, "$1 以上で指定してください"],
+  [/^Too big: expected number to be <=(-?\d+)$/, "$1 以下で指定してください"],
+  // zod 4 quotes the keys as "a", "b"; the screen showed them as 'a', 'b'.
+  [/^Unrecognized keys?: (.+)$/, (_, keys) => `知らない項目があります: ${keys.replace(/"/g, "'")}`],
 ];
-const reason = (message: string) => reasons.reduce((text, [pattern, japanese]) => text.replace(pattern, japanese), message);
+const reason = (message: string) => reasons.reduce((text, [pattern, japanese]) => typeof japanese === "string" ? text.replace(pattern, japanese) : text.replace(pattern, japanese), message);
 export const explain = (errors: Array<{ path: string; message: string }>) => errors.map(e => `${place(e.path)}: ${reason(e.message)}`);

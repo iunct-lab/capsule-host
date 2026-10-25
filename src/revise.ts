@@ -1,8 +1,13 @@
 // A trip is revised the way it was made: by a chat assistant, outside the host. The owner hands it the trip as it stands
 // and the recipe it was made from. Candidates and talk go out by their words only; who wrote them, when, memories
-// and the version stay in the host.
-import type { Spec, Document, Item } from "./schema";
+// and the version stay in the host. Runs in the host and the browser (no node: modules): a sealed trip is revised and
+// undone in the browser from the opened trip with these same functions (docs/design/trip-e2e.md §4).
+import { checkTrip, validate, type Spec, type Document, type Item, type SealedDocument } from "./schema";
 import { recipe } from "./recipe";
+import { extract, explain } from "./paste";
+
+// The largest answer taken in, in bytes.
+export const PASTE_LIMIT = 200_000;
 
 export const revisable = (spec: Spec, document: Document) =>
   ({ schemaVersion: 1 as const, spec, document: { items: document.items, checklist: document.checklist, notes: document.notes, budget: document.budget, suggestions: document.suggestions.map(({ id, body, promoted }) => ({ id, body, promoted })), comments: document.comments.map(({ id, body }) => ({ id, body })) } });
@@ -30,7 +35,7 @@ export function merge(current: Trip, answer: unknown, by: { author: string; at: 
 }
 
 // Key order is not content: an answer may write an item's fields in any order.
-const canon = (v: unknown): string => Array.isArray(v) ? `[${v.map(canon).join(",")}]` : v && typeof v === "object" ? `{${Object.keys(v).sort().filter(k => (v as Record<string, unknown>)[k] !== undefined).map(k => `${JSON.stringify(k)}:${canon((v as Record<string, unknown>)[k])}`).join(",")}}` : JSON.stringify(v);
+export const canon = (v: unknown): string => Array.isArray(v) ? `[${v.map(canon).join(",")}]` : v && typeof v === "object" ? `{${Object.keys(v).sort().filter(k => (v as Record<string, unknown>)[k] !== undefined).map(k => `${JSON.stringify(k)}:${canon((v as Record<string, unknown>)[k])}`).join(",")}}` : JSON.stringify(v);
 export const same = (a: unknown, b: unknown) => canon(a) === canon(b);
 const content = ({ revision, ...rest }: Item) => rest;
 
@@ -99,4 +104,50 @@ export function diff(before: Trip, after: Trip): Diff {
   const touched = d.items.filter(i => i.change !== "added").length;
   d.large = Boolean(d.title || d.dates) || (before.document.items.length > 0 && touched * 2 >= before.document.items.length) || [...d.suggestions, ...d.comments].some(r => r.change !== "added");
   return d;
+}
+
+// The rules every change of a trip's settings obeys: a page already there stays (its posts must stay readable), and the
+// deadline stays in the future. Only the pages' id and kind and the deadline are read, so a sealed Spec is checked the same.
+export function refusal(current: Pick<Spec, "modules">, updated: Pick<Spec, "modules" | "lifecycle">, now: number) {
+  if (current.modules.some(m => !updated.modules.some(n => n.id === m.id && n.kind === m.kind))) return "今あるページは消せません";
+  if (+new Date(updated.lifecycle.purgeAt) <= now) return "削除期限は今より後にしてください";
+}
+// A suggestion promoted to an item that a revise or an undo then dropped can be promoted again. Done before the diff, so the preview and the title
+// confirmation describe what is saved. A suggestion without `itemId`
+// (promoted before the host kept it) stays "promoted": there is no telling which item it made.
+export function unpromote(doc: Document) { for (const s of doc.suggestions) if (s.promoted && s.itemId && !doc.items.some(i => i.id === s.itemId)) s.promoted = false; }
+
+// A chat's answer to "revise this trip", checked as a new trip is and set against the trip as it stands. Only the items the
+// trip already held without a time may stay so; an item the answer adds or times needs a time, as in a new trip. The same text
+// against the same version gives the same change, so what is applied is what was shown without storing what was shown.
+// `keepSpec` (an editor's answer): the settings are the owner's, so the trip's own replace whatever the answer holds.
+export function reviseTrip(trip: Trip, text: string, by: { author: string; at: string; created: number; now: number; keepSpec: boolean }) {
+  if (new TextEncoder().encode(text).length > PASTE_LIMIT) return { ok: false as const, tooLong: true as const };
+  const taken = extract(text);
+  if (!taken.ok) return { ok: false as const, reason: taken.reason };
+  const answer = by.keepSpec && taken.value && typeof taken.value === "object" && !Array.isArray(taken.value) ? { ...taken.value, spec: trip.spec } : taken.value;
+  const merged = merge(trip, answer, by), checked = checkTrip(merged, by.created, { allowUntimed: trip.document.items.filter(i => !i.startsAt).map(i => i.id) });
+  if (!checked.ok) return { ok: false as const, messages: explain(checked.errors) };
+  const refused = refusal(trip.spec, checked.validated.spec, by.now);
+  if (refused) return { ok: false as const, messages: [refused] };
+  const next = { spec: checked.validated.spec, document: settle(trip.document, checked.validated.document) };
+  unpromote(next.document);
+  return { ok: true as const, next, diff: diff(trip, next) };
+}
+
+// The trip just before the last revise: the owner's part as it was. A sealed trip keeps it sealed.
+export type Previous<S, D extends Document | SealedDocument> = { spec: S; document: Pick<D, "items" | "checklist" | "notes" | "budget"> & Partial<Pick<D, "suggestions" | "comments">>; revisedIds?: { suggestions: string[]; comments: string[] } };
+// The trip as it would be after going back one step: the owner's part as it was, everything participants did since as it is.
+// `keepSpec` (an editor): only a step that leaves the settings as they are, since changing them is the owner's.
+export function undoTrip(trip: Trip, previous: Previous<Spec, Document> | undefined, by: { created: number; keepSpec: boolean }) {
+  if (!previous) return { ok: false as const, reason: "none" as const };
+  const restored = <T extends { id: string }>(before: T[] | undefined, now: T[], revised: string[]) => before === undefined ? now : [...before, ...now.filter(p => !before.some(o => o.id === p.id) && !revised.includes(p.id))];
+  const suggestions = restored(previous.document.suggestions, trip.document.suggestions, previous.revisedIds?.suggestions ?? []);
+  const comments = restored(previous.document.comments, trip.document.comments, previous.revisedIds?.comments ?? []);
+  let back: ReturnType<typeof validate>; try { back = validate(previous.spec, { ...trip.document, ...previous.document, suggestions, comments }, by.created); } catch { return { ok: false as const, reason: "invalid" as const }; }
+  // Both read the same way, so a default the stored Spec predates does not count as a change.
+  if (by.keepSpec && !same(back.spec, validate(trip.spec, trip.document, by.created).spec)) return { ok: false as const, reason: "spec" as const };
+  const next = { spec: back.spec, document: settle(trip.document, back.document) };
+  unpromote(next.document);
+  return { ok: true as const, next, diff: diff(trip, next) };
 }

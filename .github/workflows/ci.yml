@@ -30,4 +30,6 @@ jobs:
       - uses: aws-actions/setup-sam@f84ec7d548307efafe33230528756de3c5841a17 # v2
         with:
           use-installer: true
+          # SAM CLI の版を固定する（最新版の lint 規則だけで CI の結果が変わらないように）。ローカル CI は手元の `sam` で回るので、版を上げるときは手元の `sam` も同じ版にする
+          version: 1.166.2
       - run: sam validate --lint --template-file aws/template.yaml --region ap-northeast-1

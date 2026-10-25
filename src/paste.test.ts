@@ -88,26 +88,35 @@ describe("saying what is wrong in a way a person can act on", () => {
   });
 
   test("a place's latitude out of range is named in Japanese", () => {
-    expect(explain([{ path: "document.items.0.place.lat", message: "Number must be less than or equal to 90" }])[0]).toBe("1 つめの予定の場所の緯度: 90 以下で指定してください");
-    expect(explain([{ path: "document.items.1.place.lng", message: "Number must be greater than or equal to -180" }])[0]).toBe("2 つめの予定の場所の経度: -180 以上で指定してください");
+    expect(explain([{ path: "document.items.0.place.lat", message: "Too big: expected number to be <=90" }])[0]).toBe("1 つめの予定の場所の緯度: 90 以下で指定してください");
+    expect(explain([{ path: "document.items.1.place.lng", message: "Too small: expected number to be >=-180" }])[0]).toBe("2 つめの予定の場所の経度: -180 以上で指定してください");
     expect(explain([{ path: "document.items.0.place", message: "緯度と経度は両方そろえてください" }])[0]).toBe("1 つめの予定の場所: 緯度と経度は両方そろえてください");
   });
 
   test("the schema's own English wording is put into Japanese", () => {
     const cases: Array<[string, string]> = [
-      ["Required", "指定してください"],
-      ["Invalid", "形式が正しくありません"],
-      ["Invalid url", "URL の形式が正しくありません"],
-      ["String must contain at least 1 character(s)", "1 文字以上で指定してください"],
-      ["Array must contain at most 12 element(s)", "12 件以内にしてください"],
-      ["Expected number, received string", "number で指定してください（いまは string）"],
-      ["Unrecognized key(s) in object: 'extra'", "知らない項目があります: 'extra'"],
+      ["Invalid input: expected string, received undefined", "指定してください"],
+      ["Invalid string: must match pattern /^[a-zA-Z0-9_-]+$/", "形式が正しくありません"],
+      ["Invalid URL", "URL の形式が正しくありません"],
+      ["Too small: expected string to have >=1 characters", "1 文字以上で指定してください"],
+      ["Too big: expected array to have <=12 items", "12 件以内にしてください"],
+      ["Invalid input: expected number, received string", "number で指定してください（いまは string）"],
+      ["Unrecognized key: \"extra\"", "知らない項目があります: 'extra'"],
+      ["Unrecognized keys: \"a\", \"b\"", "知らない項目があります: 'a', 'b'"],
     ];
     for (const [english, japanese] of cases) expect(explain([{ path: "spec.title", message: english }])[0]).toBe(`旅行の題: ${japanese}`);
     // A message the schema wrote itself is already Japanese and must come through untouched.
     expect(explain([{ path: "", message: "旅行期間と削除期限の順序が不正です" }])[0]).toBe("旅程全体: 旅行期間と削除期限の順序が不正です");
     // Anything unrecognised is shown as it came rather than swallowed.
     expect(explain([{ path: "spec.title", message: "Some new zod wording" }])[0]).toBe("旅行の題: Some new zod wording");
+  });
+
+  test("a missing choice reads as any missing field, a wrong one names the choices", () => {
+    const missing = testTrip(), wrong = testTrip();
+    delete (missing.spec as Partial<typeof missing.spec>).locale; (wrong.spec as { locale: string }).locale = "fr";
+    const said = (t: unknown) => { const r = check(t, Date.parse("2026-09-01T00:00:00Z")); return r.ok ? [] : explain(r.errors); };
+    expect(said(missing)).toEqual(["言語: 指定してください"]);
+    expect(said(wrong)).toEqual(["言語: 次のいずれかを指定してください: ja | en"]);
   });
 
   test("a place with no translation is shown as it is, never hidden", () => {

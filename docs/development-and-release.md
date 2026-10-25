@@ -25,7 +25,7 @@ AWS dev または prod（Host単位のスタック）
 
 1. このリポジトリで作業ブランチを作る。Trip Runtime/Domain Kit/RecipeとIaCを変更する。
 2. `bun run check`（型・テスト・AWS/ブラウザ用ビルド）、`sam validate --lint --template-file aws/template.yaml` を実行する。
-3. 画面変更はローカルで操作確認（旅程の並べ替えと「詳細 / リスト」は `bun run dev` に対して `bun run verify:ui`。手元の Chrome をヘッドレスで動かし、依存は足さない。`verify:http` と同じく、立っている Host に対して走らせる検証で `bun run check` には入れない）。認可・保存・削除の変更はAWS dev上でも検証する。認可・ライフサイクルの実装は `src/cloud-host.ts` の1つだけで、ローカル（`bun run dev`、`src/local-d1.ts` のSQLite）もAWS（`src/aws-store.ts` のDynamoDB）も同じコードを通る。ローカルで確かめられないのは保存先とその手前（CloudFront・Lambda Web Functions の OAC・IAM・地域制限）。
+3. 画面変更はローカルで操作確認（`bun run dev` に対して `bun run verify:ui`。変えた所の群を `bun run verify:ui <群>` で確かめ、PBI の最後に引数なしで 1 回通す。新しい場面は群に入れ、前の群の状態に頼らず群の用意で作る。群と選び方は README の「ローカル開発」。手元の Chrome をヘッドレスで動かし、依存は足さない。`verify:http` と同じく、立っている Host に対して走らせる検証で `bun run check` には入れない）。認可・保存・削除の変更はAWS dev上でも検証する。認可・ライフサイクルの実装は `src/cloud-host.ts` の1つだけで、ローカル（`bun run dev`、`src/local-d1.ts` のSQLite）もAWS（`src/aws-store.ts` のDynamoDB）も同じコードを通る。ローカルで確かめられないのは保存先とその手前（CloudFront・Lambda Web Functions の OAC・IAM・地域制限）。
 4. ソースとIaCの差分をレビューする。schemaVersionの破壊変更、既存旅行の読取互換性、削除への影響を確認する。
 5. 検証済みコミットをリリース対象に固定する。初期は手動配置、将来のCI化でもこの順序を保つ。
 
@@ -39,6 +39,7 @@ CI（`.github/workflows/ci.yml`）は、PRとmainへのpushで `bun install --fr
 - 変更セットの置換・削除・IAM変更を確認して実行。初回のみCloudFront出力Originを設定する2段階配置。詳細はaws/README.md。
 - S3には `dist/public/` だけを同期し、CloudFrontをinvalidate。SAM/Lambda更新とS3更新は原子的ではないため、APIは直前のUIと互換にする。破壊変更は新schema/APIの併存、UI切替、旧版廃止の順に行う。
 - devでリンク交換Cookie、role制限、同時更新、ZIP、失効を実際のCloudFront越しに検証（`aws/verify.ts`）。期限拒否と定期物理削除は実時間で6分半〜13分かかるので毎回は回さず、期限・sweep・ライフサイクルの経路に触ったときと、prod公開の前にdevで1回（`aws/verify-expiry.ts`）。
+- **旅程の暗号化を配る順番**（`docs/design/trip-e2e.md` §5。API を直前の画面と互換に保つため）: 1. Host を配る（平文の旅行は今の API のまま、暗号化した旅行の API と移す要求を足す）2. 画面を配る（新しい画面は要求に `ui=2` を付け、owner に平文の旅行を移す帯を出す。古い画面が暗号化した旅行を開くと Host は「画面を更新してください」）3. 画面を配り終えた時刻を prod の `SealedFrom` に置く（`aws/README.md` の「旅程の暗号化を始めた後に発行した旅行」）。これが「配った後」の線で、**配った後に発行された旅行**とは `created` が `SealedFrom` 以後の旅行のこと。それは平文で使えず、owner が移すまで開けない。配る前に発行された平文の旅行は、owner が新しい画面で開いて移すまで平文のまま使え、来なければ削除期限まで平文で残る。`SealedFrom` を置いてから 180 日の後に、平文の旅行を平文のまま読み書きする道を消す（§6 の 8）。dev の `SealedFrom` は普段は空のまま。置いた後の prod の配置でも `aws/verify.ts` を smoke test として回し、線のある Host として回ったことを出力の `SealedFrom: set (trips published by this run are after the line)` の行で確かめる（`SealedFrom: set, not reached yet …` なら線の前として回っている）（線のある Host で何を確かめ、何を線の無い dev に任せるかは `aws/README.md` の「AWS検証」。#893）
 - 同じコミットとlockfileでprodを配置。prodで架空カプセルを発行してsmoke testし、削除する。
 - コミットSHA、環境、スタック、配置時刻、検証結果を リリース記録（`docs/releases.md`。Private のリポジトリだけにある）へ1行足す。秘密や実旅程は含めない。
 - 同時に `README.md` の「状態」を読み直し、事実でなくなった文を直す。配置と関係なく変わる事実（リポジトリの公開範囲、台帳との接続など）は、それを変えた PR で直す。
@@ -77,7 +78,10 @@ Project の URL はリポジトリ変数 `CAPSULE_PROJECT_URL`。Issue を Proje
 - 公開先: `iunct-lab/capsule-host`（Public）。開発はこの Private のリポジトリで続ける
 - 送るもの: main のツリーだけ（新しい履歴。Private のコミット・Issue・PR は送らない）。外すファイルは root の `ops.config.json` の `publicSync.exclude`（配置の記録、Private の Actions の代わりのスクリプト、ラベルの同期）
 - 公開側の扱い: Issue は要望だけ（要望のテンプレ）、質問・相談は Discussions。PR は受け付けず、workflow が方針の返信つきで自動で閉じる。脆弱性は Security Advisory（`SECURITY.md`）。公開側の要望は `request-to-backlog` の「公開側の Issue から」で、この Private のリポジトリの要望 Issue にしてから扱う
-- 同期の回し方: 手で `ops-kit public-sync`（初回は main へ直接、2 回目からは `sync/<sha>` の PR を公開側で Rebase and merge）。定期実行は置かない（公開後の同期は当面手で回す）。送る前に `--dry-run` で除外と検査の結果を見る
+- 同期の回し方: 手で `ops-kit public-sync --source <開発タグ>`（`--source` は private origin にあり main に含まれる厳密な `vX.Y.Z`。初回は main へ直接、2 回目からは `sync/<sha>` の PR を公開側で Rebase and merge）。定期実行は置かない（公開後の同期は当面手で回す）。送る前に `--dry-run` で除外と検査の結果と、予定の公開版（`version:` の行）を見る
+- 公開版（`publicSync.versioning: "independent"`）: 公開側の `vX.Y.Z` は開発タグ（`release-tag.ts` が付ける `v0.x.y`）とは別の番号。前回公開した source から今回の `--source` までの開発タグの最大区分（major > minor > patch）を、公開側で 1 回だけ上げる。公開側 `main` のコミットの題と Release は版だけ。台帳は private origin の `refs/public-sync/versions/*`。`package.json` の version は書き換えない
+- `v0.1.0` の経緯: 2026-10-25、既存の公開履歴を独立採番へ移す機能が無かったため、公開側 `main` を題 `v0.1.0` の根のコミット 1 つに置き換え（ツリーは同じ）、タグ・Release・台帳・同期の記録を手で作った。共通化の要望は Switchboard の iunct-lab/switchboard-dev#2595
+- 中断したとき: 台帳（`git ls-remote origin 'refs/public-sync/versions/*'`）と公開側を確かめ、同じ `--source` で再開する（台帳や公開タグを消して採番をやり直さない）。詳細は共通キットの README の「独立した公開バージョン」
 - 仕組みの正本: Switchboard の `docs/design/public-repo.md`（公開側の受け口、公開する日の手順）と、共通キットの README の「公開リポジトリへの同期」
 
 ## 認証の値の検査

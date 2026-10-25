@@ -29,11 +29,24 @@ const assets = new Map([
 ]);
 const start = process.env.CAPSULE_TRIP_START ?? new Date().toISOString().slice(0, 10);
 const db = new LocalD1(path); chmodSync(path, 0o600);
+// The host's clock. Only a loopback server may move it forward (POST /dev/clock below); it is not saved, so a restart puts it back.
+let advanced = 0;
+const clock = () => Date.now() + advanced;
 // The same CloudHost as on AWS; only the store differs. A loopback server may make a trip from its own page, and nothing more:
 // the identity is given to /v1/publish, /v1/recipe and /v1/check alone, so /recover and the creator registry (the IAM
 // publisher's on AWS) stay closed here.
-const host = new CloudHost({ DB: db, CAPSULE_HMAC_KEY: key, CAPSULE_ORIGIN: origin }, undefined, async req => local && (["/v1/publish", "/v1/recipe", "/v1/check", "/v1/account/key"].includes(new URL(req.url).pathname) || /^\/v1\/assist(\/[a-f0-9]{32})?$/.test(new URL(req.url).pathname)) ? "local" : null);
+const host = new CloudHost({ DB: db, CAPSULE_HMAC_KEY: key, CAPSULE_ORIGIN: origin, CAPSULE_SEALED_FROM: process.env.CAPSULE_SEALED_FROM }, clock, async req => local && (["/v1/publish", "/v1/recipe", "/v1/check", "/v1/account/key"].includes(new URL(req.url).pathname) || /^\/v1\/assist(\/[a-f0-9]{32})?$/.test(new URL(req.url).pathname)) ? "local" : null);
 const preview = local ? emptyTrip(start) : undefined;
+// /dev/clock lets verify:ui move the host's clock instead of waiting out the passkey check's 5 minutes, the per-minute counts
+// and a footprint's minute in real time. Only a loopback host has it; elsewhere the path goes on to CloudHost and is a 404.
+// JSON only, so another site's page cannot send it without a preflight this server never answers.
+async function moveClock(req: Request): Promise<Response> {
+  if (req.headers.get("Content-Type")?.split(";")[0]?.trim() !== "application/json") return Response.json({ error: "JSON で送ってください" }, { status: 415 });
+  const advance = await req.json().then((body: { advance?: unknown }) => body?.advance, () => undefined);
+  if (!Number.isInteger(advance) || (advance as number) < 0 || (advance as number) > 3600000) return Response.json({ error: "advance は 0 以上 3600000 以下の整数（ミリ秒）です" }, { status: 400 });
+  advanced += advance as number;
+  return Response.json({ now: clock() });
+}
 // Routes production serves elsewhere (static files from S3/CloudFront) or not at all (preview). Kept out of CloudHost so the Lambda does not carry them.
 function localRoute(req: Request, url: URL): Response | Promise<Response> | undefined {
   if (req.method !== "GET") return;
@@ -47,7 +60,7 @@ function localRoute(req: Request, url: URL): Response | Promise<Response> | unde
   const asset = assets.get(url.pathname === "/" || /^\/c\/[a-f0-9]{32}$/.test(url.pathname) ? "/index.html" : url.pathname);
   if (asset) return new Response(asset.body, { headers: { "Content-Type": asset.type } });
 }
-await host.sweep(Date.now());
+await host.sweep(clock());
 const server = Bun.serve({
   hostname, port, maxRequestBodySize: 2 * 1024 * 1024,
   fetch: async (req, server) => {
@@ -57,16 +70,17 @@ const server = Bun.serve({
     const seen = new URL(req.url), url = new URL(origin), ip = server.requestIP(req)?.address ?? "unknown";
     url.pathname = seen.pathname; url.search = seen.search;
     if (seen.host !== url.host) return secure(Response.json({ error: "ホスト名が一致しません" }, { status: 403 }), origin);
-    const served = localRoute(req, url);
+    const moving = local && req.method === "POST" && url.pathname === "/dev/clock";
+    const served = moving ? undefined : localRoute(req, url);
     // A map asks for many ranges as it is moved, so its tiles have their own count and never use up the API's (src/cloud-host.ts).
     const tiles = url.pathname.startsWith("/map/");
-    if (served) return secure(await host.store.rate(host.digest(`${tiles ? "tiles" : "ip"}:${ip}`), tiles ? 3000 : 300, Date.now()) ? await served : Response.json({ error: "操作が多すぎます。1分後に再試行してください" }, { status: 429 }), origin);
+    if (served || moving) return secure(await host.store.rate(host.digest(`${tiles ? "tiles" : "ip"}:${ip}`), tiles ? 3000 : 300, clock()) ? await (served ?? moveClock(req)) : Response.json({ error: "操作が多すぎます。1分後に再試行してください" }, { status: 429 }), origin);
     // As in src/aws-handler.ts: the client address comes from the connection, never from a header the client sent.
     const headers = new Headers(req.headers); headers.set("cf-connecting-ip", ip);
     return host.fetch(new Request(url, { method: req.method, headers, body: req.body }));
   },
 });
-const cleanup = setInterval(() => host.sweep(Date.now()), 60000);
+const cleanup = setInterval(() => host.sweep(clock()), 60000);
 const stop = () => { clearInterval(cleanup); server.stop(); db.close(); process.exit(0); };
 process.on("SIGINT", stop); process.on("SIGTERM", stop);
 console.log(`Trip Capsule: ${origin}${local ? " / ローカルプレビュー" : ""}`);

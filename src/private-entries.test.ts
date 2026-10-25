@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test";
-import { newMemoKey, open, openEntry, privateMarkdown, seal, sealEntry, unwrapMemoKey, wrapMemoKey, wrappingKey, type PlainEntry } from "./private-entries";
+import { assistSealingKey, newMemoKey, open, openEntry, privateMarkdown, seal, sealEntry, unwrapMemoKey, wrapMemoKey, wrappingKey, type PlainEntry } from "./private-entries";
 import { testTrip } from "./test-fixture";
 
 // Stand-ins for a passkey's PRF output: 32 bytes, the same each time for one passkey.
@@ -15,6 +15,14 @@ describe("the memo key and sealed text", () => {
     await expect(unwrapMemoKey(wrapped, await wrappingKey(mine, "trip-b"), "trip-b")).rejects.toThrow();
     // Rewrapping (a passkey replaced) needs the key taken out once, so it opens extractable when asked.
     expect((await unwrapMemoKey(wrapped, await wrappingKey(mine, "trip-a"), "trip-a", true)).extractable).toBe(true);
+  });
+  test("a seat's API key sealed under one PRF output opens with that output and that trip only; the memo key's wrapping key cannot seal it", async () => {
+    const mine = prf(), key = "sk-ant-test-key", sealed = await seal(await assistSealingKey(mine, "trip-a"), key, "trip-a/assist");
+    expect(sealed).toMatch(form); expect(sealed).not.toContain(key);
+    expect(await open(await assistSealingKey(mine, "trip-a"), sealed, "trip-a/assist")).toBe(key);
+    await expect(open(await assistSealingKey(prf(), "trip-a"), sealed, "trip-a/assist")).rejects.toThrow();
+    await expect(open(await assistSealingKey(mine, "trip-b"), sealed, "trip-a/assist")).rejects.toThrow();
+    await expect(seal(await wrappingKey(mine, "trip-a"), key, "trip-a/assist")).rejects.toThrow();
   });
   test("sealed text opens under the same key and the same associated data only", async () => {
     const key = await newMemoKey(), long = "旅".repeat(4000), sealed = await seal(key, long, "e1/body/item/2026-09-25/2026-09-25T10:00:00+09:00/");

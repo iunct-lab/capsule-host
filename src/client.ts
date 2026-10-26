@@ -8,12 +8,13 @@ import { reviseText, reviseTrip, undoTrip, type Diff, type Previous } from "./re
 import { exportFiles, tripHtml, tripMarkdown, zip } from "./export";
 import { PRF_INPUT, assistSealingKey, b64, unb64, newMemoKey, unwrapMemoKey, wrapMemoKey, wrappingKey, openEntry, sealEntry, privateMarkdown, seal as sealWords, open as openWords, type PlainEntry } from "./private-entries";
 import { generate, REVISE_LIMIT, REVISE_SYSTEM, todayLine } from "./assist";
-import { openName, openPoint, sealMove, sealName, sealPoint, openTrip, resealTrip, sealOperation, sealSpec, confirmationCodes, matchesCommitment, newAttempt, newHandoffKeys, newSeatKeys, newTripKey, seatPublic, signEdge, unwrapSeatSecret, unwrapTripKey, wrapSeatSecret, wrapTripKey, acceptRekey, reachableSeats, resealAll, signRekey, signSuccession, verifyEdge, verifySuccession, type KeyedSeat } from "./trip-keys";
+import { openField, openPhotoImage, openPhotoLocation, sealPhoto, type PhotoSize, openName, openPoint, sealMove, sealName, sealPoint, openTrip, resealTrip, sealOperation, sealSpec, confirmationCodes, matchesCommitment, newAttempt, newHandoffKeys, newSeatKeys, newTripKey, seatPublic, signEdge, unwrapSeatSecret, unwrapTripKey, wrapSeatSecret, wrapTripKey, acceptRekey, reachableSeats, resealAll, signRekey, signSuccession, verifyEdge, verifySuccession, type KeyedSeat } from "./trip-keys";
 import { privateReviseText, takePrivate, privateDiff } from "./private-revise";
 import { expiredIn, type Joined } from "./joined";
 import { autoDue, footprints, spotsOf, type Point } from "./footprints";
 import type { MapCamera, MapData } from "./map";
-import { itemAt } from "./moments";
+import { itemAt, photoDays, photoInstant, photosPageShown, photosUploadable, type Shown } from "./moments";
+import { inspectJpeg, readExif, PHOTO_LIMITS } from "./media";
 import { firstPage, story, type StoryEntry } from "./story";
 const e = (s: string) => s.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
 
@@ -27,7 +28,7 @@ let plain = new Map<string, PlainEntry | null>();
 // `openFootprints` opens them into this shape first (`HostFootprint`).
 type Footprint = { id: string; at: string; lat: number; lng: number; accuracy: number; by: string; mine: boolean; auto: boolean };
 type HostFootprint = Omit<Footprint, "lat" | "lng" | "accuracy"> & (PlainPoint | { point: string });
-type View = { id?: string; spec: Spec; document: Document; role: Role; state: State | "draft"; passkey?: boolean; private?: PrivateEntry[]; privateKey?: string | null; seatKey?: SeatKey | null; keyed?: boolean; handoff?: Handoff | null; waiting?: Array<{ id: string; label: string; handoff: Handoff | null }>; footprints?: Footprint[]; sealed?: { generation: number } | null; unreadable?: string[]; updated?: string; created?: number; label?: string; self?: { id: string; label: string }; assistKey?: boolean; assistWrapped?: string | null; assistModel?: string; mustSeal?: boolean; rekey?: "auto" | "ask" | null; seats?: KeyedSeat[] };
+type View = { id?: string; spec: Spec; document: Document; role: Role; state: State | "draft"; passkey?: boolean; private?: PrivateEntry[]; privateKey?: string | null; seatKey?: SeatKey | null; keyed?: boolean; handoff?: Handoff | null; waiting?: Array<{ id: string; label: string; handoff: Handoff | null }>; footprints?: Footprint[]; media?: Shown[]; photos?: boolean; sealed?: { generation: number } | null; unreadable?: string[]; updated?: string; created?: number; label?: string; self?: { id: string; label: string }; assistKey?: boolean; assistWrapped?: string | null; assistModel?: string; mustSeal?: boolean; rekey?: "auto" | "ask" | null; seats?: KeyedSeat[] };
 // This seat's keys for the trip as the host keeps them (docs/design/trip-e2e.md §2.1): public keys and what is already wrapped.
 // `rekey`: the owner seat's signature over this wrap, when the owner's browser replaced the trip key (docs/design/trip-e2e.md §8).
 type SeatKey = { x25519: string; ed25519: string; generation: number; wrapped: string; ephemeral: string; secret?: { x25519: string; ed25519: string; passkey: string }; edges?: Array<{ seat: string; signature: string }>; since?: KeyedSeat["since"]; rekey?: { seat: string; signature: string } };
@@ -249,7 +250,7 @@ const codeAsk = "相手の画面に出ているコードを聞いて、下に入
 const wrongCode = "確認コードが違います。もう一度やり直してください";
 let handoffRun = 0, codeResolver: ((value: string) => void) | undefined;
 // The close event comes after close() returns: a dialog opened again meanwhile (another 「鍵を受け取る」) is a new attempt, not one to end.
-dialog.addEventListener("close", () => { if (dialog.open) return; handoffRun++; codeResolver?.(""); codeResolver = undefined; });
+dialog.addEventListener("close", () => { if (dialog.open) return; handoffRun++; codeResolver?.(""); codeResolver = undefined; displayRun++; if (openedDisplay) { URL.revokeObjectURL(openedDisplay); openedDisplay = ""; } });
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 // The seat's own pair kept in this browser (`seat:<trip>`), made when there is none. The public keys are kept with it: a pair that
 // cannot be taken out cannot say its public half again.
@@ -588,7 +589,7 @@ async function rekeyTrip() {
     if (!id || !raw.sealed || !k || !raw.self || !secret || !await owns(secret, k)) throw new Error("この端末には旅行の鍵がありません");
     const grants = await api("grants") as Array<{ id: string; label: string; members: Array<{ id: string; label: string }> }>;
     const old = await unwrapTripKey(k.wrapped, k.ephemeral, secret.x25519, id, k.generation, true), key = await newTripKey(), generation = raw.sealed.generation + 1;
-    const sealed = await resealAll(old, key, id, generation, { spec: raw.spec as unknown as SealedSpec, document: raw.document as unknown as SealedDocument, footprints: raw.footprints.map(p => ({ id: p.id, point: p.point, by: p.by })), members: grants.flatMap(g => g.members).map(m => ({ id: m.id, label: m.label })), grants: grants.map(g => ({ id: g.id, label: g.label })) });
+    const sealed = await resealAll(old, key, id, generation, { spec: raw.spec as unknown as SealedSpec, document: raw.document as unknown as SealedDocument, footprints: raw.footprints.map(p => ({ id: p.id, point: p.point, by: p.by })), media: raw.media, members: grants.flatMap(g => g.members).map(m => ({ id: m.id, label: m.label })), grants: grants.map(g => ({ id: g.id, label: g.label })) });
     const seats = raw.seats ?? [], reached = await reachableSeats({ id: raw.self.id, ed25519: k.ed25519 }, seats, id);
     // This seat's own wrap goes to the key it just showed it holds, not to the one the list names.
     const to = seats.filter(s => reached.has(s.id)).map(s => s.id === raw.self!.id ? { ...s, x25519: k.x25519 } : s);
@@ -849,7 +850,9 @@ function entries(type: "suggest" | "comment" | "reflect") {
 // only, never in a Spec. With a trip-map page, that page is where footprints are left, seen and removed (#583), and no second page is added.
 function pageModules() {
   const { modules, navigation } = view.spec;
-  const pages: Array<{ id: string; kind: Spec["modules"][number]["kind"] | "footprints"; label: string }> = navigation.map(n => modules.find(m => m.id === n)!);
+  const pages: Array<{ id: string; kind: Spec["modules"][number]["kind"] | "footprints"; label: string }> = navigation.map(n => modules.find(m => m.id === n)!)
+    // Without photos on (the operator's switch) and none put up, the page is not shown.
+    .filter(m => m.kind !== "moments" || photosPageShown(view));
   if (!pages.some(m => m.kind === "reflection")) pages.push(modules.find(m => m.kind === "reflection") ?? { id: ":memories", kind: "reflection", label: "旅の思い出" });
   if (!pages.some(m => m.kind === "trip-map")) pages.push({ id: ":footprints", kind: "footprints", label: "足あと" });
   return pages;
@@ -980,6 +983,113 @@ function spotDialog(ids: string[]) {
   modal("この地点の足あと", `<div class="grant-list">${(view.footprints ?? []).filter(p => ids.includes(p.id)).map(p => { const t = +new Date(p.at), item = itemAt(view.document.items, t, zone);
     return `<div class="grant" data-spot="${e(p.id)}"><div><strong>${e(p.by)}</strong><small>${dateLabel(localDay(t, zone))} ${clock(p.at, zone)}</small>${item ? `<small>予定: ${e(item.title)}</small>` : ""}</div><a class="button quiet" href="${map(`${p.lat},${p.lng}`)}" target="_blank" rel="noopener noreferrer">地図 ↗</a></div>`; }).join("")}</div>`);
 }
+// The photos page (docs/design/trip-e2e.md §3.1, the photo rows). A photo is opened here and nowhere else: its sealed image is
+// fetched, opened with the photo's own key (which the trip's key opens), walked by `inspectJpeg` again (any member could have put
+// anything there, §4) and shown from a `blob:` URL, kept in `shownPhotos` until the photo is removed.
+const shownPhotos = new Map<string, string>();
+// A full-size image is made for the dialog that shows it and released when that closes: only the thumbnails, small and at most 500,
+// are kept across redraws, and those of a photo no longer on the trip are released with each redraw of the page.
+let openedDisplay = "", displayRun = 0;
+const releasePhoto = (key: string) => { const url = shownPhotos.get(key); if (url) URL.revokeObjectURL(url); shownPhotos.delete(key); };
+const photoRefused = "この写真は開けませんでした";
+async function photoUrl(p: Shown, size: PhotoSize): Promise<string> {
+  const held = size === "thumb" ? shownPhotos.get(`${p.id}/thumb`) : undefined; if (held) return held;
+  if (!tripKey) throw new Error("この端末には旅行の鍵がありません");
+  const res = await fetch(`/v1/c/${id}/media/${p.id}/${size}?ui=2`);
+  if (!res.ok) throw new Error(photoRefused);
+  const [edge, bytes] = size === "thumb" ? [PHOTO_LIMITS.thumbEdge, PHOTO_LIMITS.thumbBytes] : [PHOTO_LIMITS.displayEdge, PHOTO_LIMITS.displayBytes];
+  const clean = inspectJpeg(await openPhotoImage(tripKey, id!, p.id, p.key, size, new Uint8Array(await res.arrayBuffer())), edge, bytes);
+  const url = URL.createObjectURL(new Blob([clean.bytes as BlobPart], { type: "image/jpeg" }));
+  if (size === "thumb") shownPhotos.set(`${p.id}/thumb`, url);
+  return url;
+}
+// Anyone but a viewer adds photos, until sharing ends, and only to a trip this browser holds the key of.
+const canUpload = () => photosUploadable(view, Boolean(tripKey));
+function photosPage() {
+  for (const key of [...shownPhotos.keys()]) if (!view.media?.some(p => key === `${p.id}/thumb`)) releasePhoto(key);
+  const { days, unknown } = photoDays(view.media ?? [], view.spec.timezone);
+  const group = (title: string, list: Shown[], attr = "") => `<section class="photo-day" ${attr}><h3>${e(title)}</h3><div class="photo-grid">${list.map(p => `<button class="photo" data-action="photo-open" data-id="${e(p.id)}" aria-label="写真を開く"><img data-thumb="${e(p.id)}" alt="" width="${p.thumb.width}" height="${p.thumb.height}"></button>`).join("")}</div></section>`;
+  const upload = canUpload() ? `<div class="admin-actions"><label class="button primary photo-upload">写真を上げる<input type="file" accept="image/jpeg,image/heic,image/*" multiple data-upload="photos"></label></div>`
+    : !view.photos || view.sealed ? "" : `<p class="muted">この旅行はまだ暗号化されていないため、写真は上げられません。オーナーが旅行を暗号化すると使えます。</p>`;
+  return `<h2>旅の写真</h2><p class="muted">旅行中の写真をみんなで。写真の位置は画像から消し、この旅行の中だけで使います。旅行の削除と一緒に消えます。</p><p class="muted">iPhone は写真を選ぶ画面で位置情報を含めると、地図に使えます。Android のブラウザから上げた写真には位置が付きません。</p>${upload}${days.map(d => group(dateLabel(d.day), d.photos, `data-photo-day="${e(d.day)}"`)).join("")}${unknown.length ? group("時刻の分からない写真", unknown, 'data-photo-day="unknown"') : ""}${(view.media ?? []).length ? "" : `<p class="muted" data-photos-empty>まだ写真はありません。</p>`}`;
+}
+// The thumbnails are fetched, opened and drawn as they come into view, a few at a time by the browser's own pace.
+async function mountPhotos() {
+  const frames = [...app.querySelectorAll<HTMLImageElement>("img[data-thumb]")]; if (!frames.length) return;
+  const byId = new Map((view.media ?? []).map(p => [p.id, p]));
+  const show = async (img: HTMLImageElement) => {
+    const p = byId.get(img.dataset.thumb!); if (!p) return;
+    try { img.src = await photoUrl(p, "thumb"); } catch { img.replaceWith(Object.assign(document.createElement("span"), { textContent: photoRefused, className: "photo-refused" })); }
+  };
+  const seen = new IntersectionObserver(entries => { for (const en of entries) if (en.isIntersecting) { seen.unobserve(en.target); void show(en.target as HTMLImageElement); } }, { rootMargin: "300px" });
+  for (const img of frames) seen.observe(img);
+}
+async function photoDialog(pid: string) {
+  const p = view.media?.find(x => x.id === pid); if (!p) return;
+  const zone = view.spec.timezone, at = +new Date(p.capturedAt ?? NaN);
+  const when = Number.isFinite(at) ? `${dateLabel(localDay(at, zone))} ${clock(at, zone)}` : "撮影時刻の分からない写真";
+  const place = p.location && tripKey ? await openPhotoLocation(tripKey, id!, p.id, p.location) : null;
+  const caption = p.caption && tripKey ? await openField(tripKey, id!, "photo", p.id, "caption", p.caption).catch(() => "") : "";
+  modal("写真", `<div class="photo-view"><img data-display alt="" width="${p.width}" height="${p.height}"><small>${e(when)}</small>${place ? `<small><a href="${map(`${place.lat},${place.lng}`)}" target="_blank" rel="noopener noreferrer">撮影した場所を地図で見る</a></small>` : ""}${caption ? `<p class="entry-body">${e(caption)}</p>` : ""}<div class="admin-actions">${p.mine || editor() ? button("消す", "photo-remove", "quiet danger-text", `data-id="${e(p.id)}"`) : ""}</div></div>`);
+  const img = dialog.querySelector<HTMLImageElement>("img[data-display]")!, run = ++displayRun;
+  try {
+    const url = await photoUrl(p, "display");
+    // The dialog this was made for may have closed, or another photo's replaced it, while the image was fetched and opened: it is then no one's.
+    if (run !== displayRun || !dialog.open) { URL.revokeObjectURL(url); return; }
+    if (openedDisplay) URL.revokeObjectURL(openedDisplay);
+    openedDisplay = url; img.src = url;
+  } catch { if (run === displayRun) img.replaceWith(Object.assign(document.createElement("p"), { textContent: photoRefused, className: "photo-refused" })); }
+}
+// Pressed twice: the first press asks, the second takes the photo out for everyone.
+async function removePhoto(b: HTMLButtonElement) {
+  if (!b.dataset.sure) { b.dataset.sure = "1"; b.textContent = "もう一度押すと消します"; return; }
+  const pid = b.dataset.id!, res = await api("media", "PATCH", { type: "remove", id: pid }) as { media: Shown[] };
+  releasePhoto(`${pid}/thumb`);
+  view.media = res.media; if (dialog.open) dialog.close(); render(); notice("写真を消しました。");
+}
+const base64 = (bytes: Uint8Array) => { let s = ""; for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode(...bytes.subarray(i, i + 0x8000)); return btoa(s); };
+const unreadablePhoto = "この写真は読めませんでした（JPEG で選び直してください）";
+// A copy of the picture no longer than `edge` on its long side, as a JPEG that fits `limit` bytes: the quality goes down a step at a
+// time until it does. The canvas writes no EXIF, and the picture was turned the way it was taken by createImageBitmap.
+async function drawn(bitmap: ImageBitmap, edge: number, limit: number): Promise<Uint8Array> {
+  const scale = Math.min(1, edge / Math.max(bitmap.width, bitmap.height)), canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(bitmap.width * scale)); canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+  canvas.getContext("2d")!.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+  let out = new Uint8Array();
+  for (const quality of [0.85, 0.75, 0.65, 0.5]) {
+    const blob = await new Promise<Blob | null>(done => canvas.toBlob(done, "image/jpeg", quality));
+    if (!blob) throw new Error(unreadablePhoto);
+    out = new Uint8Array(await blob.arrayBuffer()); if (out.length <= limit) break;
+  }
+  return out;
+}
+// One photo up: its time and place read from the original (and nowhere else: what the file or the device says now does not stand in
+// for what the picture says), the two copies drawn and walked, the images and the place sealed, and one POST. The host is told no
+// more than it keeps (docs/design/trip-e2e.md §3.1).
+async function uploadPhoto(file: File) {
+  if (!view.sealed || !tripKey) throw new Error("この端末には旅行の鍵がありません");
+  const exif = readExif(new Uint8Array(await file.arrayBuffer()));
+  let bitmap: ImageBitmap; try { bitmap = await createImageBitmap(file, { imageOrientation: "from-image" }); } catch { throw new Error(unreadablePhoto); }
+  try {
+    const display = inspectJpeg(await drawn(bitmap, PHOTO_LIMITS.displayEdge, PHOTO_LIMITS.displayBytes), PHOTO_LIMITS.displayEdge, PHOTO_LIMITS.displayBytes);
+    const thumb = inspectJpeg(await drawn(bitmap, PHOTO_LIMITS.thumbEdge, PHOTO_LIMITS.thumbBytes), PHOTO_LIMITS.thumbEdge, PHOTO_LIMITS.thumbBytes);
+    const pid = crypto.randomUUID().replaceAll("-", ""), where = exif.location && { lat: exif.location.lat, lng: exif.location.lng, ...exif.location.accuracy !== undefined && exif.location.accuracy <= 1000 && { accuracy: exif.location.accuracy } };
+    const sealed = await sealPhoto(tripKey, id!, view.sealed.generation, pid, { display: display.bytes, thumb: thumb.bytes, ...where && { location: where } });
+    const taken = exif.capturedAt && photoInstant(exif.capturedAt, view.spec.timezone);
+    const res = await api("media", "POST", { id: pid, images: { display: base64(sealed.display), thumb: base64(sealed.thumb) }, width: display.width, height: display.height, thumb: { width: thumb.width, height: thumb.height }, ...taken && { capturedAt: taken }, key: sealed.key, ...sealed.location && { location: sealed.location } }) as { photo: Shown };
+    view.media = [...view.media ?? [], res.photo];
+  } finally { bitmap.close(); }
+}
+async function uploadPhotos(files: File[]) {
+  if (!files.length || !canUpload()) return;
+  const failed: string[] = [];
+  for (const [n, file] of files.entries()) {
+    notice(`写真を上げています（${n + 1} / ${files.length}）`);
+    try { await uploadPhoto(file); } catch (err) { failed.push(`${file.name}: ${(err as Error).message}`); }
+  }
+  render();
+  notice(failed.length ? `${files.length - failed.length} 枚を上げました。上げられなかった写真 — ${failed.join(" / ")}` : `${files.length} 枚を上げました。`, failed.length > 0);
+}
 function content() {
   const kind = pageModules().find(m => m.id === tab)?.kind;
   switch (kind) {
@@ -991,6 +1101,7 @@ function content() {
     case "notes": return `<h2>覚えておきたいこと。</h2><div class="card"><p class="entry-body">${e(view.document.notes)}</p>${editor() && editable() && whole("notes") ? button("メモを編集", "notes", "secondary") : ""}</div>`;
     case "footprints": return tripMap(true);
     case "story": return storyPage();
+    case "moments": return photosPage();
     case "trip-map": { const m = view.spec.modules.find(m => m.id === tab); return tripMap(m?.kind === "trip-map" && m.showTrack); }
     case "reflection": return `<h2>旅の思い出</h2>${view.spec.modules.some(m => m.kind === "reflection" && view.spec.navigation.includes(m.id)) ? `<p class="muted">旅行後も${view.spec.lifecycle.reflectionDays}日間、思い出を追記できます。オーナー・編集者が選んだ投稿を旅行記に載せます。JSONには全投稿が含まれます。</p><section class="shared-memories"><h3>みんなの思い出</h3><p class="muted">この旅行のメンバーに共有します。</p>${entries("reflect")}</section>` : ""}${diary(diaryDay)}`;
     default: return "";
@@ -1073,6 +1184,7 @@ function render() {
   boundaryRows();
   void mountMap();
   void mountPlaceElement();
+  void mountPhotos();
 }
 // The element's `location` event carries the fix (`position`) or why there is none (`error`); a prompt the member dismissed says
 // nothing. Opening the page asks for nothing: a refusal already on record is only shown, and the element is what asks again.
@@ -1292,6 +1404,8 @@ document.addEventListener("click", async event => {
     if (action === "handoff-submit") { const input = dialog.querySelector<HTMLInputElement>("[data-handoff-input]"); const typed = input?.value.trim() ?? ""; if (typed) { const resolve = codeResolver; codeResolver = undefined; resolve?.(typed); } else input?.focus(); }
     if (action === "read-private") try { await readWithPasskey(); await openAll(); if (dialog.open) dialog.close(); render(); notice("自分だけのメモを読めるようにしました。"); } catch (err) { passkeyError(err); }
     if (action === "footprint-here") await leaveFootprint();
+    if (action === "photo-open") await photoDialog(b.dataset.id!);
+    if (action === "photo-remove") await removePhoto(b);
     if (action === "auto-footprint") await switchAutoFootprint(b as unknown as HTMLInputElement);
     if (action === "map-day" || action === "map-by") { if (action === "map-day") mapDay = b.dataset.value!; else mapBy = b.dataset.value!; mapCameraKey = ""; render(); }
     if (action === "map-show") { const k = b.dataset.value as "plans" | "footprints"; mapShow = { ...mapShow, [k]: !mapShow[k] }; mapCameraKey = ""; render(); }
@@ -1432,6 +1546,7 @@ document.addEventListener("click", async event => {
 document.addEventListener("change", async event => { const t = event.target as HTMLInputElement; if (t.matches("[data-diary-day]")) { diaryDay = t.value; editingDiaryId = ""; render(); } if (t.dataset.check) try { await mutate({ type: "check", id: t.dataset.check, done: t.checked }); } catch (err) { t.checked = !t.checked; notice((err as Error).message, true); } });
 document.addEventListener("change", async event => {
   const field = event.target as HTMLInputElement;
+  if (field.dataset.upload === "photos") { const files = [...field.files ?? []]; field.value = ""; await uploadPhotos(files); return; }
   if (!field.dataset.import || !canCreate) return;
   try {
     const file = field.files?.[0]; if (!file) return;
@@ -1802,8 +1917,11 @@ setInterval(async () => {
   // Footprints move no revision: on their page, the map and the story, a point left or removed by another member redraws it too.
   try { const asked = loads, latest = await api() as View; if (asked !== loads || dragging || ordering || latest.document.revision < view.document.revision) return;
     const stepped = onFootprints() && (latest.footprints?.length !== view.footprints?.length || latest.footprints?.at(-1)?.id !== view.footprints?.at(-1)?.id);
+    // Photos move no revision either: on their page, one put up or taken out by another member redraws it.
+    const photoKey = (v: View) => (v.media ?? []).map(p => p.id).join();
+    const photos = pageModules().find(m => m.id === tab)?.kind === "moments" && photoKey(latest) !== photoKey(view);
     const handoffKey = (v: View) => JSON.stringify([(v.waiting ?? []).map(w => w.id), Boolean(v.seatKey)]);
     const handoffs = handoffKey(latest) !== handoffKey(view);
-    if (latest.document.revision !== view.document.revision || latest.state !== view.state || stepped || handoffs) { if (app.querySelector("form") || stale) { notice("新しい更新があります。「再読込」で確認してください。入力中の内容はコピーしてから再読込してください。"); } else { view = latest; await openAll(); await openSealed(); render(); } } }
+    if (latest.document.revision !== view.document.revision || latest.state !== view.state || stepped || photos || handoffs) { if (app.querySelector("form") || stale) { notice("新しい更新があります。「再読込」で確認してください。入力中の内容はコピーしてから再読込してください。"); } else { view = latest; await openAll(); await openSealed(); render(); } } }
   catch (err) { notice((err as Error).message, true); }
 }, 20000);

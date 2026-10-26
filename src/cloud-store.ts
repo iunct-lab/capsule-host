@@ -11,7 +11,8 @@ export interface CapsuleStore {
   get(key: string): Promise<CloudRow | null>;
   create(key: string, payload: string, expires: number, owner: string, now: number): Promise<{ meta: { changes?: number } }>;
   save(row: CloudRow, payload: string | null, expires: number, now: number): Promise<boolean>;
-  sweep(now: number): Promise<void>;
+  // `erase` is told each expired capsule's key before its row is emptied; a row it throws for is left for the next sweep.
+  sweep(now: number, erase?: (key: string) => Promise<void>): Promise<void>;
   // The keys of every row still holding a payload before its deadline: the capsules, and the creators' registry.
   list(now: number): Promise<string[]>;
   rate(key: string, limit: number, now: number): Promise<boolean>;
@@ -34,8 +35,13 @@ export class CloudStore implements CapsuleStore {
     const row = await this.db.prepare("SELECT json_group_array(key) AS keys FROM trip_capsules WHERE payload IS NOT NULL AND purge_at>?").bind(now).first<{ keys: string }>();
     return JSON.parse(row?.keys ?? "[]") as string[];
   }
-  async sweep(now: number) {
-    await this.db.prepare("UPDATE trip_capsules SET payload=NULL,version=version+1,purged_at=?,owner_key=NULL WHERE payload IS NOT NULL AND purge_at<=?").bind(now, now).run();
+  async sweep(now: number, erase?: (key: string) => Promise<void>) {
+    const purge = (where: string, ...keys: string[]) => this.db.prepare(`UPDATE trip_capsules SET payload=NULL,version=version+1,purged_at=?,owner_key=NULL WHERE payload IS NOT NULL AND purge_at<=?${where}`).bind(now, now, ...keys).run();
+    if (!erase) await purge("");
+    else {
+      const due = await this.db.prepare("SELECT json_group_array(key) AS keys FROM trip_capsules WHERE payload IS NOT NULL AND purge_at<=?").bind(now).first<{ keys: string }>();
+      for (const key of JSON.parse(due?.keys ?? "[]") as string[]) { try { await erase(key); } catch { continue; } await purge(" AND key=?", key); }
+    }
     await this.db.prepare("DELETE FROM trip_capsules WHERE payload IS NULL AND purged_at<?").bind(now - 30 * 86400000).run();
     await this.db.prepare("DELETE FROM trip_rate_limits WHERE expires<?").bind(now).run();
   }

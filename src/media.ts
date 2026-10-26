@@ -3,13 +3,20 @@
 // picture, the host only walks the JPEG's segments, keeps the image and drops the metadata (EXIF, GPS, XMP, comments).
 
 // `contributor` is the uploader's `Session.id`; it stays in the host and the page is told only whether a photo is its own.
-// `itineraryItemId` is the item a member chose for the photo by hand and `caption` the line written under it; neither is set
-// by the host on its own (which item a photo goes under is worked out by `linkPhotos` in src/moments.ts each time it is drawn).
-export type PhotoAsset = { id: string; contributor: string; capturedAt?: string; uploadedAt: string; location?: { lat: number; lng: number; accuracy?: number }; width: number; height: number; thumb: { width: number; height: number }; itineraryItemId?: string; caption?: string };
+// `itineraryItemId` is the item a member chose for the photo by hand; the host does not set it (which item a photo goes under is
+// worked out by `linkPhotos` in src/moments.ts each time it is drawn). What the browser sealed (docs/design/trip-e2e.md §3.1) is
+// ciphertext of the trip key: `location` and `caption`, and `key`, the random key the photo's two images are sealed under, so a
+// new trip key has these few strings to seal again and no image to fetch and send back (§8). The images are in the MediaStore,
+// under `blob`, a name the host gives each upload: an upload that loses a race or fails can take back its own images, and no other
+// upload can write over a committed photo's.
+export type PhotoAsset = { id: string; contributor: string; capturedAt?: string; uploadedAt: string; width: number; height: number; thumb: { width: number; height: number }; itineraryItemId?: string; blob: string; key: string; location?: string; caption?: string };
 
 export const PHOTO_LIMITS = { count: 500, displayEdge: 2048, displayBytes: 1024 * 1024, thumbEdge: 400, thumbBytes: 150 * 1024 };
+// An image's ciphertext is its 12-byte IV, the sealed bytes and AES-GCM's 16-byte tag.
+export const SEALED_OVERHEAD = 12 + 16;
 
 const size = (bytes: number) => bytes % (1024 * 1024) === 0 ? `${bytes / (1024 * 1024)} MiB` : `${Math.round(bytes / 1024)} KiB`;
+export const tooLargeText = (maxEdge: number, maxBytes: number) => `写真が大きすぎます（長辺 ${maxEdge}px・${size(maxBytes)} まで）`;
 const broken = () => new Error("写真が壊れています");
 
 // The image of `bytes` without its APP1–APP15 and COM segments and without whatever follows the first EOI (a Motion Photo carries
@@ -17,7 +24,7 @@ const broken = () => new Error("写真が壊れています");
 // JPEG, for a broken one, and for one past `maxEdge` on its long side or `maxBytes` in length.
 export function inspectJpeg(bytes: Uint8Array, maxEdge: number, maxBytes: number): { bytes: Uint8Array; width: number; height: number } {
   if (bytes.length < 4 || bytes[0] !== 0xff || bytes[1] !== 0xd8) throw new Error("JPEG の写真を選んでください");
-  const tooLarge = new Error(`写真が大きすぎます（長辺 ${maxEdge}px・${size(maxBytes)} まで）`);
+  const tooLarge = new Error(tooLargeText(maxEdge, maxBytes));
   if (bytes.length > maxBytes) throw tooLarge;
   const kept: Uint8Array[] = [bytes.subarray(0, 2)];
   let at = 2, width = 0, height = 0, scanned = false;

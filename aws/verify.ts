@@ -3,7 +3,7 @@ import { randomBytes, randomInt } from "node:crypto";
 import { invoke } from "./invoke";
 import { fakeAuthenticator, testTrip } from "../src/test-fixture";
 import { regionsOf } from "../src/mapdata";
-import { openName, openPoint, sealName, sealPoint, openTrip, resealTrip, sealOperation, sealMove, confirmationCodes, matchesCommitment, newAttempt, newHandoffKeys, newSeatKeys, newTripKey, seatPublic, signEdge, unwrapSeatSecret, unwrapTripKey, wrapSeatSecret, wrapTripKey, acceptRekey, openField, reachableSeats, resealAll, signRekey, type SeatKeys } from "../src/trip-keys";
+import { openName, openPoint, sealName, sealPoint, openTrip, resealTrip, sealOperation, sealMove, confirmationCodes, matchesCommitment, newAttempt, newHandoffKeys, newSeatKeys, newTripKey, seatPublic, signEdge, unwrapSeatSecret, unwrapTripKey, wrapSeatSecret, wrapTripKey, acceptRekey, openField, sealPhoto, openPhotoImage, reachableSeats, resealAll, signRekey, type SeatKeys } from "../src/trip-keys";
 import { assistSealingKey, newMemoKey, open as openEntryText, openEntry, seal as sealText, sealEntry, unwrapMemoKey, wrapMemoKey, wrappingKey, type SealedEntry } from "../src/private-entries";
 
 // Publishes a disposable fictional capsule through IAM Lambda Invoke, verifies it through CloudFront, then purges it.
@@ -51,12 +51,25 @@ const cliIn = async (where: string, ...args: string[]) => {
 };
 const cli = (...args: string[]) => cliIn(region, ...args);
 // Every capsule's payload as stored in DynamoDB, joined from its chunks: what an operator with the table's read permission reads.
-async function storedPayloads() {
+async function storedRows() {
   const table = await cli("lambda", "get-function-configuration", "--function-name", functionName!, "--query", "Environment.Variables.CAPSULE_TABLE") as string;
   const { Items } = await cli("dynamodb", "scan", "--table-name", table, "--consistent-read", "--filter-expression", "begins_with(sk, :c)", "--expression-attribute-values", '{":c":{"S":"chunk:"}}') as { Items: Array<{ pk: { S: string }; sk: { S: string }; bytes: { B: string } }> };
   const payloads = new Map<string, Array<[number, Buffer]>>();
   for (const i of Items) payloads.set(i.pk.S, [...payloads.get(i.pk.S) ?? [], [Number(i.sk.S.slice("chunk:".length)), Buffer.from(i.bytes.B, "base64")]]);
-  return [...payloads.values()].map(parts => Buffer.concat(parts.sort((x, y) => x[0] - y[0]).map(([, b]) => b)).toString());
+  return [...payloads].map(([pk, parts]) => [pk, Buffer.concat(parts.sort((x, y) => x[0] - y[0]).map(([, b]) => b)).toString()] as const);
+}
+const storedPayloads = async () => (await storedRows()).map(([, payload]) => payload);
+// What is in the photos' bucket under one trip's prefix (the row's key, which names the trip and so is not printed): the bucket is the
+// Lambda's own setting, and only the names are counted. The prefix is read while the trip's row holds its payload.
+const photoPrefix = async (capsule: string) => {
+  const prefix = (await storedRows()).find(([, payload]) => payload.includes(`"id":"${capsule}"`))?.[0];
+  assert.ok(prefix, "the trip's row was not found");
+  return prefix!;
+};
+async function photoObjects(prefix: string) {
+  const bucket = await cli("lambda", "get-function-configuration", "--function-name", functionName!, "--query", "Environment.Variables.CAPSULE_MEDIA_BUCKET") as string | null;
+  assert.ok(bucket, "the function has no CAPSULE_MEDIA_BUCKET: aws/template.yaml is not deployed");
+  return await cli("s3api", "list-objects-v2", "--bucket", bucket!, "--prefix", prefix + "/", "--query", "length(Contents || `[]`)") as number;
 }
 // The Web Function's own address is read from the stack's output, never passed in: a run that was handed nothing would skip the check
 // that the function refuses a caller who bypasses CloudFront (#610). Not printed.
@@ -69,6 +82,9 @@ if (!webEndpoint) throw new Error("スタック出力 WebEndpoint がありま�
 // the sealed and moved trips' scenes keep to what such a trip allows before its move (#893). Its time is not printed.
 const sealedFrom = await cli("lambda", "get-function-configuration", "--function-name", functionName, "--query", "Environment.Variables.CAPSULE_SEALED_FROM") as string | null;
 if (sealedFrom && Number.isNaN(Date.parse(sealedFrom))) throw new Error("CAPSULE_SEALED_FROM は時刻として読めません（Host も起動のときに断ります）");
+// Photos are off unless the stack's Photos parameter is 1: then the host says so and refuses; with it on, the photo scenes run.
+const photosOn = await cli("lambda", "get-function-configuration", "--function-name", functionName, "--query", "Environment.Variables.CAPSULE_PHOTOS") === "1";
+console.log(photosOn ? "Photos: on" : "Photos: off (the default; the photo scenes check only that the host refuses)");
 const afterLine = Boolean(sealedFrom) && Date.parse(sealedFrom!) <= Date.now(), ui = afterLine ? "?ui=2" : "";
 console.log(afterLine ? "SealedFrom: set (trips published by this run are after the line)" : sealedFrom ? "SealedFrom: set, not reached yet (trips published by this run are before the line)" : "SealedFrom: not set");
 try {
@@ -76,6 +92,8 @@ try {
   assert.match(page.headers.get("Content-Security-Policy")!, /frame-ancestors 'none'/);
   // The only outside origin the page may reach: Anthropic, for a sealed trip's 「ここで直す」 sent by the browser (#692).
   assert.match(page.headers.get("Content-Security-Policy")!, /(^|; )connect-src 'self' https:\/\/api\.anthropic\.com(;|$)/);
+  // A photo is drawn from a blob: URL the page makes from what it opened (#437), and from nowhere else outside the host.
+  assert.match(page.headers.get("Content-Security-Policy")!, /(^|; )img-src 'self' data: blob:(;|$)/);
   // CloudFront's page lets the trip use the position (足あと) and keeps the camera and microphone closed, as the host does.
   assert.equal(page.headers.get("Permissions-Policy"), "camera=(), microphone=(), geolocation=(self)");
   for (const path of ["/app.js", "/app.css"]) { const r = await request(path); assert.equal(r.status, 200); assert.ok((await r.text()).length > 1000); }
@@ -376,6 +394,34 @@ try {
   const sGrantsText = await (await request(sAt("/grants"), "GET", undefined, sealedOwner)).text();
   assert.ok(!sGrantsText.includes(nameMarker), "the grants list holds a plain name of the sealed trip");
   assert.equal(await openName(sTrip, sealedId, "grant", viewerGrant, JSON.parse(sGrantsText).find((g: { id: string }) => g.id === viewerGrant).label), nameMarker);
+  // Photos (#437, docs/design/trip-e2e.md §3.1): the participant puts up one, its two images sealed under a key of the photo's own that
+  // the trip key seals, standing in for a picture with random bytes. The host hands back the ciphertext as it came, to every seat of the
+  // trip and to no one else, holds no position in plain, and the images open under the trip key. The photo goes through the key's
+  // replacement and the purge below (on dev, the bucket holds two objects for it until then and none after).
+  const photoOff = { id: gid(), images: { display: Buffer.alloc(40).toString("base64"), thumb: Buffer.alloc(40).toString("base64") }, width: 1, height: 1, thumb: { width: 1, height: 1 }, key: "v1.1.x" };
+  assert.equal((await (await request(sAt(""), "GET", undefined, sealedOwner)).json()).photos, photosOn);
+  if (!photosOn) assert.equal((await request(sAt("/media"), "POST", photoOff, sMember)).status, 403, "photos are off but the host took one");
+  const plainImage = randomBytes(3000), photoId = gid(), photo = photosOn ? await sealPhoto(sTrip, sealedId, 1, photoId, { display: plainImage, thumb: randomBytes(800), location: { lat: 35.6586, lng: 139.7454 } }) : undefined!;
+  let photosAt = "";
+  if (photosOn) {
+    const photoBody = { id: photoId, images: { display: Buffer.from(photo.display).toString("base64"), thumb: Buffer.from(photo.thumb).toString("base64") }, width: 1536, height: 2048, thumb: { width: 300, height: 400 }, capturedAt: "2026-09-25T10:15:00+09:00", key: photo.key, location: photo.location };
+    assert.equal((await request(sAt("/media"), "POST", photoBody, sViewer)).status, 403);
+    assert.equal((await request(sAt("/media"), "POST", photoBody, sMember)).status, 201);
+    for (const cookie of [sMember, sViewer, sealedOwner]) {
+      const got = await request(sAt(`/media/${photoId}/display`), "GET", undefined, cookie); assert.equal(got.status, 200);
+      assert.equal(Buffer.compare(Buffer.from(await got.arrayBuffer()), Buffer.from(photo.display)), 0, "the host did not return the image as it came");
+    }
+    assert.equal((await request(sAt(`/media/${photoId}/thumb`), "GET", undefined, "")).status, 401);
+    assert.equal((await request(sAt(`/media/${photoId}/display`), "GET", undefined, owner)).status, 401, "another trip's seat read the photo");
+    assert.equal((await request(sAt(`/media/${gid()}/display`), "GET", undefined, sMember)).status, 404);
+    const photoView = await (await request(sAt(""), "GET", undefined, sViewer)).text();
+    assert.ok(!photoView.includes("35.6586") && !photoView.includes("139.7454"), "the host returns a plain position of the photo");
+    assert.deepEqual(JSON.parse(photoView).media.map((p: { id: string; mine: boolean; capturedAt: string }) => [p.id, p.mine, p.capturedAt]), [[photoId, false, "2026-09-25T10:15:00+09:00"]]);
+    assert.equal(Buffer.compare(Buffer.from(await openPhotoImage(sTrip, sealedId, photoId, photo.key, "display", photo.display)), plainImage), 0, "the image does not open under the trip key");
+    assert.notEqual(Buffer.compare(Buffer.from(photo.display).subarray(12, 12 + 64), plainImage.subarray(0, 64)), 0);
+    photosAt = stackName === "capsule-host-dev" ? await photoPrefix(sealedId) : "";
+    if (photosAt) assert.equal(await photoObjects(photosAt), 2, "the photo's two images are not the bucket's two objects");
+  }
   const sHistory = await (await request(sAt("/history"), "GET", undefined, sealedOwner)).json() as Array<Record<string, unknown>>;
   assert.deepEqual([sHistory[0]!.event, sHistory[0]!.grant, typeof sHistory[0]!.seat, sHistory[1]!.event, sHistory[1]!.grant], ["sessions", viewerGrant, "string", "grants", viewerGrant]);
   assert.ok(sHistory.slice(0, 2).every(h => !("label" in h) && !("by" in h)), "a sealed trip's history line holds a name");
@@ -423,7 +469,7 @@ try {
   assert.equal((await request(sAt("/revoke"), "POST", { member: keyB.id, confirm: true }, sealedOwner)).status, 200);
   const toReplace = await (await request(sAt(""), "GET", undefined, sealedOwner)).json(), sGrants = await (await request(sAt("/grants"), "GET", undefined, sealedOwner)).json() as Array<{ id: string; label: string; members: Array<{ id: string; label: string }> }>;
   assert.equal(toReplace.rekey, "auto"); assert.equal((await (await request(sAt(""), "GET", undefined, sMember)).json()).rekey, null);
-  const nextKey = await newTripKey(), resealedAll = await resealAll(sTrip, nextKey, sealedId, 2, { spec: toReplace.spec, document: toReplace.document, footprints: toReplace.footprints.map((p: { id: string; point: string; by: string }) => ({ id: p.id, point: p.point, by: p.by })), members: sGrants.flatMap(g => g.members).map(m => ({ id: m.id, label: m.label })), grants: sGrants.map(g => ({ id: g.id, label: g.label })) });
+  const nextKey = await newTripKey(), resealedAll = await resealAll(sTrip, nextKey, sealedId, 2, { spec: toReplace.spec, document: toReplace.document, footprints: toReplace.footprints.map((p: { id: string; point: string; by: string }) => ({ id: p.id, point: p.point, by: p.by })), media: toReplace.media, members: sGrants.flatMap(g => g.members).map(m => ({ id: m.id, label: m.label })), grants: sGrants.map(g => ({ id: g.id, label: g.label })) });
   const reached = await reachableSeats({ id: ownerSeat.id, ed25519: sPub.ed25519 }, toReplace.seats, sealedId);
   assert.deepEqual([...reached].sort(), [ownerSeat.id, keyA.id].sort());
   const rekeyed = await Promise.all(toReplace.seats.filter((x: { id: string }) => reached.has(x.id)).map(async (x: { id: string; x25519: string }) => { const w = await wrapTripKey(nextKey, x.x25519, sealedId, 2); return { seat: x.id, ...w, signature: await signRekey(sSeat.ed25519.privateKey, { capsuleId: sealedId, generation: 2, seat: x.id, x25519: x.x25519, ...w }) }; }));
@@ -434,6 +480,14 @@ try {
   assert.equal(await acceptRekey({ self: { id: keyA.id, ed25519: keyA.pub.ed25519 }, known: 1, capsuleId: sealedId, seats: aView.seats, seatKey: aView.seatKey }), true);
   await assert.rejects(openField(sTrip, sealedId, "spec", "spec", "title", aView.spec.title), "the revoked participant's key of generation 1 opens the new title");
   assert.equal((await request(sAt(""), "GET", undefined, keyB.cookie)).status, 401);
+  // The photo went with it: its key (the one its images are sealed under) is of the new generation, and the image that was never
+  // fetched or put again still opens, under the new trip key.
+  if (photosOn) {
+  const rekeyedPhoto = (await (await request(sAt(""), "GET", undefined, sealedOwner)).json()).media[0];
+  assert.match(rekeyedPhoto.key, /^v1\.2\./);
+  const sameImage = Buffer.from(await (await request(sAt(`/media/${photoId}/display`), "GET", undefined, sealedOwner)).arrayBuffer());
+  assert.equal(Buffer.compare(Buffer.from(await openPhotoImage(nextKey, sealedId, photoId, rekeyedPhoto.key, "display", sameImage)), plainImage), 0, "the photo does not open under the new trip key");
+  }
   if (stackName === "capsule-host-dev") {
     const mine = (await storedPayloads()).find(p => p.includes(`"id":"${sealedId}"`))!, kept = JSON.parse(mine);
     const generations = new Set([...mine.matchAll(/v1\.(\d+)\./g)].map(m => m[1]));
@@ -454,7 +508,10 @@ try {
   assert.equal((await (await request(sAt(""), "GET", undefined, sealedOwner)).json()).rekey, null);
   console.log("trip key replaced: after a member's revocation the owner sealed the trip again under generation 2 (the remaining member reading it, the revoked member's key opening none of it); after recover the new owner was asked and kept the key");
   assert.equal((await request(sAt("/purge"), "POST", { title: "" }, sealedOwner)).status, 200);
-  assert.equal((await request(sAt(""), "GET", undefined, sealedOwner)).status, 410); sealedId = "";
+  assert.equal((await request(sAt(""), "GET", undefined, sealedOwner)).status, 410);
+  if (photosOn) assert.equal((await request(sAt(`/media/${photoId}/display`), "GET", undefined, sealedOwner)).status, 410);
+  if (photosAt) { assert.equal(await photoObjects(photosAt), 0, "the purged trip's photos are still in the bucket"); console.log("photos: put up by a participant, the images returned as they came to every seat and to no other, the photo's key sealed again with the trip's, its objects gone from the bucket with the trip"); }
+  sealedId = "";
   // Moving a plain trip (#694, docs/design/trip-e2e.md §5): a fourth disposable capsule, plain, whose title, an item, a post, the
   // participant's name and an invite's name carry a marker, and where the participant and the owner each leave a point. The owner
   // reads it (GET "", GET seal, GET grants), seals all of it with src/trip-keys.ts sealMove and posts it after the passkey check:

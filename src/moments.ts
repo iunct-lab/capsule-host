@@ -1,8 +1,9 @@
 import type { PhotoAsset } from "./media";
 import { localDay, type Item, type Spec } from "./schema";
+import { wallClock } from "./timing";
 
 // A photo as `GET /v1/c/:id` gives it to the page: who uploaded it stays in the host, the page only learns whether it is its own.
-export type Shown = Omit<PhotoAsset, "contributor"> & { mine: boolean };
+export type Shown = Omit<PhotoAsset, "contributor" | "blob"> & { mine: boolean };
 
 // A photo without a time, or with one that does not read as an instant, sorts after the others and is `unlinked`.
 const taken = (p: Shown) => { const t = +new Date(p.capturedAt ?? NaN); return Number.isFinite(t) ? t : Infinity; };
@@ -33,4 +34,30 @@ export function itemAt(items: Item[], at: number, timezone: string): Item | unde
   let under: Item | undefined;
   for (const i of items) if (i.day === day && i.status !== "cancelled" && i.startsAt !== undefined && +new Date(i.startsAt) <= at && (!under || +new Date(i.startsAt) >= +new Date(under.startsAt!))) under = i;
   return under;
+}
+
+// With photos off (the operator's switch) the page is not shown unless photos are already there, and nothing can be put up; a viewer,
+// a trip whose sharing has ended, a trip that is not sealed and a browser without the key put up nothing either.
+export const photosPageShown = (v: { photos?: boolean; media?: unknown[] }) => Boolean(v.photos || v.media?.length);
+export const photosUploadable = (v: { photos?: boolean; sealed?: unknown; role: string; state: string }, hasKey: boolean) => Boolean(v.photos && v.sealed && hasKey) && v.role !== "viewer" && v.state !== "frozen";
+
+// The time a photo was taken, as the host keeps it: an instant with its offset (it must have one, or `linkPhotos` would read it in
+// the zone of whoever opens the page). An EXIF time with an offset keeps it; one without is the wall clock of the trip's zone.
+export function photoInstant(taken: { local: string; offset?: string }, zone: string): string {
+  if (taken.offset) return `${taken.local}${taken.offset}`;
+  const [day, time] = taken.local.split("T") as [string, string];
+  return new Date(wallClock(day, time.slice(0, 5), zone) + Number(time.slice(6, 8)) * 1000).toISOString();
+}
+
+// The photos by the day they were taken (in the trip's zone), each day in the order they were taken and then uploaded; those with no
+// time that reads as an instant come last, as a group of their own.
+export function photoDays(photos: Shown[], zone: string): { days: Array<{ day: string; photos: Shown[] }>; unknown: Shown[] } {
+  const days = new Map<string, Shown[]>(), unknown: Shown[] = [];
+  for (const p of [...photos].sort(inOrder)) {
+    const at = taken(p);
+    if (at === Infinity) { unknown.push(p); continue; }
+    const day = localDay(at, zone);
+    days.set(day, [...days.get(day) ?? [], p]);
+  }
+  return { days: [...days].sort(([a], [b]) => a < b ? -1 : 1).map(([day, list]) => ({ day, photos: list })), unknown };
 }

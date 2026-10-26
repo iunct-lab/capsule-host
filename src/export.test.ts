@@ -41,8 +41,8 @@ test("tripHtml is the index.html of the ZIP", async () => {
 test("export bytes stay the same", async () => {
   const trip = testTrip(); trip.spec.exports = ["markdown", "json", "ics", "html"];
   const files = await exportFiles("c1", trip.spec, trip.document, "2026-09-20T00:00:00Z");
-  expect(files["manifest.json"]).toBe("{\n  \"schemaVersion\": 1,\n  \"capsuleId\": \"c1\",\n  \"revision\": 1,\n  \"createdAt\": \"2026-09-20T00:00:00Z\",\n  \"files\": {\n    \"README.md\": \"e9cd0c000543c107c37af83b3899bedab0af266a42a63d738416f4c63b5b14ec\",\n    \"trip.json\": \"d61be5adfb82764417d81d9c80352d837309647f7a6b3c1545f7e186ca88f6e3\",\n    \"calendar.ics\": \"4c5063941610e2a6b2f472ca3cd7533a6984d9efcd7c69705166296077472ad2\",\n    \"index.html\": \"cc7055f61e029ad7caa20380e4a92596996aecdbf6c46158e80350827dd66d32\"\n  }\n}");
-  expect(new Bun.CryptoHasher("sha256").update(zip(files)).digest("hex")).toBe("7feef7cc00c9f1ef3b28d0ed4cca1900c8280cbc7c21652b51a49c1d8f5099fe");
+  expect(files["manifest.json"]).toBe("{\n  \"schemaVersion\": 1,\n  \"capsuleId\": \"c1\",\n  \"revision\": 1,\n  \"createdAt\": \"2026-09-20T00:00:00Z\",\n  \"files\": {\n    \"README.md\": \"e9cd0c000543c107c37af83b3899bedab0af266a42a63d738416f4c63b5b14ec\",\n    \"trip.json\": \"a7b56a6a0a1aae62f3f1bf747d536631d11c78f1f598c201e67661d11a395ebd\",\n    \"calendar.ics\": \"4c5063941610e2a6b2f472ca3cd7533a6984d9efcd7c69705166296077472ad2\",\n    \"index.html\": \"cc7055f61e029ad7caa20380e4a92596996aecdbf6c46158e80350827dd66d32\"\n  }\n}");
+  expect(new Bun.CryptoHasher("sha256").update(zip(files)).digest("hex")).toBe("e4d81e7e8e006b5c8e3e2b07961ce593a93ba8799883183cdd036fc8a987b475");
 });
 test("export runs in the browser", async () => {
   const built = await Bun.build({ entrypoints: ["src/export.ts"], target: "browser" });

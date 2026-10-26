@@ -63,6 +63,7 @@ JSON を 1 ファイル。形は次のとおりで、ほかのトップレベル
 | `reflection` | `document.reflections`（旅行後の思い出） | 旅行後に振り返りたい。初期値は空配列 |
 | `trip-map` | 足あとのページ。メンバーはこのページの「ここにいる」で足あとを残し、地図の下の一覧で見て消す。足あとを点で出し、`showTrack` なら同じメンバーの点を時刻の順に線で結ぶ。線は点を結んだもので、実際に通った道ではない。`showPhotos` は使わない（書かない） | 旅行中に足あとを残す |
 | `story` | 日ごとに予定と、足あとから求めた実際の時刻（予定 12:00 / 記録 13:02）、予定になかったところ。旅行後に開くと最初に出る | ほぼ常に入れる |
+| `moments` | 写真のページ。メンバー（閲覧のみを除く）が旅行中に撮った写真を上げ、全員が日ごと・撮影日時の順に見る。写真は旅行の鍵で暗号化して保存し、位置は画像から消して暗号化した写真の情報にだけ残す。`document` には何も入らない（`label` だけ） | 写真を持ち寄りたい。新しい旅行には入る |
 
 - `spec.theme.preset`: `paper`（生成りの紙、既定）/ `postcard`（暖色の背景）/ `minimal`（白い背景）/ `night`（暗い配色。差し色も固定になる）。`accent` は差し色で、`#` + 16 進 6 桁
 - `spec.exports`: `markdown` / `json` / `ics` / `html`。迷ったら 4 つとも
@@ -138,6 +139,7 @@ bun run validate <file>
     "trip": { "startsOn": "2026-11-21", "endsOn": "2026-11-23", "destinations": ["みなと町", "灯台岬"] },
     "modules": [
       { "id": "days", "kind": "day-timeline", "label": "旅程" },
+      { "id": "photos", "kind": "moments", "label": "写真" },
       { "id": "places", "kind": "places", "label": "行くところ" },
       { "id": "ideas", "kind": "suggestion-board", "label": "候補・相談" },
       { "id": "check", "kind": "checklist", "label": "準備", "mode": "shared" },
@@ -145,7 +147,7 @@ bun run validate <file>
       { "id": "notes", "kind": "notes", "label": "旅のメモ" },
       { "id": "memories", "kind": "reflection", "label": "思い出" }
     ],
-    "navigation": ["days", "places", "ideas", "check", "budget", "notes", "memories"],
+    "navigation": ["days", "photos", "places", "ideas", "check", "budget", "notes", "memories"],
     "theme": { "preset": "paper", "accent": "#2f6f8f" },
     "collaboration": { "participantSuggestions": true, "participantComments": true, "participantChecklist": true },
     "lifecycle": { "reflectionDays": 7, "purgeAt": "2026-12-23T00:00:00+09:00" },

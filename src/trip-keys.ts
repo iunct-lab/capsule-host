@@ -126,7 +126,7 @@ export async function verifyEdge(ed25519Public: string, signature: string, other
 // A trip's words, sealed record by record under the trip's key (docs/design/trip-e2e.md §3, §3.1). The associated data
 // names where the words belong, `<capsule id>/<kind>/<record id>/<field>`, so ciphertext moved to another trip, record or
 // field no longer opens. An item's date and times are not in it: the host rewrites them when it places an item (§3).
-export type RecordKind = "spec" | "module" | "heading" | "item" | "suggestion" | "comment" | "reflection" | "checklist" | "budget" | "notes" | "footprint" | "member" | "grant";
+export type RecordKind = "spec" | "module" | "heading" | "item" | "suggestion" | "comment" | "reflection" | "checklist" | "budget" | "notes" | "footprint" | "photo" | "member" | "grant";
 const recordAad = (capsuleId: string, kind: RecordKind, recordId: string, field: string) => text(`${capsuleId}/${kind}/${recordId}/${field}`);
 export async function sealField(key: CryptoKey, capsuleId: string, generation: number, kind: RecordKind, recordId: string, field: string, plain: string): Promise<string> {
   const iv = crypto.getRandomValues(new Uint8Array(12));
@@ -148,6 +148,42 @@ export async function sealPoint(key: CryptoKey, capsuleId: string, generation: n
 export async function openPoint(key: CryptoKey, capsuleId: string, id: string, sealed: string): Promise<PlainPoint | null> {
   try {
     const p = pointSchema.safeParse(JSON.parse(await openField(key, capsuleId, "footprint", id, "point", sealed)));
+    return p.success ? p.data : null;
+  } catch { return null; }
+}
+// A photo (docs/design/trip-e2e.md §3.1, the photo rows). Each image is sealed under a key of the photo's own, a random AES-GCM key
+// that the trip's key seals into the photo's record as `key`: a new trip key seals that one short string again and no image has to
+// come back to the browser (§8). An image is its 12-byte IV, the sealed bytes and the 16-byte tag, the form the host measures
+// (src/media.ts SEALED_OVERHEAD); what names it is the AAD `<capsule id>/photo/<photo id>/<thumb|display>`. The location is one
+// ciphertext of the trip's key, as a footprint's point is, with the accuracy left out when the photo had none.
+export type PhotoSize = "thumb" | "display";
+export const locationSchema = pointSchema.partial({ accuracy: true });
+export type PlainLocation = Omit<PlainPoint, "accuracy"> & { accuracy?: number };
+const imageAad = (capsuleId: string, id: string, size: PhotoSize) => text(`${capsuleId}/photo/${id}/${size}`);
+export async function sealPhoto(key: CryptoKey, capsuleId: string, generation: number, id: string, photo: { display: Uint8Array; thumb: Uint8Array; location?: PlainLocation }) {
+  const raw = crypto.getRandomValues(new Uint8Array(32)), own = await crypto.subtle.importKey("raw", raw, "AES-GCM", false, ["encrypt"]);
+  const image = async (size: PhotoSize, bytes: Uint8Array) => {
+    const iv = crypto.getRandomValues(new Uint8Array(12)), out = new Uint8Array(12 + bytes.length + 16);
+    out.set(iv); out.set(new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv, additionalData: imageAad(capsuleId, id, size) }, own, bytes.slice())), 12);
+    return out;
+  };
+  const place = photo.location && locationSchema.parse(photo.location);
+  return {
+    key: await sealField(key, capsuleId, generation, "photo", id, "key", b64(raw)),
+    display: await image("display", photo.display), thumb: await image("thumb", photo.thumb),
+    ...place && { location: await sealField(key, capsuleId, generation, "photo", id, "location", JSON.stringify(place)) },
+  };
+}
+// The image's bytes, or a throw when the key, the photo or the size is not the one it was sealed for.
+export async function openPhotoImage(key: CryptoKey, capsuleId: string, id: string, sealedKey: string, size: PhotoSize, bytes: Uint8Array): Promise<Uint8Array> {
+  const own = await crypto.subtle.importKey("raw", unb64(await openField(key, capsuleId, "photo", id, "key", sealedKey)), "AES-GCM", false, ["decrypt"]);
+  if (bytes.length < 28) throw new Error("not sealed image");
+  return new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv: bytes.slice(0, 12), additionalData: imageAad(capsuleId, id, size) }, own, bytes.slice(12)));
+}
+// null when it does not open here or is out of range: the screen leaves the photo off the map rather than draw a false place.
+export async function openPhotoLocation(key: CryptoKey, capsuleId: string, id: string, sealed: string): Promise<PlainLocation | null> {
+  try {
+    const p = locationSchema.safeParse(JSON.parse(await openField(key, capsuleId, "photo", id, "location", sealed)));
     return p.success ? p.data : null;
   } catch { return null; }
 }
@@ -414,6 +450,8 @@ export async function acceptRekey(a: { self: { id: string; ed25519: string }; kn
 const isCipher = (v: string) => { try { unpack(v); return true; } catch { return false; } };
 export async function resealAll(oldKey: CryptoKey, newKey: CryptoKey, capsuleId: string, generation: number, t: {
   spec: SealedSpec; document: SealedDocument; footprints: Array<{ id: string; point: string; by: string }>; members: Array<{ id: string; label: string }>; grants: Array<{ id: string; label: string }>;
+  // The photos' sealed parts (src/media.ts PhotoAsset). The images stay as they are: they are sealed under each photo's own key.
+  media?: Array<{ id: string; key: string; location?: string; caption?: string }>;
 }) {
   const opened = await openTrip(oldKey, capsuleId, t);
   if (!opened) throw new Error("旅程を開けません");
@@ -431,6 +469,10 @@ export async function resealAll(oldKey: CryptoKey, newKey: CryptoKey, capsuleId:
   }));
   const members = await Promise.all(t.members.map(async m => ({ id: m.id, label: await name("member", m.id, m.label) })));
   const grants = await Promise.all(t.grants.map(async g => ({ id: g.id, label: await name("grant", g.id, g.label) })));
+  const photoField = async (id: string, field: "key" | "location" | "caption", value: string) => {
+    try { return await sealField(newKey, capsuleId, generation, "photo", id, field, await openField(oldKey, capsuleId, "photo", id, field, value)); } catch { unreadable.push(`photo/${id}`); return ""; }
+  };
+  const media = await Promise.all((t.media ?? []).map(async p => ({ id: p.id, key: await photoField(p.id, "key", p.key), ...p.location && { location: await photoField(p.id, "location", p.location) }, ...p.caption && { caption: await photoField(p.id, "caption", p.caption) } })));
   if (unreadable.length) throw new Error(`開けない記録があります（${new Set(unreadable).size} 件）`);
   const { spec, document } = await sealTrip(newKey, capsuleId, generation, opened);
   // A post keeps the seat that wrote it, which openTrip leaves out.
@@ -438,5 +480,5 @@ export async function resealAll(oldKey: CryptoKey, newKey: CryptoKey, capsuleId:
     const seat = (t.document[list] as Array<{ id: string; seat?: string }>).find(y => y.id === x.id)?.seat;
     if (seat) x.seat = seat;
   }
-  return { spec, document, footprints, members, grants };
+  return { spec, document, footprints, media, members, grants };
 }

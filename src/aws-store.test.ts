@@ -30,3 +30,18 @@ test("list reads the live keys off the expiry index, page after page", async () 
   expect(sent[0]).toMatchObject({ TableName: "table", IndexName: "expiry", KeyConditionExpression: "expiry_kind = :active AND purge_at > :now", ExpressionAttributeValues: { ":active": "active", ":now": 100 } });
   expect(sent[1].ExclusiveStartKey).toEqual({ pk: "b" });
 });
+test("sweep erases the media before the payload and retries when that fails", async () => {
+  const log: string[] = [];
+  const store = new AwsStore("table", { send: async () => ({ Items: [{ pk: "a" }, { pk: "b" }, { pk: "c" }] }) } as unknown as DynamoDBDocumentClient);
+  store.get = async key => ({ key, payload: key === "c" ? null : "{}", version: 1, purge_at: 50, purged_at: null, owner_key: "o" });
+  store.save = async row => { log.push(`save ${row.key}`); return true; };
+  // The one whose photos cannot be removed keeps its payload for the next sweep; the others go on.
+  await store.sweep(100, async key => { log.push(`erase ${key}`); if (key === "a") throw new Error("down"); });
+  expect(log).toEqual(["erase a", "erase b", "save b"]);
+  log.length = 0;
+  await store.sweep(100, async key => { log.push(`erase ${key}`); });
+  expect(log).toEqual(["erase a", "save a", "erase b", "save b"]);
+  // Without a place for photos the rows are emptied as before.
+  log.length = 0; await store.sweep(100);
+  expect(log).toEqual(["save a", "save b"]);
+});

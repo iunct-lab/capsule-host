@@ -17,13 +17,14 @@ Status: adopted, 2026-09-18。利用者がAWSを選択。AWSリソース・契�
 | HTTPS画面配信 | CloudFront + 非公開S3、OAC | 汎用アプリだけを配信。実際の旅行は含めない |
 | API | Lambda Web Function（CloudFront の OAC で呼ぶ）+ Event Function | 通常のTypeScript/Node.jsコード。旅行ごとのプロセスなし |
 | 旅程・権限 | DynamoDB on-demand | 旅行単位のアクセスパターン。条件付き更新・トランザクション |
+| 写真の画像 | 非公開S3（`Media`。Retain・SSE既定・作成から181日で消える規則） | ブラウザが旅行の鍵で暗号化した bytes だけ。1 旅行 500 枚・表示用 1 MiB・サムネイル 150 KiB まで。Web Function が席の Cookie を見て返し、旅行の削除で Host が先に消す |
 | 期限処理 | EventBridge + Lambda | 期限超過データの削除と失敗時の再試行 |
 | 可観測性 | CloudWatch Logs | CloudFrontのアクセスログ（us-east-1。時刻・接続元IP・メソッド・パス・status・応答の大きさ・User-Agent）と、Hostが拒んだ要求の1行（カプセルid・action・status・理由コード）。保持は90日。本文・Cookie・招待secret・題名・クエリは記録しない（`aws/README.md` の「侵害の確認」） |
 | 費用監視 | AWS Budgets、Web Functionの速さ・環境数の上限、Lambda同時実行制限 | 費用通知に加えて実行量も制御 |
 
 利用地域の候補は東京。具体的なアカウント・リージョン・既存サービス利用量が判明してから単価と無料枠共有分を確定する。
 
-将来の写真は非公開S3へ署名付きURLで送信し、サイズ・個数・容量を制限する。通知・大量の出力はSQS/Lambdaへ分離する。これらは初期実装に先回りで作り込まない。画像解析・生成などの有料AIは別の明示的な費用項目とする。
+写真（#437）は非公開S3 `Media` に置く。画像は署名付きURLでなく、Web Function（Lambda）経由で送り・返す（本文は今の2 MiBの上限のまま、1回のPOSTで1枚）ので、CloudFrontの別の経路・署名の鍵・権限判定の2か所化を持たない。サイズ・個数（1 旅行 500 枚）・容量は Host が見る。画像はブラウザが旅行の鍵で暗号化してから上げるので、S3 にあるのは暗号文だけで、運用者は読めない（`docs/design/trip-e2e.md` §3.1。`COSTS-AND-PRIVACY.md` の「写真」）。通知・大量の出力はSQS/Lambdaへ分離する。これらは初期実装に先回りで作り込まない。画像解析・生成などの有料AIは別の明示的な費用項目とする。
 
 ## 移行上の注意
 

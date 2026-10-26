@@ -70,6 +70,18 @@ test("story: a story module is accepted", () => {
   expect(check(trip, now)).toMatchObject({ ok: true });
 });
 
+test("a moments module is accepted and a trip without one still validates", () => {
+  const trip = testTrip();
+  expect(trip.spec.modules.some(m => m.kind === "moments")).toBe(true);
+  expect(check(trip, now)).toMatchObject({ ok: true });
+  const without = testTrip();
+  without.spec.modules = without.spec.modules.filter(m => m.kind !== "moments"); without.spec.navigation = without.spec.navigation.filter(id => id !== "photos");
+  expect(check(without, now)).toMatchObject({ ok: true });
+  // Only a label: a setting of any other name is refused, as for every other page.
+  const extra = testTrip(); extra.spec.modules[1] = { ...extra.spec.modules[1]!, columns: 3 } as never;
+  expect(check(extra, now).ok).toBe(false);
+});
+
 test("an item's place may carry a latitude and longitude, both or neither", () => {
   const tripWith = (place: object) => { const t = testTrip(); t.document.items[0]!.place = place as never; return t; };
   const withPlace = (place: object) => failed(tripWith(place));

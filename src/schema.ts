@@ -26,6 +26,7 @@ const modulesOf = <L extends z.ZodTypeAny>(label: L) => z.discriminatedUnion("ki
   z.object({ id: identifier, kind: z.literal("reflection"), label }).strict(),
   z.object({ id: identifier, kind: z.literal("trip-map"), label, showPhotos: z.boolean().optional(), showTrack: z.boolean() }).strict(),
   z.object({ id: identifier, kind: z.literal("story"), label }).strict(),
+  z.object({ id: identifier, kind: z.literal("moments"), label }).strict(),
 ]);
 // The rules on a Spec's plain parts, the same for a plain and a sealed trip.
 type SpecPlain = { modules: Array<{ id: string }>; navigation: string[]; trip: { startsOn: string; endsOn: string }; lifecycle: { purgeAt: string } };

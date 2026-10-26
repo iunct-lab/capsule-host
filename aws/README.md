@@ -25,7 +25,7 @@ sam validate --lint --template-file aws/template.yaml
 sam deploy --template-file aws/template.yaml --stack-name $STACK --resolve-s3 --capabilities CAPABILITY_IAM --region ap-northeast-1 --profile YOUR_PROFILE --parameter-overrides WebCodeBucket=$BUCKET WebCodeVersion=$VERSION --no-execute-changeset
 ```
 
-変更セットで、テーブル（`Data`）・`Assets` バケットが置き換え・削除になっていないことを見る。**以前の経路（`/v1/*` を別のゲートウェイ越しに受けていた版）の既存スタック（prod）を初めてこの template に更新するときは、その前に利用者に聞く**: 更新で古いアクセスログ群（`/capsule-host/<スタック名>/api`、直近 90 日ぶんの侵害確認の証跡）がスタックと一緒に消える（dev は架空データだけなので消えた）。残すなら、配置の前に `aws logs create-export-task` で S3 に書き出すか、そのロググループに `DeletionPolicy: Retain` を付けた中間の template を 1 回通す。配信ログ（新しい `cdn`）は配置の後から溜まり、前のぶんは入らない。dev で既存のスタックを更新したときは約 6 分で終わった（#679）。Web Function は空の環境変数を受けない（変更セットの作成が止まる）ので、空が正しい `ClaimCountries`・`DisabledActions` は、空のときは変数を付けない作りになっている。
+変更セットで、テーブル（`Data`）・`Assets` バケット・`Media` バケットが置き換え・削除になっていないことを見る。`Media`（写真の置き場。下の「写真の置き場」）を足す配置では、変更セットは `Media` の追加、`Host` と `WebRole` の IAM の追加、2 つの関数の環境変数 `CAPSULE_MEDIA_BUCKET` の追加だけのはず。dev では先に `aws/dev-agent.yaml` を管理者の SSO で配置し直す（実行ロールと境界が `capsule-host-dev-media-*` を許すようにする。次の節）。**以前の経路（`/v1/*` を別のゲートウェイ越しに受けていた版）の既存スタック（prod）を初めてこの template に更新するときは、その前に利用者に聞く**: 更新で古いアクセスログ群（`/capsule-host/<スタック名>/api`、直近 90 日ぶんの侵害確認の証跡）がスタックと一緒に消える（dev は架空データだけなので消えた）。残すなら、配置の前に `aws logs create-export-task` で S3 に書き出すか、そのロググループに `DeletionPolicy: Retain` を付けた中間の template を 1 回通す。配信ログ（新しい `cdn`）は配置の後から溜まり、前のぶんは入らない。dev で既存のスタックを更新したときは約 6 分で終わった（#679）。Web Function は空の環境変数を受けない（変更セットの作成が止まる）ので、空が正しい `ClaimCountries`・`DisabledActions` は、空のときは変数を付けない作りになっている。
 
 CloudFront のアクセスログ（下の「侵害の確認（ログ）」）は、**us-east-1** に別のスタック（`aws/edge-logs.yaml`）として配置する（CloudFront のログの配信先がそこにしか作れない）。スタックができて配信（`DistributionId` 出力）が決まったあとに 1 回:
 
@@ -51,7 +51,7 @@ AssetsBucket出力で指定された非公開S3へ `dist/public/` の6ファイ�
 | 許す | 許さない |
 |---|---|
 | `capsule-host-dev` の変更セットの作成・実行（実行ロール `capsule-host-agent-dev-cfn` を渡すときだけ）、SAM の変換 | `capsule-host-prod` とほかのスタック、`capsule-host-agent-dev` 自身、取り込み（import）の変更セット |
-| このスタックの成果物バケット・`capsule-host-dev-code-*`・`capsule-host-dev-assets-*` への put、dev の配信の無効化 | prod のバケット・配信 |
+| このスタックの成果物バケット・`capsule-host-dev-code-*`・`capsule-host-dev-assets-*` への put、`capsule-host-dev-media-*` の一覧（`aws/verify.ts` が purge 後の写真の残りを数える。中身は読まない）、dev の配信の無効化 | prod のバケット・配信 |
 | `capsule-host-dev-*` の関数の invoke・get、テーブルの scan、dev のログ群の読み取り（`aws/verify.ts`・`aws/verify-expiry.ts`・`aws/invoke.ts` が呼ぶもの） | prod の関数・テーブル・ログ群 |
 | IAM は実行ロールを CloudFormation に渡すことだけ | IAM のロール・ユーザー・アクセスキー・ポリシーの作成と変更 |
 
@@ -80,6 +80,12 @@ sam deploy --template-file aws/template.yaml --stack-name capsule-host-dev --rol
 for r in $(aws iam list-roles --profile YOUR_PROFILE --query "Roles[?starts_with(RoleName,'capsule-host-dev-')].RoleName" --output text); do
   aws iam get-role --role-name $r --profile YOUR_PROFILE --query '[Role.RoleName,Role.PermissionsBoundary.PermissionsBoundaryArn]' --output text; done   # 全部に境界
 ```
+
+### 写真の置き場（`Media`）
+
+**写真は既定で無効**で、スタックのパラメータ `Photos`（`'0'` が既定、`'1'` で有効）が Host と Web の `CAPSULE_PHOTOS` になる。有効にするのは、機微な情報が増えうること・費用がかさむことを検討して決めてから（`sam deploy` に `--parameter-overrides Photos=1`）。無効のあいだ `Media` は空で費用は出ず、`aws/verify.ts` は写真の場面を走らせず、Host が断ることだけを確かめる（有効のスタックでは全部走る）。
+
+メンバーが上げた写真の画像は、旅行の鍵で暗号化した bytes（表示用とサムネイルの 2 つ）のまま、スタックの非公開 S3 バケット `Media` に置く（`src/aws-media.ts`。設計: `docs/design/trip-e2e.md` §3.1、要望 #436）。バケットは公開を全部ブロックし、CloudFront の経路も署名付き URL も持たない。画像は `/v1/c/<id>/media/<写真の id>/(thumb|display)` を Web Function が Cookie の席で判定して返す（応答は `private, max-age=3600`）。キーは `<カプセルの行のキー>/<アップロードごとの名前>.(thumb|display)` で、旅行の削除（オーナーの完全削除・運用者の terminate・期限の sweep）は、行を空にする前にその prefix を消す。消せなければ行を残して次の sweep でやり直す。バケットの 181 日の有効期限は、その歯止め（旅行は作成から 180 日までなので、消し漏れがあっても 181 日で消える）で、削除の正は Host の `removeAll`。中身が暗号文なので、S3 の暗号化（SSE）は運用者に対する守りではなく既定のまま。`DeletionPolicy: Retain` なので、スタックを消してもバケットは残る（中身が空であることを確かめて手で消す）。`aws/verify.ts` は、dev で、写真を上げ → 上げた暗号文がそのまま返る → 鍵を替えても開ける → purge の後にその prefix のオブジェクトが 0 件、を確かめる（バケット名と prefix は出力しない）。
 
 ### 足あとの地図の背景（地図データ）
 

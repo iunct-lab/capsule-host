@@ -38,6 +38,11 @@ Parameters:
     Default: ''
     AllowedPattern: '(20[0-9]{2}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z)?'
     Description: When the new screen was out everywhere (docs/development-and-release.md). A trip published at or after it cannot be used until its owner moves it to the sealed form; empty means not started
+  Photos:
+    Type: String
+    Default: '0'
+    AllowedValues: ['0', '1']
+    Description: '1 lets members put photos up. Off by default: photos are more to keep private and cost more, so it is turned on only when decided (aws/README.md, the photos bucket)'
   AssistModel:
     Type: String
     Default: claude-haiku-5-5
@@ -115,8 +120,10 @@ Resources:
           CAPSULE_CLAIM_COUNTRIES: !Ref ClaimCountries
           CAPSULE_DISABLED_ACTIONS: !Ref DisabledActions
           CAPSULE_SEALED_FROM: !Ref SealedFrom
+          CAPSULE_PHOTOS: !Ref Photos
           CAPSULE_ASSIST_MODEL: !Ref AssistModel
           CAPSULE_KEY_PREFIX: !Sub '/capsule-host/${AWS::StackName}/creator-key'
+          CAPSULE_MEDIA_BUCKET: !Ref Media
       Policies:
         - Version: '2012-10-17'
           Statement:
@@ -131,6 +138,13 @@ Resources:
             - Effect: Allow
               Action: ["ssm:GetParametersByPath"]
               Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/capsule-host/${AWS::StackName}/creator-key'
+            # A trip's photos, sealed by the browsers: the sweep and the operator's terminate take a trip's prefix away (src/aws-media.ts).
+            - Effect: Allow
+              Action: ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"]
+              Resource: !Sub '${Media.Arn}/*'
+            - Effect: Allow
+              Action: ["s3:ListBucket"]
+              Resource: !GetAtt Media.Arn
       Events:
         Cleanup:
           Type: Schedule
@@ -167,6 +181,13 @@ Resources:
               - Effect: Allow
                 Action: ["lambda:InvokeFunction"]
                 Resource: !GetAtt Host.Arn
+              # The photos a member puts up, reads and takes out, and a trip's whole prefix when it is deleted.
+              - Effect: Allow
+                Action: ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"]
+                Resource: !Sub '${Media.Arn}/*'
+              - Effect: Allow
+                Action: ["s3:ListBucket"]
+                Resource: !GetAtt Media.Arn
   WebLogs:
     Type: AWS::Logs::LogGroup
     Properties:
@@ -204,9 +225,11 @@ Resources:
           CAPSULE_CLAIM_COUNTRIES: !If [HasClaimCountries, !Ref ClaimCountries, !Ref AWS::NoValue]
           CAPSULE_DISABLED_ACTIONS: !If [HasDisabledActions, !Ref DisabledActions, !Ref AWS::NoValue]
           CAPSULE_SEALED_FROM: !If [HasSealedFrom, !Ref SealedFrom, !Ref AWS::NoValue]
+          CAPSULE_PHOTOS: !Ref Photos
           CAPSULE_ASSIST_MODEL: !Ref AssistModel
           CAPSULE_KEY_PREFIX: !Sub '/capsule-host/${AWS::StackName}/creator-key'
           CAPSULE_EVENT_FUNCTION: !Ref Host
+          CAPSULE_MEDIA_BUCKET: !Ref Media
     DependsOn: [WebLogsLocal]
   WebEndpoint:
     Type: AWS::Lambda::WebFunctionEndpoint
@@ -247,6 +270,21 @@ Resources:
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+  # Photos, as the members' browsers sealed them under the trip's key (docs/design/trip-e2e.md §3.1): only ciphertext, so the bucket's own
+  # encryption is no protection from the operator, only the default. No public access and no CloudFront route: the Web Function reads it for
+  # a seat. A trip's photos are removed with the trip (src/cloud-host.ts); 181 days is a day more than the longest a trip lives, the last resort.
+  Media:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      PublicAccessBlockConfiguration: { BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      LifecycleConfiguration:
+        Rules:
+          - { Id: last-resort, Status: Enabled, ExpirationInDays: 181, AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 } }
   Access:
     Type: AWS::CloudFront::OriginAccessControl
     Properties:
@@ -270,7 +308,7 @@ Resources:
           StrictTransportSecurity: { AccessControlMaxAgeSec: 31536000, Override: true }
           ContentSecurityPolicy:
             Override: true
-            ContentSecurityPolicy: "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' https://api.anthropic.com; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+            ContentSecurityPolicy: "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self' https://api.anthropic.com; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
         CustomHeadersConfig:
           Items:
             - { Header: X-Robots-Tag, Value: "noindex, nofollow", Override: true }
@@ -347,6 +385,7 @@ Resources:
 Outputs:
   Origin: { Value: !Sub 'https://${Cdn.DomainName}' }
   AssetsBucket: { Value: !Ref Assets }
+  MediaBucket: { Value: !Ref Media }
   FunctionName: { Value: !Ref Host }
   DistributionId: { Value: !Ref Cdn }
   WebEndpoint: { Value: !Sub 'https://${WebEndpoint.DomainName}' }

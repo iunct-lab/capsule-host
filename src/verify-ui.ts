@@ -21,7 +21,7 @@ import { openField } from "./trip-keys";
 // the owner and participant have no such header entry. The editor's 共有・管理 hands out and revokes viewer invites only, and
 // the owner sees who handed each out; a participant has no 共有・管理.
 // Last, the trip sealed under the trip's key from the owner's page (#691): drawn from what the page opens, "＋", the grip, a promoted
-// suggestion, no 旅を保存 or チャットで直す, and a purge with another title not sent.
+// suggestion, no 旅を保存 or チャットで直す, photos put up from the participant's page and shown to the viewer (#447), and a purge with another title not sent.
 // Then, on trips of their own, a plain trip moved by its owner (#694) and the trip key replaced by the owner's page after a member
 // left (#695): revoked, reached only through the revoked one, or past an invite's end; and the new owner after the owner invite was
 // handed over asked whether to replace it, the hand-over stopped while no other seat holds the key, and a seat made again kept.
@@ -1599,6 +1599,103 @@ async function sealed() {
   assert.deepEqual(await owner.evaluate(`(async () => { const t = await (await vfetch("/v1/c/${capsuleId}")).text(), v = JSON.parse(t);
     return [["35.6586", "139.7454", "35.6812", "139.7671", "35.6852"].filter(w => t.includes(w)), v.footprints.every(p => /^v1\.1\./.test(p.point) && /^v1\.1\./.test(p.by) && !("lat" in p))]; })()`), [[], true], "the host holds a plain point of the sealed trip");
   await nextMinute();
+  // (t2) #447: 写真 of the sealed trip. The participant, the owner and then the viewer's pages: pictures made in the page (a canvas)
+  // get the EXIF of a phone's camera put in by this script (a time and a place; and the turn a phone writes for a portrait, Orientation
+  // 6) and go up by the file field. They lay out by when they were taken, the viewer has no field to add one, the images the screen
+  // shows have no EXIF and the portrait stands upright, what the host holds is ciphertext, and 消す is the uploader's and the owner's
+  // (an editor's is the host's test). The 375px page does not run off the side.
+  const tripDay = day.replaceAll("-", ":");
+  assert.equal(await owner.evaluate(`(async () => (await (await vfetch("/v1/c/${capsuleId}")).json()).photos)()`), true, "verify:ui の写真の場面は、写真を有効にした host（CAPSULE_PHOTOS=1 の bun run dev）に向けてください");
+  const jpegIn = (p: NonNullable<typeof owner>, width: number, height: number) => p.evaluate(`(async () => { const c = document.createElement("canvas"); c.width = ${width}; c.height = ${height}; const x = c.getContext("2d");
+    x.fillStyle = "#3a7"; x.fillRect(0, 0, ${width}, ${height}); x.fillStyle = "#e83"; x.fillRect(0, 0, ${width} / 2, ${height} / 2);
+    const u = new Uint8Array(await (await new Promise(r => c.toBlob(r, "image/jpeg", 0.9))).arrayBuffer()); let s = ""; for (const v of u) s += String.fromCharCode(v); return btoa(s); })()`) as Promise<string>;
+  // An EXIF APP1 (little endian): IFD0 with the turn and pointers, the Exif IFD with DateTimeOriginal and its offset, a GPS IFD.
+  const exifOf = (a: { orientation?: number; taken: string; offset: string; gps?: { lat: number; lng: number } }) => {
+    type Entry = { tag: number; type: number; count: number; bytes: number[] };
+    const u16 = (n: number) => [n & 255, n >> 8], u32 = (n: number) => [n & 255, (n >> 8) & 255, (n >> 16) & 255, n >>> 24];
+    const ascii = (s: string): Entry["bytes"] => [...Buffer.from(s + "\0")], rationals = (v: Array<[number, number]>) => v.flatMap(([n, d]) => [...u32(n), ...u32(d)]);
+    const ifd = (entries: Entry[], at: number) => {
+      const head = [...u16(entries.length)], tail: number[] = [], tailAt = at + 2 + entries.length * 12 + 4;
+      for (const e of entries) {
+        head.push(...u16(e.tag), ...u16(e.type), ...u32(e.count));
+        if (e.bytes.length <= 4) head.push(...e.bytes, ...Array(4 - e.bytes.length).fill(0));
+        else { head.push(...u32(tailAt + tail.length)); tail.push(...e.bytes, ...(e.bytes.length % 2 ? [0] : [])); }
+      }
+      return [...head, 0, 0, 0, 0, ...tail];
+    };
+    const degrees = (v: number): Array<[number, number]> => { const d = Math.floor(Math.abs(v)), m = Math.floor((Math.abs(v) - d) * 60), s = Math.round(((Math.abs(v) - d) * 60 - m) * 60 * 10000); return [[d, 1], [m, 1], [s, 10000]]; };
+    const size0 = 2 + 12 * (1 + (a.orientation ? 1 : 0) + (a.gps ? 1 : 0)) + 4, exifAt = 8 + size0;
+    const exif = (at: number) => ifd([{ tag: 0x9003, type: 2, count: 20, bytes: ascii(a.taken) }, { tag: 0x9011, type: 2, count: 7, bytes: ascii(a.offset) }], at);
+    const gpsAt = exifAt + exif(exifAt).length;
+    const gps = a.gps && ifd([{ tag: 1, type: 2, count: 2, bytes: ascii(a.gps.lat < 0 ? "S" : "N") }, { tag: 2, type: 5, count: 3, bytes: rationals(degrees(a.gps.lat)) }, { tag: 3, type: 2, count: 2, bytes: ascii(a.gps.lng < 0 ? "W" : "E") }, { tag: 4, type: 5, count: 3, bytes: rationals(degrees(a.gps.lng)) }], gpsAt);
+    const root = ifd([...a.orientation ? [{ tag: 0x0112, type: 3, count: 1, bytes: u16(a.orientation) }] : [], { tag: 0x8769, type: 4, count: 1, bytes: u32(exifAt) }, ...gps ? [{ tag: 0x8825, type: 4, count: 1, bytes: u32(gpsAt) }] : []], 8);
+    const tiff = [0x49, 0x49, 42, 0, 8, 0, 0, 0, ...root, ...exif(exifAt), ...gps ?? []];
+    const payload = [...Buffer.from("Exif\0\0"), ...tiff];
+    return Uint8Array.from([0xff, 0xe1, ...[(payload.length + 2) >> 8, (payload.length + 2) & 255], ...payload]);
+  };
+  const withExif = (b64: string, exif: Uint8Array) => { const jpeg = Buffer.from(b64, "base64"); return Buffer.concat([jpeg.subarray(0, 2), exif, jpeg.subarray(2)]).toString("base64"); };
+  const photoTab = async (p: NonNullable<typeof owner>) => { await p.evaluate(`document.querySelector('[data-action="tab"][data-tab="photos"]').click()`); await p.until(`[...document.querySelectorAll("h2")].some(h => h.textContent === "旅の写真")`); await p.evaluate(`document.querySelector(".content").scrollIntoView()`); };
+  const attach = (p: NonNullable<typeof owner>, files: Array<{ name: string; b64: string }>) => p.evaluate(`(() => { const dt = new DataTransfer(); for (const f of ${JSON.stringify(files)}) dt.items.add(new File([Uint8Array.from(atob(f.b64), c => c.charCodeAt(0))], f.name, { type: "image/jpeg" }));
+    const i = document.querySelector('input[data-upload="photos"]'); i.files = dt.files; i.dispatchEvent(new Event("change", { bubbles: true })); return true; })()`);
+  const photoIds = `[...document.querySelectorAll(".photo")].map(b => b.dataset.id)`, photoRecords = `(async () => (await (await vfetch("/v1/c/${capsuleId}")).json()).media)()`;
+  const loaded = (n: number) => `document.querySelectorAll("img[data-thumb]").length === ${n} && [...document.querySelectorAll("img[data-thumb]")].every(i => i.complete && i.naturalWidth > 0)`;
+  const landscape = withExif(await jpegIn(reader, 640, 480), exifOf({ taken: `${tripDay} 10:15:00`, offset: "+09:00", gps: { lat: 35.6586, lng: 139.7454 } }));
+  const portrait = withExif(await jpegIn(reader, 640, 480), exifOf({ orientation: 6, taken: `${tripDay} 09:05:00`, offset: "+09:00" }));
+  const ownerPhoto = withExif(await jpegIn(owner, 480, 480), exifOf({ taken: `${tripDay} 11:30:00`, offset: "+09:00" }));
+  const viewer = await takeKey("viewer");
+  // The participant puts two up (the later first); the viewer's page, opened after, shows both thumbnails, the earlier one first, and has no field.
+  await reader.reload(); await photoTab(reader);
+  assert.equal(await reader.evaluate(`!!document.querySelector('input[data-upload="photos"]')`), true);
+  await attach(reader, [{ name: "a.jpg", b64: landscape }, { name: "b.jpg", b64: portrait }]);
+  await reader.until(`${message} === "2 枚を上げました。" && ${loaded(2)}`, 30000);
+  const records = await reader.evaluate(photoRecords) as Array<{ id: string; capturedAt: string; location?: string; width: number; height: number; mine: boolean }>;
+  assert.equal(records.length, 2);
+  const byTime = [...records].sort((x, y) => +new Date(x.capturedAt) - +new Date(y.capturedAt)).map(r => r.id);
+  assert.deepEqual(await reader.evaluate(photoIds), byTime);
+  const [turned, flat] = [records.find(r => r.height > r.width)!, records.find(r => r.width >= r.height)!];
+  assert.ok(turned && flat, "the portrait (Orientation 6) was not kept upright");
+  assert.equal(flat.capturedAt, `${day}T10:15:00+09:00`); assert.match(flat.location!, /^v1\.1\./); assert.equal(turned.location, undefined);
+  await viewer.reload(); await photoTab(viewer); await viewer.until(loaded(2), 30000);
+  assert.deepEqual(await viewer.evaluate(photoIds), byTime);
+  assert.equal(await viewer.evaluate(`!!document.querySelector('input[data-upload="photos"]')`), false);
+  // What the screen shows has no EXIF (the page drew it again), and the portrait stands upright: the image the screen opens is taller than wide.
+  // The page's policy lets it fetch nothing but its own host (and Anthropic), so the bytes of a blob: image are read from the Blob the
+  // page made: `URL.createObjectURL` is wrapped before the photo is opened, and keeps each Blob by its URL.
+  const shown = (p: NonNullable<typeof owner>, pid: string) => p.evaluate(`(async () => { if (!window.blobs) { window.blobs = new Map(); const make = URL.createObjectURL.bind(URL); URL.createObjectURL = b => { const u = make(b); window.blobs.set(u, b); return u; }; }
+    document.querySelector('.photo[data-id="${pid}"]').click(); await new Promise(ok => { const t = setInterval(() => { const i = document.querySelector("#dialog img[data-display]"); if (i && i.complete && i.naturalWidth > 0) { clearInterval(t); ok(); } }, 50); });
+    const i = document.querySelector("#dialog img[data-display]"), b = new Uint8Array(await window.blobs.get(i.src).arrayBuffer());
+    return { w: i.naturalWidth, h: i.naturalHeight, jpeg: b[0] === 255 && b[1] === 216, exif: new TextDecoder("latin1").decode(b).includes("Exif"), url: i.src.slice(0, 5), remove: !!document.querySelector('#dialog [data-action="photo-remove"]'), where: !![...document.querySelectorAll("#dialog a")].find(a => a.textContent.includes("地図")) }; })()`) as Promise<{ w: number; h: number; jpeg: boolean; exif: boolean; url: string; remove: boolean; where: boolean }>;
+  const closeDialog = (p: NonNullable<typeof owner>) => p.evaluate(`document.querySelector('#dialog [data-action="close"]').click()`);
+  const upright = await shown(viewer, turned.id);
+  assert.deepEqual([upright.jpeg, upright.exif, upright.url, upright.w < upright.h, upright.remove, upright.where], [true, false, "blob:", true, false, false]);
+  await closeDialog(viewer);
+  // A photo opened and closed before its image is ready, and another opened at once: the first one's late image does not take the second's.
+  await viewer.evaluate(`(() => { document.querySelector('.photo[data-id="${turned.id}"]').click(); setTimeout(() => document.querySelector('#dialog [data-action="close"]')?.click(), 0); setTimeout(() => document.querySelector('.photo[data-id="${flat.id}"]').click(), 5); return true; })()`);
+  await viewer.until(`(() => { const i = document.querySelector("#dialog img[data-display]"); return !!i && i.complete && i.naturalWidth > 0 && i.naturalWidth > i.naturalHeight; })()`, 20000);
+  await closeDialog(viewer);
+  const place = await shown(viewer, flat.id); assert.deepEqual([place.jpeg, place.exif, place.where, place.w > place.h], [true, false, true, true]); await closeDialog(viewer);
+  // The host holds ciphertext: the image is no JPEG and has no EXIF, the position is not in the trip, the time is.
+  assert.deepEqual(await viewer.evaluate(`(async () => { const text = await (await vfetch("/v1/c/${capsuleId}")).text(); const b = new Uint8Array(await (await vfetch("/v1/c/${capsuleId}/media/${flat.id}/display")).arrayBuffer());
+    return [b[0] === 255 && b[1] === 216, new TextDecoder("latin1").decode(b).includes("Exif"), text.includes("35.6586") || text.includes("139.7454"), text.includes("${day}T10:15:00+09:00")]; })()`), [false, false, false, true]);
+  // 消す: the participant has it for their own and not for another's; the owner's photo is the owner's and an editor's to take out.
+  await owner.reload(); await photoTab(owner); await attach(owner, [{ name: "c.jpg", b64: ownerPhoto }]);
+  await owner.until(`${message} === "1 枚を上げました。" && ${loaded(3)}`, 30000);
+  await owner.size(375, 812, true); assert.equal(await owner.evaluate(`document.documentElement.scrollWidth <= 375`), true, "the photos page runs off the side at 375px"); await owner.size(390, 844, true);
+  // The viewer's page, still on 写真, is redrawn by the 20-second refresh with the photo another member put up (photos move no revision).
+  await viewer.until(`${photoIds}.length === 3`, 30000);
+  const ownerId = ((await owner.evaluate(photoRecords)) as Array<{ id: string; mine: boolean }>).find(r => r.mine)!.id;
+  await reader.reload(); await photoTab(reader); await reader.until(loaded(3), 30000);
+  assert.equal((await shown(reader, ownerId)).remove, false); await closeDialog(reader);
+  assert.equal((await shown(reader, flat.id)).remove, true);
+  await reader.evaluate(`document.querySelector('#dialog [data-action="photo-remove"]').click()`);
+  assert.equal(await reader.evaluate(`document.querySelector('#dialog [data-action="photo-remove"]').textContent`), "もう一度押すと消します"); assert.equal((await reader.evaluate(photoRecords) as unknown[]).length, 3);
+  await reader.evaluate(`document.querySelector('#dialog [data-action="photo-remove"]').click()`); await reader.until(`${message} === "写真を消しました。" && ${photoIds}.length === 2`, 20000);
+  assert.equal((await viewer.evaluate(`(async () => (await vfetch("/v1/c/${capsuleId}/media/${flat.id}/display", { cache: "reload" })).status)()`)), 404);  // not the copy the page may keep for an hour
+  await owner.reload(); await photoTab(owner); await owner.until(loaded(2), 30000);
+  assert.equal((await shown(owner, turned.id)).remove, true);
+  await owner.evaluate(`document.querySelector('#dialog [data-action="photo-remove"]').click()`); await owner.evaluate(`document.querySelector('#dialog [data-action="photo-remove"]').click()`);
+  await owner.until(`${message} === "写真を消しました。" && ${photoIds}.length === 1`, 20000);
+  await viewer.until(`${photoIds}.length === 1`, 30000);  // and by the removals
   // (u) #693: 招待とメンバー and the history of the sealed trip, from what the owner's page opens. (1) Opened, it shows every
   // member's and invite's name opened, and the names the host gave the seats are put back sealed. (2) The participant renamed
   // 暗号化確認さん shows so, the host holding no such word. (3) An invite 暗号化確認用 issued makes the history's first line as in
@@ -1642,6 +1739,8 @@ async function sealed() {
   await owner.until(`![...document.querySelectorAll("#dialog .member")].some(m => m.textContent.startsWith("暗号化確認さん · "))`);
   // That seat held the key, so the owner's page replaced it (#695): the trip is of generation 2 from here on.
   assert.equal(await owner.evaluate(`(async () => (await (await vfetch("/v1/c/${capsuleId}")).json()).sealed.generation)()`), 2, "the key was not replaced after a seat holding it was revoked");
+  // …and the photo that was there went with it: its key (the one that opens its images) is of generation 2, the images as they were (#447).
+  assert.deepEqual(await owner.evaluate(`(async () => (await (await vfetch("/v1/c/${capsuleId}")).json()).media.map(p => /^v1\\.2\\./.test(p.key)))()`), [true], "the photo's key was not sealed again with the new trip key");
   await owner.evaluate(`document.querySelector('#dialog [data-action="close"]').click()`); await manageOpen();
   assert.match(await owner.evaluate(`(() => { document.querySelector("#dialog details.history").open = true; return document.querySelector("#dialog details.history li").textContent; })()`) as string, / · メンバーを失効 · 参加者 · （失効したメンバー） · オーナー（[^（）]+）$/);
   await owner.evaluate(`document.querySelector('#dialog [data-action="close"]').click()`);
@@ -1833,7 +1932,7 @@ async function sealed() {
   assert.equal((await fetch(`${origin}/v1/c/${capsuleId}`)).status, 401, "the capsule is still there (401 without a cookie)");
   await owner.evaluate(`document.querySelector('#dialog [data-action="close"]').click()`);
   await owner.reload(); await owner.evaluate(answerYes);
-  console.log("Sealed trip verification: sealed from the page (no plain word held by the host), drawn the same, \"＋\" at the offered time, moved by the grip, a change by the 20-second refresh opened (not drawn as ciphertext), a suggestion promoted last of its day, a 準備 line that does not open counted with no edit of the whole list (and named in 旅を保存), 旅を保存 made by the page (the trip page, the Markdown and the ZIP the host gave for the same trip while plain, none asked of the host; for a participant who took the key, the page and the Markdown without a ZIP), チャットで直す made by the page (the host's text and diff of the same trip while plain, a large change's other title not sent, applied and gone back by the owner, an editor's change of the title left out and the owner's change of settings not gone back by an editor, an http link and a paste past 200,000 bytes refused, no GET revise or revise/check asked, no new word sent or held in plain), ここで直す from the page to Anthropic (answered by CDP: the key checked there and kept wrapped, the trip and the request sent with it, the answer applied through the same diff, none of them sent to or held by the host, no other outside origin), no チャットで直す while a record does not open, a purge with another title not sent");
+  console.log("Sealed trip verification: sealed from the page (no plain word held by the host), drawn the same, \"＋\" at the offered time, moved by the grip, a change by the 20-second refresh opened (not drawn as ciphertext), a suggestion promoted last of its day, a 準備 line that does not open counted with no edit of the whole list (and named in 旅を保存), 旅を保存 made by the page (the trip page, the Markdown and the ZIP the host gave for the same trip while plain, none asked of the host; for a participant who took the key, the page and the Markdown without a ZIP), チャットで直す made by the page (the host's text and diff of the same trip while plain, a large change's other title not sent, applied and gone back by the owner, an editor's change of the title left out and the owner's change of settings not gone back by an editor, an http link and a paste past 200,000 bytes refused, no GET revise or revise/check asked, no new word sent or held in plain), ここで直す from the page to Anthropic (answered by CDP: the key checked there and kept wrapped, the trip and the request sent with it, the answer applied through the same diff, none of them sent to or held by the host, no other outside origin), no チャットで直す while a record does not open, 写真 (two pictures with a camera's EXIF put up from the participant's page, laid out by the time taken with the portrait upright, none of the viewer's page's field, no EXIF in what the screen shows and ciphertext at the host with no position, 消す by its uploader and the owner and not another's, nothing off the side at 375px), a purge with another title not sent");
   // (w) #842: the top page forgets a trip it lists that is past its deletion, with what this browser kept for it, without the trip
   // being opened, and after another trip's page wrote the list back first; the live trip stays listed with its keys.
   const pastId = "0".repeat(32);

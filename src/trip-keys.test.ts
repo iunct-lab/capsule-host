@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { open, seal } from "./private-entries";
 import { testTrip } from "./test-fixture";
 import { sealedOperationSchema, type Document } from "./schema";
-import { confirmationCodes, openField, openName, openPoint, openTrip, sealField, sealName, sealPoint, resealTrip, sealOperation, sealTrip, sealMove, matchesCommitment, newAttempt, newHandoffKeys, newSeatKeys, newTripKey, signEdge, verifyEdge, seatPublic, unwrapSeatSecret, unwrapTripKey, wrapSeatSecret, wrapTripKey, acceptRekey, reachableSeats, resealAll, signRekey, signSuccession, type KeyedSeat, type SeatKeys } from "./trip-keys";
+import { openPhotoImage, openPhotoLocation, sealPhoto, confirmationCodes, openField, openName, openPoint, openTrip, sealField, sealName, sealPoint, resealTrip, sealOperation, sealTrip, sealMove, matchesCommitment, newAttempt, newHandoffKeys, newSeatKeys, newTripKey, signEdge, verifyEdge, seatPublic, unwrapSeatSecret, unwrapTripKey, wrapSeatSecret, wrapTripKey, acceptRekey, reachableSeats, resealAll, signRekey, signSuccession, type KeyedSeat, type SeatKeys } from "./trip-keys";
 
 const prf = () => crypto.getRandomValues(new Uint8Array(32));
 const shape = /^v1\.[A-Za-z0-9_-]+$/;
@@ -419,5 +419,37 @@ describe("rekey", () => {
     // A generation already taken here is taken without a signature.
     expect(await accept(b, unsigned, 2)).toBe(true);
     expect(await accept(b, { ...unsigned, generation: 1 }, 1)).toBe(true);
+  });
+});
+
+describe("photos", () => {
+  const bytes = (n: number, v: number) => new Uint8Array(n).fill(v);
+  test("sealed images open back under the photo's own key; the host sees only a length of the bytes plus 28", async () => {
+    const trip = await newTripKey(), sealed = await sealPhoto(trip, "trip-a", 1, "p1", { display: bytes(5000, 1), thumb: bytes(900, 2), location: { lat: 35.6812, lng: 139.7671 } });
+    expect(sealed.display.length).toBe(5028); expect(sealed.thumb.length).toBe(928);
+    expect(sealed.key).toMatch(/^v1\.1\.[A-Za-z0-9_-]+$/); expect(sealed.key.length).toBeLessThanOrEqual(200); expect(sealed.location!.length).toBeLessThanOrEqual(300);
+    expect(await openPhotoImage(trip, "trip-a", "p1", sealed.key, "display", sealed.display)).toEqual(bytes(5000, 1));
+    expect(await openPhotoImage(trip, "trip-a", "p1", sealed.key, "thumb", sealed.thumb)).toEqual(bytes(900, 2));
+    expect(await openPhotoLocation(trip, "trip-a", "p1", sealed.location!)).toEqual({ lat: 35.6812, lng: 139.7671 });
+    expect(Buffer.from(sealed.display).includes(Buffer.from(bytes(64, 1)))).toBe(false);
+  });
+  test("another trip key, trip, photo or size opens none of it; two photos of the same bytes seal differently", async () => {
+    const trip = await newTripKey(), sealed = await sealPhoto(trip, "trip-a", 1, "p1", { display: bytes(100, 1), thumb: bytes(100, 1) });
+    await expect(openPhotoImage(await newTripKey(), "trip-a", "p1", sealed.key, "display", sealed.display)).rejects.toThrow();
+    await expect(openPhotoImage(trip, "trip-b", "p1", sealed.key, "display", sealed.display)).rejects.toThrow();
+    await expect(openPhotoImage(trip, "trip-a", "p2", sealed.key, "display", sealed.display)).rejects.toThrow();
+    await expect(openPhotoImage(trip, "trip-a", "p1", sealed.key, "thumb", sealed.display)).rejects.toThrow();
+    await expect(openPhotoImage(trip, "trip-a", "p1", sealed.key, "display", sealed.display.slice(0, 20))).rejects.toThrow();
+    const other = await sealPhoto(trip, "trip-a", 1, "p3", { display: bytes(100, 1), thumb: bytes(100, 1) });
+    expect(other.display).not.toEqual(sealed.display); expect(sealed).not.toHaveProperty("location");
+    // The image is not under the trip's key: a new key seals `key` again and the image still opens.
+    const next = await newTripKey(), again = await sealField(next, "trip-a", 2, "photo", "p1", "key", await openField(trip, "trip-a", "photo", "p1", "key", sealed.key));
+    expect(await openPhotoImage(next, "trip-a", "p1", again, "display", sealed.display)).toEqual(bytes(100, 1));
+  });
+  test("a location out of range is refused to seal and left off when opened", async () => {
+    const trip = await newTripKey();
+    await expect(sealPhoto(trip, "trip-a", 1, "p1", { display: bytes(40, 1), thumb: bytes(40, 1), location: { lat: 91, lng: 0 } })).rejects.toThrow();
+    const bad = await sealField(trip, "trip-a", 1, "photo", "p1", "location", '{"lat":200,"lng":0}');
+    expect(await openPhotoLocation(trip, "trip-a", "p1", bad)).toBeNull(); expect(await openPhotoLocation(trip, "trip-a", "p2", await sealField(trip, "trip-a", 1, "photo", "p1", "location", '{"lat":1,"lng":2}'))).toBeNull();
   });
 });

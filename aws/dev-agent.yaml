@@ -44,6 +44,15 @@ Resources:
             Effect: Allow
             Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:DeleteItem, dynamodb:UpdateItem, dynamodb:ConditionCheckItem, dynamodb:Query]
             Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/capsule-host-dev-*'
+          # The photos' bucket (aws/template.yaml, Media): what the Web Function and the Event Function put, read, take out and list.
+          - Sid: Photos
+            Effect: Allow
+            Action: [s3:PutObject, s3:GetObject, s3:DeleteObject]
+            Resource: 'arn:aws:s3:::capsule-host-dev-media-*/*'
+          - Sid: PhotosList
+            Effect: Allow
+            Action: s3:ListBucket
+            Resource: 'arn:aws:s3:::capsule-host-dev-media-*'
           - Sid: CreatorKeys
             Effect: Allow
             Action: [ssm:PutParameter, ssm:GetParameter, ssm:DeleteParameter, ssm:AddTagsToResource, ssm:ListTagsForResource, ssm:GetParametersByPath]
@@ -101,7 +110,7 @@ Resources:
               - Sid: Assets
                 Effect: Allow
                 Action: s3:*
-                Resource: ['arn:aws:s3:::capsule-host-dev-assets-*', 'arn:aws:s3:::capsule-host-dev-assets-*/*']
+                Resource: ['arn:aws:s3:::capsule-host-dev-assets-*', 'arn:aws:s3:::capsule-host-dev-assets-*/*', 'arn:aws:s3:::capsule-host-dev-media-*', 'arn:aws:s3:::capsule-host-dev-media-*/*']
               - Sid: Schedule
                 Effect: Allow
                 Action: events:*
@@ -241,6 +250,10 @@ Resources:
               - Effect: Allow
                 Action: [lambda:InvokeFunction, lambda:GetFunction, lambda:GetFunctionConfiguration]
                 Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:capsule-host-dev-*'
+              # aws/verify.ts counts what is left of a purged trip's photos in the bucket (names only, no read)
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: 'arn:aws:s3:::capsule-host-dev-media-*'
               - Effect: Allow
                 Action: [dynamodb:Scan, dynamodb:DescribeTable]
                 Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/capsule-host-dev-*'

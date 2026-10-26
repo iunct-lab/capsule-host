@@ -37,13 +37,15 @@ export class AwsStore implements CapsuleStore {
     return { meta: { changes: ok ? 1 : 0 } };
   }
   save(row: CloudRow, payload: string | null, expires: number, now: number) { return this.write(row, payload, expires, now, false); }
-  async sweep(now: number) {
+  async sweep(now: number, erase?: (key: string) => Promise<void>) {
     let cursor: Record<string, any> | undefined;
     do {
       const batch = await this.db.send(new QueryCommand({ TableName: this.table, IndexName: "expiry", KeyConditionExpression: "expiry_kind = :active AND purge_at <= :now", ExpressionAttributeValues: { ":active": "active", ":now": now }, Limit: 25, ExclusiveStartKey: cursor }));
       for (const item of batch.Items ?? []) {
         const row = await this.get(item.pk);
-        if (row?.payload && row.purge_at <= now) await this.save(row, null, row.purge_at, now);
+        if (!row?.payload || row.purge_at > now) continue;
+        if (erase) try { await erase(row.key); } catch { continue; }
+        await this.save(row, null, row.purge_at, now);
       }
       cursor = batch.LastEvaluatedKey;
     } while (cursor);

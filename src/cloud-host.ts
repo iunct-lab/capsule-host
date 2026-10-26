@@ -13,6 +13,8 @@ import { recipe } from "./recipe";
 import { check, publishHash } from "./validate";
 import { reviseText, same, reviseTrip, undoTrip, refusal, PASTE_LIMIT, type Previous } from "./revise";
 import { placeholder, type Timed } from "./timing";
+import { PHOTO_LIMITS, SEALED_OVERHEAD, tooLargeText, type PhotoAsset } from "./media";
+import type { MediaStore } from "./media-store";
 
 // A Grant is an invite: its link can be redeemed `seats` times until `claimBy`. Each redemption binds one browser as a Session (member).
 // `issuedBy`: the member (Session id) who handed it out; none for one handed out from outside the trip (publishing, recover).
@@ -56,6 +58,8 @@ type FootprintRecord = { id: string; seat: string; by: string; at: string; auto?
 // was stored get it at their next write.
 // `private`: each seat's own entries, by `Session.id`. Outside `document`, so no role, export or revision ever reaches them.
 // `footprints`: the trip's points, oldest first. Outside `document` too: leaving one moves no revision, and no export or revision holds them.
+// `media`: the trip's photos, oldest upload first, outside `document` as the footprints are. Only what the screen needs to place and
+// open each is here; the image bytes, sealed by the browser, are in `env.MEDIA` under the capsule row's key (docs/design/trip-e2e.md §3.1).
 // One line of the capsule's record. What an invite or an owner seat went through also names the role, the link or member it was
 // about (`label`), and who did it: a member's name and device, or 発行者 / 作成者 for the publisher and the creator. Older lines
 // have none of these, and are not filled in. A sealed trip's lines copy no name (docs/design/trip-e2e.md §3.1, `Audit`): they
@@ -68,7 +72,7 @@ const HISTORY = ["publish", "replay", "creator-owner", "recover", "sessions", "g
 // `departed`: the seats that held the present generation of the trip key and are gone, and why (docs/design/trip-e2e.md §8).
 // The owner's browser replacing the key clears it.
 type Trip = { sealed?: undefined; spec: Spec; document: Document; previous?: Previous<Spec, Document> } | { sealed: { generation: number }; spec: SealedSpec; document: SealedDocument; previous?: Previous<SealedSpec, SealedDocument> };
-type Capsule = Trip & { id?: string; ownedAt?: number; joined?: number; created: number; updated: string; forced: string | null; hash: string; publishHash?: string; grants: Grant[]; sessions: Session[]; audit: Audit[]; spent?: Array<{ digest: string; expires: number }>; private?: Record<string, PrivateEntry[]>; footprints?: FootprintRecord[]; departed?: Departure[]; left?: string[] };
+type Capsule = Trip & { id?: string; ownedAt?: number; joined?: number; created: number; updated: string; forced: string | null; hash: string; publishHash?: string; grants: Grant[]; sessions: Session[]; audit: Audit[]; spent?: Array<{ digest: string; expires: number }>; private?: Record<string, PrivateEntry[]>; footprints?: FootprintRecord[]; media?: PhotoAsset[]; departed?: Departure[]; left?: string[] };
 // `left`: the cookie digests of the seats that are gone (revoked, their invite rotated, revoked or ended, sharing ended, the owner
 // recovered), newest last, so their 401 can say so. A cookie not in it (a seat gone before it was kept, or dropped off its end) is
 // answered as an idle one is: the browser then keeps its keys, as before. Its end bounds the row: a trip holds 100 seats at
@@ -87,6 +91,9 @@ type Enrollment = { digest: string; creatorId: string | null; label: string; exp
 type Registry = { creators: Creator[]; enrollments: Enrollment[]; spent?: Array<{ digest: string; expires: number }> };
 // `seat`: told back with the error. "gone" = the seat this cookie held is no more (revoked, its invite rotated, revoked or ended,
 // sharing ended, the owner recovered), so the browser forgets the trip's keys; a cookie only unused for 30 days is not.
+// The images an upload has put but not yet committed with its record, under the name it gave them (`PhotoAsset.blob`): whatever is
+// left when the request ends is taken out again, so a request that failed, lost the race for the capsule or met a purge leaves none.
+type Stage = { prefix: string; blob: string; names: string[]; done: boolean };
 class Fault extends Error { constructor(public status: number, message: string, public reason?: string, public seat?: "gone") { super(message); } }
 function fail(status: number, text: string): never { throw new Fault(status, text); }
 const token = () => randomBytes(32).toString("base64url");
@@ -160,6 +167,17 @@ const sealedFootprintOperations = z.discriminatedUnion("type", [
   z.object({ type: z.literal("add"), id: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/), point: cipher(200), by: cipher(CIPHER.short), auto: z.literal(true).optional() }).strict(),
   footprintOperations.options[1],
 ]);
+// A photo arrives sealed by the browser, which chose its id (the id is in the ciphertext's associated data): the host checks the plain
+// parts, the form of what is sealed and the sizes, and opens and reads no image. `images` are the IV, sealed bytes and tag, in base64.
+// The size of what is sealed is told apart from its form (413, in Japanese, as the browser's own check says it).
+const image = z.string().refine(v => { const n = Buffer.from(v, "base64"); return n.length > SEALED_OVERHEAD && n.toString("base64") === v; });
+const edge = (max: number) => z.number().int().min(1).max(max);
+const photoInput = z.object({
+  id: z.string().regex(/^[a-f0-9]{32}$/), images: z.object({ display: image, thumb: image }).strict(),
+  width: edge(PHOTO_LIMITS.displayEdge), height: edge(PHOTO_LIMITS.displayEdge), thumb: z.object({ width: edge(PHOTO_LIMITS.thumbEdge), height: edge(PHOTO_LIMITS.thumbEdge) }).strict(),
+  capturedAt: isoTime.optional(), key: cipher(200), location: cipher(300).optional(), caption: cipher(CIPHER.short).optional(),
+}).strict();
+const photoRemove = z.object({ type: z.literal("remove"), id: z.string().regex(/^[a-f0-9]{32}$/) }).strict();
 const grantInput = z.object({ role: z.enum(["owner", "editor", "participant", "viewer"]), label: author.default("招待リンク"), expiresAt: isoTime, seats: z.number().int().min(1).max(50).default(1), claimDays: z.number().int().min(1).max(30).default(3), confirm: z.literal(true), rotate: z.string().optional(), approval: z.enum(["auto", "owner"]).optional() }).strict();
 // A sealed trip's invite is named in ciphertext sealed against the id the browser chose, or with one of the host's own names.
 const sealedGrantInput = grantInput.extend({ id: z.string().regex(/^[0-9a-f]{32}$/), label: z.union([cipher(CIPHER.short), z.enum(["自分用", "招待リンク"])]).default("招待リンク") });
@@ -199,7 +217,7 @@ async function anthropicAccepts(apiKey: string) {
 export class CloudHost {
   store: CapsuleStore;
   keys: KeyStore;
-  constructor(public env: { DB?: D1; STORE?: CapsuleStore; KEYS?: KeyStore; VERIFY_KEY?: (apiKey: string) => Promise<boolean>; ASSIST?: { generate: (apiKey: string, model: string, text: string, system?: string, follow?: Follow) => Promise<Generated>; dispatch?: (id: string) => Promise<void> }; CAPSULE_ASSIST_MODEL?: string; CAPSULE_HMAC_KEY: string; CAPSULE_ORIGIN: string; CAPSULE_CLAIM_COUNTRIES?: string; CAPSULE_DISABLED_ACTIONS?: string; CAPSULE_SEALED_FROM?: string }, public clock = () => Date.now(), public publisherIdentity: (req: Request) => Promise<string | null> = async () => null) {
+  constructor(public env: { DB?: D1; STORE?: CapsuleStore; KEYS?: KeyStore; MEDIA?: MediaStore; VERIFY_KEY?: (apiKey: string) => Promise<boolean>; ASSIST?: { generate: (apiKey: string, model: string, text: string, system?: string, follow?: Follow) => Promise<Generated>; dispatch?: (id: string) => Promise<void> }; CAPSULE_ASSIST_MODEL?: string; CAPSULE_HMAC_KEY: string; CAPSULE_ORIGIN: string; CAPSULE_CLAIM_COUNTRIES?: string; CAPSULE_DISABLED_ACTIONS?: string; CAPSULE_SEALED_FROM?: string; CAPSULE_PHOTOS?: string }, public clock = () => Date.now(), public publisherIdentity: (req: Request) => Promise<string | null> = async () => null) {
     // Publisher authorization only permits creation; all trip access requires a capability session.
     const origin = new URL(env.CAPSULE_ORIGIN);
     if (origin.origin !== env.CAPSULE_ORIGIN || (origin.protocol !== "https:" && !["127.0.0.1", "localhost", "[::1]"].includes(origin.hostname))) throw new Error("公開ホストはHTTPSが必要です");
@@ -213,6 +231,9 @@ export class CloudHost {
   // The line after which a trip was published once the new screen was out (docs/design/trip-e2e.md §5, docs/development-and-release.md):
   // such a trip is not used plain. Until the operator sets it, there is none.
   sealedFrom: number | undefined;
+  // Photos are off until the operator turns them on (CAPSULE_PHOTOS=1): nothing is put up while they are off, and what is there
+  // is still read, taken out and deleted with the trip.
+  get photosOn() { return this.env.CAPSULE_PHOTOS === "1"; }
   // A trip published after the line and not moved yet: only its owner may come in, to take the seat, check a passkey, put the
   // keys, move it or delete it.
   mustSeal(c: Capsule) { return !c.sealed && this.sealedFrom !== undefined && c.created >= this.sealedFrom; }
@@ -265,7 +286,9 @@ export class CloudHost {
   // The periodic cleanup: expired trips, then creators' keys unused for KEY_IDLE. The trips are done by the time the keys are
   // looked at, so a failing key store (a missing permission, an outage) leaves only a log line with no key or subject in it.
   async sweep(now: number) {
-    await this.store.sweep(now);
+    // A trip's photos go before its row does; one that cannot be removed leaves the trip for the next sweep to try again.
+    const media = this.env.MEDIA;
+    await this.store.sweep(now, media && (async key => { try { await media.removeAll(key); } catch (err) { this.log({ action: "sweep", method: "RUN", status: 500, reason: "sweep:media", ip: "-" }); throw err; } }));
     try { await this.keys.sweep(now - KEY_IDLE); } catch { this.log({ action: "sweep", method: "RUN", status: 500, reason: "sweep:keys", ip: "-" }); }
   }
   // Takes the creator's or seat's running row and a host-wide slot, writes the job row and starts it: the one way a generation
@@ -634,6 +657,11 @@ export class CloudHost {
     return secure(response, this.env.CAPSULE_ORIGIN);
   }
   async route(req: Request): Promise<Response> {
+    const stage: Stage = { prefix: "", blob: "", names: [], done: false };
+    try { return await this.routing(req, stage); }
+    finally { for (const name of stage.names) try { await this.env.MEDIA?.remove(stage.prefix, name); } catch { /* what is left goes with the trip's purge */ } }
+  }
+  async routing(req: Request, stage: Stage): Promise<Response> {
     const url = new URL(req.url), now = this.clock();
     if (url.origin !== this.env.CAPSULE_ORIGIN) fail(403, "ホスト名が一致しません");
     // The operator's switch (#610): a named action answers 503 and the rest keeps working. The name is the first path segment after
@@ -642,7 +670,10 @@ export class CloudHost {
     const stopName = /^\/v1\/(?:c\/[a-f0-9]{32}\/?)?([^/]*)/.exec(url.pathname)?.[1];
     if (stopName && this.env.CAPSULE_DISABLED_ACTIONS?.split(",").filter(Boolean).includes(stopName)) fail(503, "この操作は一時的に停止しています。時間をおいて再試行してください");
     const ip = req.headers.get("cf-connecting-ip") ?? "unknown";
-    await this.rate(`ip:${ip}`, 300);
+    // A page of photos reads hundreds of images at once, so these are counted apart, at a higher count, and leave the rest of the
+    // API its own.
+    const picture = req.method === "GET" && /^\/v1\/c\/[a-f0-9]{32}\/media\/[a-f0-9]{32}\/(thumb|display)$/.test(url.pathname);
+    await this.rate(picture ? `ip-media:${ip}` : `ip:${ip}`, picture ? 1200 : 300);
     if (!['GET', 'HEAD'].includes(req.method) && req.headers.get("origin") !== this.env.CAPSULE_ORIGIN) fail(403, "別のサイトからの操作は許可されていません");
     const identity = await this.publisherIdentity(req);
     // A creator may make a new trip and nothing more: the cookie is read on these four paths only, and never opens a capsule.
@@ -838,7 +869,9 @@ export class CloudHost {
       } else {
         const { grant, member, secret: held } = this.session(req, c, id);
         // Counted only after authentication: counting before lets anyone who knows the id lock every member out (#609).
-        await this.rate(`capsule:${id}`, 600); await this.rate(`grant:${grant.id}`, 120);
+        // A page of photos reads a few hundred images at once, which the two counters below would refuse: an image read is counted by seat.
+        if (req.method === "GET" && /^media\/[a-f0-9]{32}\/(thumb|display)$/.test(action)) await this.rate(`mediaread:${member.id}`, 600);
+        else { await this.rate(`capsule:${id}`, 600); await this.rate(`grant:${grant.id}`, 120); }
         const editor = grant.role === "owner" || grant.role === "editor";
         const owner = () => { if (grant.role !== "owner") fail(403, "オーナーのみ操作できます"); };
         // Hands out invites (canIssue); changes only those it handed out, unless it is the owner.
@@ -846,6 +879,9 @@ export class CloudHost {
         const mine = (g: Grant | undefined) => grant.role === "owner" || g?.issuedBy === member.id;
         // Revising with a chat is for those who edit the plan by hand; an editor's leaves the settings as they are.
         const reviser = () => { if (!editor) fail(403, "オーナー・編集者のみ操作できます"); return grant.role !== "owner"; };
+        // Every member reads every photo's record; which seat uploaded it is told only as whether it was this one.
+        const shown = () => (c.media ?? []).map(({ contributor, blob, ...p }) => ({ ...p, mine: contributor === member.id }));
+        const media = () => this.env.MEDIA ?? fail(503, "写真の保存先がありません");
         // Until the owner approves, nothing but the code that member shows the owner is given out.
         if (member.pending) { if (action === "" && req.method === "GET") return Response.json({ error: "オーナーの承認待ちです。画面のコードをオーナーに伝えてください", pending: true, code: member.code }, { status: 403 }); fail(403, "オーナーの承認待ちです"); }
         if (action === "theme.css" && req.method === "GET") return new Response(`:root{--accent:${c.spec.theme.accent}}`, { headers: { "Content-Type": "text/css" } });
@@ -853,6 +889,13 @@ export class CloudHost {
         // asked to reload. A plain trip published before the line works with it as before (docs/design/trip-e2e.md §5).
         if ((c.sealed || this.mustSeal(c)) && url.searchParams.get("ui") !== "2") throw new Fault(409, "画面を更新してください", "stale-ui");
         if (this.mustSeal(c) && !(grant.role === "owner" && (req.method === "GET" ? ["", "grants", "seal"] : ["keys", "passkey", "passkey/verify", "signout", "seal", "purge"]).includes(action))) throw new Fault(409, "オーナーがこの旅行を移すまで開けません", "unsealed");
+        // An image, as the browser sealed it, for any seat of the trip: the answer is not the page's to cache for long, and not shared.
+        const image = /^media\/([a-f0-9]{32})\/(thumb|display)$/.exec(action);
+        if (image && req.method === "GET") {
+          const photo = c.media?.find(p => p.id === image[1]), bytes = photo ? await media().get(row.key, `${photo.blob}.${image[2]}`) : null;
+          if (!bytes) fail(404, "写真が見つかりません");
+          return new Response(new Uint8Array(bytes), { headers: { "Content-Type": "application/octet-stream", "Cache-Control": "private, max-age=3600" } });
+        }
         if (action === "grants" && req.method === "GET") {
           issuer(); const label = (sid: string) => c.sessions.find(s => s.id === sid)?.label ?? "（失効したメンバー）";
           return Response.json(c.grants.filter(mine).map(({ digest, issuedBy, ...safe }) => ({ ...safe, issuedBy: issuedBy ? { id: issuedBy, label: label(issuedBy) } : null, members: c.sessions.filter(s => s.grantId === safe.id).map(({ digest, passkey, privateKey, seatKey, handoff, assistKey, assistWrapped, ...m }) => ({ ...m, passkey: Boolean(passkey), publicKey: seatKey ? { x25519: seatKey.x25519, ed25519: seatKey.ed25519 } : null, self: m.id === member.id })) })));
@@ -915,9 +958,9 @@ export class CloudHost {
         const seats = () => c.sessions.filter(s => s.seatKey && !s.pending).map(s => ({ id: s.id, role: c.grants.find(g => g.id === s.grantId)?.role, x25519: s.seatKey!.x25519, ed25519: s.seatKey!.ed25519, edges: s.seatKey!.edges ?? [], ...s.seatKey!.since && { since: s.seatKey!.since } }));
         // Once the key is replaced, ciphertext of another generation is not written: a member who left holds the older key. One
         // without a generation is not of the trip's form, and is refused by the checks below (400).
-        if (c.sealed && write && ["document", "spec", "footprints", "members", "grants", "revise", "undo"].includes(action) && ciphers(input).some(v => /^v1\.\d+\./.test(v) && !v.startsWith(`v1.${c.sealed!.generation}.`))) throw new Fault(409, "旅行の鍵が替わりました。開き直してください", "generation");
+        if (c.sealed && write && ["document", "spec", "footprints", "media", "members", "grants", "revise", "undo"].includes(action) && ciphers(input).some(v => /^v1\.\d+\./.test(v) && !v.startsWith(`v1.${c.sealed!.generation}.`))) throw new Fault(409, "旅行の鍵が替わりました。開き直してください", "generation");
         if (action === "" && req.method === "GET") {
-          response = Response.json({ id, spec: c.spec, document: c.document, sealed: c.sealed ?? null, role: grant.role, state, hash: c.hash, passkey: Boolean(member.passkey), ...(c.sealed ? { assistKey: Boolean(member.assistWrapped), assistWrapped: member.assistWrapped ?? null, assistModel: this.env.CAPSULE_ASSIST_MODEL ?? ASSIST_MODEL, updated: c.updated, created: c.created, label: member.label } : { assistKey: Boolean(member.assistKey) }), self: { id: member.id, label: member.label }, private: c.private?.[member.id] ?? [], privateKey: member.privateKey?.wrapped ?? null, seatKey: member.seatKey ?? null, keyed: c.sessions.some(s => s.seatKey), handoff: member.handoff ?? null, rekey: grant.role === "owner" && c.sealed && c.departed?.length ? c.departed.some(d => d.why !== "owner") ? "auto" : "ask" : null, waiting: waiting(), seats: member.seatKey ? seats() : [], footprints: footprints(), mustSeal: this.mustSeal(c) }, { headers: { ETag: `"${c.document.revision}"`, "Set-Cookie": this.setCookie(id, held, member.expires) } });
+          response = Response.json({ id, spec: c.spec, document: c.document, sealed: c.sealed ?? null, role: grant.role, state, hash: c.hash, passkey: Boolean(member.passkey), ...(c.sealed ? { assistKey: Boolean(member.assistWrapped), assistWrapped: member.assistWrapped ?? null, assistModel: this.env.CAPSULE_ASSIST_MODEL ?? ASSIST_MODEL, updated: c.updated, created: c.created, label: member.label } : { assistKey: Boolean(member.assistKey) }), self: { id: member.id, label: member.label }, private: c.private?.[member.id] ?? [], privateKey: member.privateKey?.wrapped ?? null, seatKey: member.seatKey ?? null, keyed: c.sessions.some(s => s.seatKey), handoff: member.handoff ?? null, rekey: grant.role === "owner" && c.sealed && c.departed?.length ? c.departed.some(d => d.why !== "owner") ? "auto" : "ask" : null, waiting: waiting(), seats: member.seatKey ? seats() : [], footprints: footprints(), media: shown(), photos: this.photosOn, mustSeal: this.mustSeal(c) }, { headers: { ETag: `"${c.document.revision}"`, "Set-Cookie": this.setCookie(id, held, member.expires) } });
           // Reading is what keeps a session alive, recorded at most once a day so that reading the trip stays free of writes.
           if (member.seen !== undefined && member.seen + SEEN_EVERY > this.clock() && !expired) return response;
           member.seen = this.clock();
@@ -1123,6 +1166,38 @@ export class CloudHost {
             c.footprints = list.filter(p => p !== point);
           }
           response = Response.json({ ok: true, footprints: footprints() });
+        } else if (action === "media" && req.method === "POST") {
+          // A photo is sealed by the browser, so it only goes into a trip that has a key: no If-Match and no new revision, as with a
+          // footprint. Left by all but a viewer, before and after the trip, until sharing ends.
+          if (!this.photosOn) fail(403, "写真は今は使えません");
+          if (!c.sealed) fail(409, "旅行を暗号化してから写真を上げてください");
+          if (grant.role === "viewer") fail(403, "閲覧者は写真を上げられません");
+          if (state === "frozen") fail(403, "共有終了後は変更できません");
+          const v = photoInput.parse(input), list = c.media ?? [];
+          if (list.length >= PHOTO_LIMITS.count) fail(413, `この旅行の写真は ${PHOTO_LIMITS.count} 枚までです`);
+          if (list.some(p => p.id === v.id)) fail(409, "同じ写真がもう上がっています");
+          const { images, ...record } = v, sealedImages = { display: Buffer.from(images.display, "base64"), thumb: Buffer.from(images.thumb, "base64") };
+          if (sealedImages.display.length > PHOTO_LIMITS.displayBytes + SEALED_OVERHEAD) fail(413, tooLargeText(PHOTO_LIMITS.displayEdge, PHOTO_LIMITS.displayBytes));
+          if (sealedImages.thumb.length > PHOTO_LIMITS.thumbBytes + SEALED_OVERHEAD) fail(413, tooLargeText(PHOTO_LIMITS.thumbEdge, PHOTO_LIMITS.thumbBytes));
+          await this.rate(`media:${member.id}`, 60);
+          // Put once, under a name of this upload's own, and kept by the record only when it is saved (a retry after losing the race
+          // for the capsule finds them put already).
+          if (!stage.done) {
+            stage.prefix = row.key; stage.blob = uid();
+            for (const size of ["display", "thumb"] as const) { stage.names.push(`${stage.blob}.${size}`); await media().put(row.key, `${stage.blob}.${size}`, sealedImages[size]); }
+            stage.done = true;
+          }
+          c.media = [...list, { ...record, blob: stage.blob, contributor: member.id, uploadedAt: new Date(this.clock()).toISOString() } satisfies PhotoAsset];
+          response = Response.json({ photo: shown().at(-1) }, { status: 201 });
+        } else if (action === "media" && req.method === "PATCH") {
+          // Taken out by the seat that uploaded it, or by an owner or editor. A seat that is gone leaves its photos with the trip.
+          const v = photoRemove.parse(input), list = c.media ?? [], photo = list.find(p => p.id === v.id);
+          if (state === "frozen") fail(403, "共有終了後は変更できません");
+          if (!photo) fail(404, "写真が見つかりません");
+          if (photo.contributor !== member.id && !editor) fail(403, "自分の写真だけ消せます");
+          await media().remove(row.key, `${photo.blob}.display`); await media().remove(row.key, `${photo.blob}.thumb`);
+          c.media = list.filter(p => p !== photo);
+          response = Response.json({ ok: true, media: shown() });
         } else if (action === "members" && req.method === "PATCH") {
           // A sealed trip's names arrive sealed against the seat (src/trip-keys.ts sealName).
           owner(); const v = z.object({ id: z.string(), label: c.sealed ? cipher(CIPHER.short) : author }).strict().parse(input), m = c.sessions.find(s => s.id === v.id);
@@ -1176,6 +1251,7 @@ export class CloudHost {
           if (member.seatKey?.generation !== c.sealed.generation) fail(409, "旅行の鍵がありません");
           const name = z.string().min(1).max(CIPHER.short);
           const v = z.object({ generation: z.number().int(), spec: z.unknown(), document: z.unknown(), footprints: z.array(z.object({ id: z.string(), point: cipher(200), by: cipher(CIPHER.short) }).strict()).max(FOOTPRINTS),
+            media: z.array(z.object({ id: z.string(), key: cipher(200), location: cipher(300).optional(), caption: cipher(CIPHER.short).optional() }).strict()).max(PHOTO_LIMITS.count).default([]),
             members: z.array(z.object({ id: z.string(), label: name }).strict()).max(200), grants: z.array(z.object({ id: z.string(), label: name }).strict()).max(200),
             seats: z.array(z.object({ seat: seatId, wrapped: sealed(200), ephemeral: rawKey, signature }).strict()).min(1).max(200), confirm: z.literal(true) }).strict().parse(input);
           const generation = c.sealed.generation + 1;
@@ -1183,11 +1259,11 @@ export class CloudHost {
           let next: { spec: SealedSpec; document: SealedDocument }; try { next = validateSealed(v.spec, { ...(v.document as object), revision: c.document.revision }, c.created); } catch { fail(400, "旅程の形を確認してください"); }
           // A name the host gave (not ciphertext) stays as it is.
           const kept = (sent: string, now: string) => sent.startsWith("v1.") || sent === now;
-          if (ciphers([next, v.footprints, v.members, v.grants]).some(x => !x.startsWith(`v1.${generation}.`)) || [...v.members.map(m => kept(m.label, c.sessions.find(s => s.id === m.id)?.label ?? "")), ...v.grants.map(g => kept(g.label, c.grants.find(x => x.id === g.id)?.label ?? ""))].includes(false)) fail(400, "鍵の世代を確認してください");
+          if (ciphers([next, v.footprints, v.media, v.members, v.grants]).some(x => !x.startsWith(`v1.${generation}.`)) || [...v.members.map(m => kept(m.label, c.sessions.find(s => s.id === m.id)?.label ?? "")), ...v.grants.map(g => kept(g.label, c.grants.find(x => x.id === g.id)?.label ?? ""))].includes(false)) fail(400, "鍵の世代を確認してください");
           // The trip as it stands, sealed again: the same records, a post keeping its seat and time. One changed meanwhile is read again.
           const ids = (list: Array<{ id: string }>) => list.map(x => x.id).sort().join("\n"), d = c.document as Doc, n = next.document as Doc;
           const lists = ["items", "suggestions", "comments", "reflections", "checklist", "budget"] as const;
-          if (lists.some(l => ids(d[l]) !== ids(n[l])) || ids(c.footprints ?? []) !== ids(v.footprints) || ids(c.sessions) !== ids(v.members) || ids(c.grants) !== ids(v.grants)) fail(409, "旅行が変わりました。開き直してください");
+          if (lists.some(l => ids(d[l]) !== ids(n[l])) || ids(c.footprints ?? []) !== ids(v.footprints) || ids(c.media ?? []) !== ids(v.media) || (c.media ?? []).some(p => { const m = v.media.find(x => x.id === p.id)!; return Boolean(p.location) !== Boolean(m.location) || Boolean(p.caption) !== Boolean(m.caption); }) || ids(c.sessions) !== ids(v.members) || ids(c.grants) !== ids(v.grants)) fail(409, "旅行が変わりました。開き直してください");
           for (const l of ["suggestions", "comments", "reflections"] as const) for (const p of n[l]) { const o = d[l].find(x => x.id === p.id)!; if (o.seat !== p.seat || o.createdAt !== p.createdAt) fail(400, "投稿の書き手と時刻は変えられません"); }
           const refused = this.refusal(c, next.spec); if (refused) fail(400, refused);
           // Wrapped to seats of this trip that hold a key, the owner's own among them, each once.
@@ -1196,6 +1272,7 @@ export class CloudHost {
           this.respec(c, next.spec); c.document = { ...next.document, revision: c.document.revision + 1 };
           const points = new Map(v.footprints.map(p => [p.id, p]));
           if (c.footprints) c.footprints = c.footprints.map(({ id, seat, at, auto }) => ({ id, seat, at, ...auto && { auto }, point: points.get(id)!.point, by: points.get(id)!.by }));
+          if (c.media) c.media = c.media.map(({ location, caption, ...p }) => { const m = v.media.find(x => x.id === p.id)!; return { ...p, key: m.key, ...m.location && { location: m.location }, ...m.caption && { caption: m.caption } }; });
           for (const m of v.members) c.sessions.find(s => s.id === m.id)!.label = m.label;
           for (const g of v.grants) c.grants.find(x => x.id === g.id)!.label = g.label;
           for (const x of to) x.s!.seatKey = { ...x.s!.seatKey!, generation, wrapped: x.wrapped, ephemeral: x.ephemeral, rekey: { seat: member.id, signature: x.signature } };
@@ -1323,8 +1400,8 @@ export class CloudHost {
           response = Response.json({ revision: doc.revision, ...(moved ? { moved } : {}) });
         } else fail(404, "操作が見つかりません");
       }
-      // Footprints are not recorded: a thousand of them would push the history of invites out, and each carries its time and name.
-      if (action !== "" && action !== "footprints") { c.audit.push({ ...entry, at: this.clock() }); c.audit = c.audit.slice(-2000); }
+      // Footprints and photos are not recorded: a thousand and five hundred of them would push the history of invites out, and each carries its time and name.
+      if (action !== "" && action !== "footprints" && action !== "media") { c.audit.push({ ...entry, at: this.clock() }); c.audit = c.audit.slice(-2000); }
       if (["document", "spec", "revise", "undo", "seal", "rekey"].includes(action)) c.updated = new Date(this.clock()).toISOString();
       // Expired/revoked links need no retained secret digest; bounded metadata is sufficient.
       c.grants = c.grants.filter(g => g.revoked === null && g.expires > this.clock());
@@ -1333,18 +1410,21 @@ export class CloudHost {
       if (c.private) for (const k of Object.keys(c.private)) if (!c.sessions.some(s => s.id === k) || !c.private[k]!.length) delete c.private[k];
       // Every seat this request took away, by whichever route (the ones expired above are kept already).
       this.leave(c, before.filter(b => !c.sessions.some(s => s.id === b.id)));
+      // The photos go first: a trip erased with its photos left behind would have nothing to find them by.
+      if (erase) await this.env.MEDIA?.removeAll(row.key);
       const serialized = erase ? null : JSON.stringify(c);
       if (serialized && Buffer.byteLength(serialized) > 1_900_000) fail(413, "カプセルの容量上限です");
-      if (await this.store.save(row, serialized, +new Date(c.spec.lifecycle.purgeAt), this.clock())) return response;
+      if (await this.store.save(row, serialized, +new Date(c.spec.lifecycle.purgeAt), this.clock())) { stage.names = []; return response; }
     }
     return fail(409, "同時更新がありました。再読込して再試行してください");
   }
 }
 // HSTS only means something on https; local development runs on http loopback.
 export function secure(response: Response, origin: string) {
-  response.headers.set("Cache-Control", "no-store"); response.headers.set("Referrer-Policy", "no-referrer"); response.headers.set("X-Content-Type-Options", "nosniff"); response.headers.set("X-Frame-Options", "DENY");
+  if (!response.headers.has("Cache-Control")) response.headers.set("Cache-Control", "no-store");
+  response.headers.set("Referrer-Policy", "no-referrer"); response.headers.set("X-Content-Type-Options", "nosniff"); response.headers.set("X-Frame-Options", "DENY");
   // One outside origin: a sealed trip's browser sends the trip to Anthropic itself, under the member's own key (#692 回答 B).
-  response.headers.set("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' https://api.anthropic.com; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");
+  response.headers.set("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self' https://api.anthropic.com; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");
   response.headers.set("Permissions-Policy", "camera=(), microphone=(), geolocation=(self)");
   if (origin.startsWith("https:")) response.headers.set("Strict-Transport-Security", "max-age=31536000");
   return response;

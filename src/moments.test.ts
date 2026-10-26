@@ -1,11 +1,11 @@
 import { test, expect } from "bun:test";
 import type { Item } from "./schema";
-import { itemAt, linkPhotos, type Shown } from "./moments";
+import { itemAt, linkPhotos, photoDays, photoInstant, photosPageShown, photosUploadable, type Shown } from "./moments";
 
 const day = "2026-09-24", at = (time: string, on = day) => `${on}T${time}:00+09:00`;
 const spec = { timezone: "Asia/Tokyo", trip: { startsOn: day, endsOn: "2026-09-25", destinations: ["唐津"] } };
 const item = (id: string, time?: string, extra: Partial<Item> = {}): Item => ({ id, title: id, day, kind: "activity", status: "confirmed", revision: 1, ...(time ? { startsAt: at(time) } : {}), ...extra });
-const photo = (id: string, time?: string, extra: Partial<Shown> = {}): Shown => ({ id, uploadedAt: at("23:59", "2026-09-25"), width: 2048, height: 1536, thumb: { width: 400, height: 300 }, mine: false, ...(time ? { capturedAt: at(time) } : {}), ...extra });
+const photo = (id: string, time?: string, extra: Partial<Shown> = {}): Shown => ({ id, uploadedAt: at("23:59", "2026-09-25"), width: 2048, height: 1536, thumb: { width: 400, height: 300 }, key: "v1.1.x", mine: false, ...(time ? { capturedAt: at(time) } : {}), ...extra });
 const ids = (photos: Shown[] | undefined) => (photos ?? []).map(p => p.id);
 
 test("link: 11:03, 13:02 and 15:41 go under the 11:00, 13:00 and 15:30 items", () => {
@@ -71,4 +71,29 @@ test("itemAt: the latest item of that day, not cancelled, starting at or before 
   expect(itemAt(items, +new Date(at("13:02")), spec.timezone)?.id).toBe("one");
   expect(itemAt(items, +new Date(at("10:00")), spec.timezone)).toBeUndefined();
   expect(itemAt(items, +new Date(at("13:00", "2026-09-25")), spec.timezone)).toBeUndefined();
+});
+
+test("photoInstant keeps the offset an EXIF time came with, and reads one without in the trip's zone", () => {
+  expect(photoInstant({ local: "2026-09-25T10:15:30", offset: "+09:00" }, "America/New_York")).toBe("2026-09-25T10:15:30+09:00");
+  expect(photoInstant({ local: "2026-09-25T10:15:30" }, "Asia/Tokyo")).toBe("2026-09-25T01:15:30.000Z");
+  expect(photoInstant({ local: "2026-09-25T10:15:30" }, "Asia/Kolkata")).toBe("2026-09-25T04:45:30.000Z");
+  // Either form reads as the same instant by `linkPhotos` and by the host (an offset or Z is what its check asks for).
+  for (const t of ["2026-09-25T10:15:30+09:00", photoInstant({ local: "2026-09-25T10:15:30" }, "Asia/Tokyo")]) expect(Number.isFinite(+new Date(t))).toBe(true);
+});
+test("photoDays: by the day taken in the trip's zone, in the order taken then uploaded; no time comes last", () => {
+  const photos = [photo("late", "23:30", { capturedAt: "2026-09-24T23:30:00+09:00" }), photo("none"), photo("next", "00:10", { capturedAt: "2026-09-25T00:10:00+09:00" }), photo("early", "08:00", { capturedAt: "2026-09-24T08:00:00+09:00" }),
+    photo("bad", undefined, { capturedAt: "昼" }), photo("utc", "09:00", { capturedAt: "2026-09-24T15:20:00Z" })];
+  const { days, unknown } = photoDays(photos, "Asia/Tokyo");
+  expect(days.map(d => [d.day, ids(d.photos)])).toEqual([["2026-09-24", ["early", "late"]], ["2026-09-25", ["next", "utc"]]]);
+  expect(ids(unknown)).toEqual(["none", "bad"]);
+  expect(photoDays([], "Asia/Tokyo")).toEqual({ days: [], unknown: [] });
+});
+
+test("photos off: no page unless photos are there, and nothing to put up; on: the page, and the field for those who may", () => {
+  expect([photosPageShown({}), photosPageShown({ photos: false, media: [] }), photosPageShown({ photos: false, media: [{}] }), photosPageShown({ photos: true, media: [] })]).toEqual([false, false, true, true]);
+  const trip = { photos: true, sealed: { generation: 1 }, role: "participant", state: "active" };
+  expect(photosUploadable(trip, true)).toBe(true);
+  expect(photosUploadable({ ...trip, photos: false }, true)).toBe(false);
+  expect([{ ...trip, role: "viewer" }, { ...trip, state: "frozen" }, { ...trip, sealed: null }, { ...trip, photos: undefined }].map(v => photosUploadable(v, true))).toEqual([false, false, false, false]);
+  expect(photosUploadable(trip, false)).toBe(false);
 });

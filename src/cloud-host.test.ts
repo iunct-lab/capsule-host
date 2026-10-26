@@ -1,6 +1,6 @@
 import { describe, test, expect, afterEach } from "bun:test";
 import { createHash, generateKeyPairSync } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Anthropic from "@anthropic-ai/sdk";
@@ -8,6 +8,7 @@ import { CloudHost, secure } from "./cloud-host";
 import { open as openKey, seal as sealKey } from "./key-store";
 import { exportFiles, tripHtml, tripMarkdown, zip } from "./export";
 import { LocalD1 } from "./local-d1";
+import { LocalMediaStore, type MediaStore } from "./media-store";
 import { validate, stateOf } from "./schema";
 import { fakeAuthenticator, testTrip } from "./test-fixture";
 import { recipe } from "./recipe";
@@ -172,7 +173,7 @@ const key = "test-key-".repeat(8);
 let now = +new Date("2026-09-16T00:00:00Z");
 const dbs: LocalD1[] = [];
 afterEach(() => { dbs.splice(0).forEach(d => d.close()); now = +new Date("2026-09-16T00:00:00Z"); devices.clear(); });
-async function setup(path?: string, env: { CAPSULE_SEALED_FROM?: string } = {}) {
+async function setup(path?: string, env: { CAPSULE_SEALED_FROM?: string; MEDIA?: MediaStore; CAPSULE_PHOTOS?: string } = {}) {
   const db = new LocalD1(path); dbs.push(db);
   const host = new CloudHost({ DB: db, CAPSULE_HMAC_KEY: key, CAPSULE_ORIGIN: origin, ...env }, () => now, async () => "test");
   const seed = testTrip();
@@ -219,16 +220,16 @@ describe("a loopback origin for local development", () => {
     // The footprint map's background (#563) comes from the same origin: MapLibre's worker is a file beside app.js and the
     // map tiles are ranges of /map/*.pmtiles, so the policy needs nothing added (docs/design/footprint-basemap.md §2).
     // The one outside origin is Anthropic's API, which a sealed trip's browser calls with the member's own key (#692 回答 B).
-    const csp = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' https://api.anthropic.com; base-uri 'none'; frame-ancestors 'none'; form-action 'self'";
+    const csp = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self' https://api.anthropic.com; base-uri 'none'; frame-ancestors 'none'; form-action 'self'";
     // The page itself (src/main.ts passes it through secure(), as every answer of the host) and an answer of the API.
     expect(secure(new Response("<!doctype html>", { headers: { "Content-Type": "text/html" } }), local).headers.get("Content-Security-Policy")).toBe(csp);
     const t = await setup();
     expect((await t.request("", "GET")).headers.get("Content-Security-Policy")).toBe(csp);
     expect(readFileSync(join(import.meta.dir, "../aws/template.yaml"), "utf8")).toContain(`ContentSecurityPolicy: "${csp}"`);
-    // Where the map could be pointed at a tile, font or image server: only the host itself (and inline data for images).
+    // Where the map could be pointed at a tile, font or image server: only the host itself (and inline data and the page's own blob: for images).
     const sources = (name: string) => csp.split(";").map(d => d.trim().split(" ")).find(([n]) => n === name)!.slice(1);
     expect(sources("connect-src")).toEqual(["'self'", "https://api.anthropic.com"]);
-    expect(sources("img-src")).toEqual(["'self'", "data:"]);
+    expect(sources("img-src")).toEqual(["'self'", "data:", "blob:"]);
     for (const name of ["script-src", "style-src", "default-src"]) expect(sources(name).every(s => s === "'self'" || s === "'none'")).toBe(true);
   });
 });
@@ -3853,8 +3854,8 @@ describe("sealed footprints and names", () => {
   type Setup = Awaited<ReturnType<typeof setup>>;
   const during = +new Date("2026-09-25T01:00:00Z"), here = { lat: 35.6812, lng: 139.7671, accuracy: 20 };
   const gid = () => crypto.randomUUID().replaceAll("-", "");
-  async function sealedTrip() {
-    const t = await setup(), owner = await stepUp(t.request, await t.login(t.created.url));
+  async function sealedTrip(env: { MEDIA?: MediaStore; CAPSULE_PHOTOS?: string } = {}) {
+    const t = await setup(undefined, env), owner = await stepUp(t.request, await t.login(t.created.url));
     const seat = await newSeatKeys(), pub = await seatPublic(seat), trip = await newTripKey(), wrap = await wrapTripKey(trip, pub.x25519, t.created.id, 1);
     expect((await t.request("/keys", "PATCH", { type: "seat", ...pub, ephemeral: wrap.ephemeral, generation: 1, wrapped: wrap.wrapped }, owner)).status).toBe(200);
     const view = await (await t.request("", "GET", undefined, owner)).json();
@@ -3988,6 +3989,208 @@ describe("sealed footprints and names", () => {
     ]);
     for (const a of lines) { expect(a).not.toHaveProperty("label"); expect(a).not.toHaveProperty("by"); }
     expect(JSON.stringify(t.stored().audit)).not.toContain("メンバー");
+  });
+
+  describe("photo", () => {
+    // A photo as the browser sends it: each image sealed under a key of its own, which the trip key seals (src/media.ts PhotoAsset).
+    // The host opens none of it, so the images here are bytes the test can look for in the store and in what comes back.
+    const dirs: string[] = [];
+    afterEach(() => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }); });
+    const withMedia = async (wrap: (real: MediaStore) => MediaStore = real => real) => {
+      const dir = mkdtempSync(join(tmpdir(), "capsule-host.media.")); dirs.push(dir);
+      const t = await sealedTrip({ MEDIA: wrap(new LocalMediaStore(dir)), CAPSULE_PHOTOS: "1" });
+      const upload = async (cookie: string, over: Record<string, unknown> = {}, sizes = { display: 5000, thumb: 900 }) => {
+        const id = gid(), fill = (n: number, v: number) => Buffer.alloc(n, v).toString("base64");
+        const body = { id, images: { display: fill(sizes.display, 1), thumb: fill(sizes.thumb, 2) }, width: 1536, height: 2048, thumb: { width: 300, height: 400 }, capturedAt: "2026-09-25T10:15:00+09:00", key: await sealField(t.trip, t.created.id, 1, "photo", id, "key", "photo-key"), location: await sealField(t.trip, t.created.id, 1, "photo", id, "location", '{"lat":35.6812,"lng":139.7671}'), ...over };
+        return { id, body, res: await t.request("/media", "POST", body, cookie) };
+      };
+      const list = async (cookie: string) => (await (await t.request("", "GET", undefined, cookie)).json()).media as Array<{ id: string; mine: boolean; capturedAt?: string; location?: string; contributor?: string }>;
+      const image = (cookie: string, id: string, size = "display") => t.request(`/media/${id}/${size}`, "GET", undefined, cookie);
+      return { ...t, dir, upload, list, image };
+    };
+    const error = async (r: Response) => [r.status, (await r.json()).error];
+
+    test("photo: members upload, every member sees them, viewer and frozen cannot upload", async () => {
+      const t = await withMedia(), { m } = t;
+      now = during;
+      const a = await t.upload(m.participant.cookie), b = await t.upload(t.owner, { capturedAt: "2026-09-25T09:00:00+09:00" });
+      expect(a.res.status).toBe(201); expect(b.res.status).toBe(201);
+      expect((await a.res.json()).photo).toMatchObject({ id: a.id, mine: true });
+      expect(await error((await t.upload(m.viewer.cookie)).res)).toEqual([403, "閲覧者は写真を上げられません"]);
+      for (const cookie of [t.owner, m.editor.cookie, m.other.cookie, m.viewer.cookie]) {
+        const seen = await t.list(cookie);
+        expect(seen.map(p => p.id)).toEqual([a.id, b.id]);
+        expect(seen.map(p => p.mine)).toEqual([false, cookie === t.owner]);
+        for (const p of seen) expect(p).not.toHaveProperty("contributor");
+      }
+      expect((await t.list(m.participant.cookie)).map(p => p.mine)).toEqual([true, false]);
+      // After the trip it is still open; a trip whose sharing has ended takes no more, and shows what it has.
+      now = +new Date("2026-09-27T01:00:00Z");
+      expect((await (await t.request("", "GET", undefined, t.owner)).json()).state).toBe("reflection");
+      expect((await t.upload(m.participant.cookie)).res.status).toBe(201);
+      expect((await t.request("/freeze", "POST", { confirm: true }, await stepUp(t.request, t.owner), t.stored().document.revision)).status).toBe(200);
+      expect(await error((await t.upload(t.owner)).res)).toEqual([403, "共有終了後は変更できません"]);
+      expect(await t.list(t.owner)).toHaveLength(3);
+      expect((await t.image(t.owner, a.id)).status).toBe(200);
+    });
+    test("photo: the host keeps the ciphertext as given and the record keeps capturedAt in plain and location only as ciphertext", async () => {
+      const t = await withMedia(), { m } = t;
+      const revision = t.stored().document.revision, a = await t.upload(m.participant.cookie);
+      expect(a.res.status).toBe(201);
+      for (const [size, fill, length] of [["display", 1, 5000], ["thumb", 2, 900]] as const) {
+        const r = await t.image(m.viewer.cookie, a.id, size);
+        expect(r.status).toBe(200); expect(r.headers.get("Content-Type")).toBe("application/octet-stream"); expect(r.headers.get("Cache-Control")).toBe("private, max-age=3600");
+        expect(new Uint8Array(await r.arrayBuffer())).toEqual(new Uint8Array(length).fill(fill));
+      }
+      const [shown] = await t.list(m.viewer.cookie);
+      expect(shown).toMatchObject({ id: a.id, capturedAt: "2026-09-25T10:15:00+09:00", width: 1536, height: 2048, thumb: { width: 300, height: 400 } });
+      expect(shown!.location).toMatch(/^v1\.1\./);
+      expect(await openField(t.trip, t.created.id, "photo", a.id, "location", shown!.location!)).toBe('{"lat":35.6812,"lng":139.7671}');
+      expect(JSON.stringify(t.stored())).not.toContain("35.6812");
+      // The record holds no image; a plain location, caption or key is refused.
+      expect(JSON.stringify(t.stored().media)).not.toContain(a.body.images.thumb);
+      for (const plain of [{ location: '{"lat":35.6812,"lng":139.7671}' }, { caption: "朝の市場" }, { key: "photo-key" }]) expect((await t.upload(m.participant.cookie, plain)).res.status).toBe(400);
+      // Nor did it put a line in the capsule's history: five hundred photos would push the invites' history out.
+      expect(t.stored().audit.some((l: { event: string }) => l.event === "media")).toBe(false);
+      // Nothing about the photo moved the trip's revision, so nobody else is told of an update.
+      expect((await (await t.request("", "GET", undefined, t.owner)).json()).document.revision).toBe(revision);
+    });
+    test("photo: the uploader, owner and editor remove; others 403; removed is 404", async () => {
+      const t = await withMedia(), { m } = t;
+      const remove = (cookie: string, id: string) => t.request("/media", "PATCH", { type: "remove", id }, cookie);
+      const [a, b, c, d] = [await t.upload(m.participant.cookie), await t.upload(m.participant.cookie), await t.upload(m.participant.cookie), await t.upload(m.other.cookie)];
+      expect(await error(await remove(m.other.cookie, a.id))).toEqual([403, "自分の写真だけ消せます"]);
+      expect((await remove(m.viewer.cookie, a.id)).status).toBe(403);
+      expect((await remove(m.participant.cookie, a.id)).status).toBe(200);
+      expect((await remove(m.editor.cookie, b.id)).status).toBe(200);
+      expect((await remove(t.owner, c.id)).status).toBe(200);
+      for (const gone of [a, b, c]) { expect((await t.image(t.owner, gone.id)).status).toBe(404); expect((await t.image(t.owner, gone.id, "thumb")).status).toBe(404); }
+      expect(await error(await remove(t.owner, a.id))).toEqual([404, "写真が見つかりません"]);
+      expect((await t.list(m.viewer.cookie)).map(p => p.id)).toEqual([d.id]);
+      // The images are kept under a name the host gave the upload, not the photo's id; what is left is the one photo's two.
+      const [kept] = t.stored().media as Array<{ id: string; blob: string }>;
+      expect(kept!.id).toBe(d.id); expect(kept!.blob).not.toBe(d.id);
+      expect(readdirSync(join(t.dir, t.host.digest(t.created.id))).sort()).toEqual([`${kept!.blob}.display`, `${kept!.blob}.thumb`]);
+      // A seat that is gone leaves its photos with the trip.
+      const seat = await t.self(m.other.cookie);
+      expect((await t.request("/revoke", "POST", { member: seat.id, confirm: true }, await stepUp(t.request, t.owner))).status).toBe(200);
+      expect((await t.list(t.owner)).map(p => p.id)).toEqual([d.id]); expect((await t.image(t.owner, d.id)).status).toBe(200);
+    });
+    test("photo: no seat, a revoked seat or another trip's cookie gets no image", async () => {
+      const t = await withMedia(), { m } = t, a = await t.upload(m.participant.cookie);
+      expect((await t.image("", a.id)).status).toBe(401);
+      const other = await withMedia();
+      expect((await t.image(other.owner, a.id)).status).toBe(401);
+      const seat = await t.self(m.viewer.cookie);
+      expect((await t.request("/revoke", "POST", { member: seat.id, confirm: true }, await stepUp(t.request, t.owner))).status).toBe(200);
+      expect((await t.image(m.viewer.cookie, a.id)).status).toBe(401);
+      expect((await t.request("/media", "POST", {}, m.viewer.cookie)).status).toBe(401);
+      expect((await t.request("/media", "PATCH", { type: "remove", id: a.id }, m.viewer.cookie)).status).toBe(401);
+      // A name that is not a photo of the trip, or not an image of it, is not found.
+      expect((await t.image(t.owner, gid())).status).toBe(404);
+      expect((await t.request(`/media/${a.id}/original`, "GET", undefined, t.owner)).status).toBe(404);
+    });
+    test("photo limits: 500 photos, size, a time without an offset, a location that is not ciphertext", async () => {
+      const t = await withMedia(), { m } = t, post = (over: Record<string, unknown>, sizes?: { display: number; thumb: number }) => t.upload(m.participant.cookie, over, sizes);
+      // Sizes are the sealed bytes' lengths: the limit and the 28 bytes of IV and tag.
+      expect((await post({}, { display: 1024 * 1024 + 28, thumb: 150 * 1024 + 28 })).res.status).toBe(201);
+      expect(await error((await post({}, { display: 1024 * 1024 + 29, thumb: 900 })).res)).toEqual([413, "写真が大きすぎます（長辺 2048px・1 MiB まで）"]);
+      expect(await error((await post({}, { display: 5000, thumb: 150 * 1024 + 29 })).res)).toEqual([413, "写真が大きすぎます（長辺 400px・150 KiB まで）"]);
+      expect((await post({}, { display: 28, thumb: 900 })).res.status).toBe(400);
+      expect((await post({ images: { display: "not base64!", thumb: "AAAA" } })).res.status).toBe(400);
+      // Dimensions past the limit, a time without an offset, a plain or wrong-form ciphertext and an id that is taken.
+      expect((await post({ width: 2049 })).res.status).toBe(400); expect((await post({ height: 0 })).res.status).toBe(400); expect((await post({ thumb: { width: 401, height: 300 } })).res.status).toBe(400);
+      expect((await post({ capturedAt: "2026-09-25T10:15:00" })).res.status).toBe(400); expect((await post({ capturedAt: "昼" })).res.status).toBe(400);
+      expect((await post({ location: "v1.x" })).res.status).toBe(400);
+      const first = (await t.list(m.participant.cookie))[0]!;
+      expect(await error((await post({ id: first.id })).res)).toEqual([409, "同じ写真がもう上がっています"]);
+      expect((await post({ unknown: 1 })).res.status).toBe(400);
+      // The 500th is taken, the next refused, whatever the record holds.
+      const row = (await t.host.store.get(t.host.digest(t.created.id)))!, c = JSON.parse(row.payload!);
+      c.media = [...c.media, ...Array.from({ length: 498 }, (_, i) => ({ id: i.toString(16).padStart(32, "0"), contributor: "gone", uploadedAt: "2026-09-25T00:00:00.000Z", width: 1, height: 1, thumb: { width: 1, height: 1 }, key: "v1.1.x" }))];
+      expect(await t.host.store.save(row, JSON.stringify(c), row.purge_at, now)).toBe(true);
+      expect((await post({})).res.status).toBe(201);
+      expect(await error((await post({})).res)).toEqual([413, "この旅行の写真は 500 枚までです"]);
+      // A trip not yet sealed has no key to seal a photo with.
+      const plain = await setup(undefined, { MEDIA: new LocalMediaStore(t.dir), CAPSULE_PHOTOS: "1" }), owner = await stepUp(plain.request, await plain.login(plain.created.url));
+      expect(await error(await plain.request("/media", "POST", {}, owner))).toEqual([409, "旅行を暗号化してから写真を上げてください"]);
+    });
+    test("photo: off unless the operator turns it on — nothing is put up, the trip says so, and what is there is still read and taken out", async () => {
+      const dir = mkdtempSync(join(tmpdir(), "capsule-host.media.")); dirs.push(dir);
+      const t = await withMedia(), off = await sealedTrip({ MEDIA: new LocalMediaStore(dir) }), id = gid();
+      expect((await (await off.request("", "GET", undefined, off.owner)).json()).photos).toBe(false);
+      expect((await t.request("", "GET", undefined, t.owner)).status).toBe(200); expect((await (await t.request("", "GET", undefined, t.owner)).json()).photos).toBe(true);
+      const body = { id, images: { display: Buffer.alloc(40).toString("base64"), thumb: Buffer.alloc(40).toString("base64") }, width: 1, height: 1, thumb: { width: 1, height: 1 }, key: await sealField(off.trip, off.created.id, 1, "photo", id, "key", "k") };
+      expect(await error(await off.request("/media", "POST", body, off.owner))).toEqual([403, "写真は今は使えません"]);
+      expect(readdirSync(dir)).toEqual([]);
+      // Turned off after photos were put up: they are still read and removed.
+      const a = await t.upload(t.m.participant.cookie); expect(a.res.status).toBe(201);
+      t.host.env.CAPSULE_PHOTOS = "0";
+      expect((await t.image(t.owner, a.id)).status).toBe(200); expect(await error((await t.upload(t.m.participant.cookie)).res)).toEqual([403, "写真は今は使えません"]);
+      expect((await t.request("/media", "PATCH", { type: "remove", id: a.id }, t.m.participant.cookie)).status).toBe(200);
+    });
+    test("photo limits: a host with no place for photos refuses them, and the screen's csp lets a blob: image show", async () => {
+      const t = await sealedTrip({ CAPSULE_PHOTOS: "1" }), id = gid();
+      expect((await t.request("/media", "POST", { id, images: { display: Buffer.alloc(40).toString("base64"), thumb: Buffer.alloc(40).toString("base64") }, width: 1, height: 1, thumb: { width: 1, height: 1 }, key: await sealField(t.trip, t.created.id, 1, "photo", id, "key", "k") }, t.owner)).status).toBe(503);
+      const read = await t.request("", "GET", undefined, t.owner);
+      expect(read.headers.get("Content-Security-Policy")).toContain("img-src 'self' data: blob:;"); expect(read.headers.get("Cache-Control")).toBe("no-store");
+    });
+    test("photo: an upload that fails, loses the race for the capsule or meets a purge leaves no image; one that is not its own never writes over a photo", async () => {
+      // A capsule that cannot hold the record: the images were put, and are taken out again.
+      const full = await withMedia();
+      const row = (await full.host.store.get(full.host.digest(full.created.id)))!, c = JSON.parse(row.payload!);
+      c.audit = Array.from({ length: 5 }, () => ({ event: "x", at: 1, pad: "x".repeat(400_000) }));
+      expect(await full.host.store.save(row, JSON.stringify(c), row.purge_at, now)).toBe(true);
+      expect(await error((await full.upload(full.m.participant.cookie)).res)).toEqual([413, "カプセルの容量上限です"]);
+      expect(readdirSync(full.dir)).toEqual([]);
+      // Losing the race for the capsule once: the images are put once, kept by the one record, and the upload goes through.
+      let puts = 0, race: () => Promise<void> = async () => {};
+      const t = await withMedia(real => ({ put: async (p, n, b) => { puts++; await real.put(p, n, b); const hook = race; race = async () => {}; await hook(); }, get: (p, n) => real.get(p, n), remove: (p, n) => real.remove(p, n), removeAll: p => real.removeAll(p) }));
+      race = async () => { expect((await t.request("/footprints", "PATCH", { type: "remove", id: "none" }, t.owner)).status).toBe(404); const r = (await t.host.store.get(t.host.digest(t.created.id)))!; expect(await t.host.store.save(r, r.payload, r.purge_at, now)).toBe(true); };
+      const a = await t.upload(t.m.participant.cookie); expect(a.res.status).toBe(201);
+      expect(puts).toBe(2); expect(readdirSync(join(t.dir, t.host.digest(t.created.id)))).toHaveLength(2);
+      // The same id again: refused, and the first photo's bytes are as they were.
+      const again = await t.upload(t.m.other.cookie, { id: a.id });
+      expect(await error(again.res)).toEqual([409, "同じ写真がもう上がっています"]);
+      expect(new Uint8Array(await (await t.image(t.owner, a.id)).arrayBuffer())).toEqual(new Uint8Array(5000).fill(1));
+      expect(readdirSync(join(t.dir, t.host.digest(t.created.id)))).toHaveLength(2);
+      // A purge that lands between the two images: the upload meets a deleted trip, and what it put is taken out.
+      const raced = await withMedia(real => ({ put: async (p, n, b) => { await real.put(p, n, b); const hook = race; race = async () => {}; await hook(); }, get: (p, n) => real.get(p, n), remove: (p, n) => real.remove(p, n), removeAll: p => real.removeAll(p) }));
+      race = async () => { expect((await raced.request("/purge", "POST", { title: "" }, await stepUp(raced.request, raced.owner))).status).toBe(200); };
+      expect((await raced.upload(raced.m.participant.cookie)).res.status).toBe(410);
+      expect(readdirSync(raced.dir)).toEqual([]);
+    });
+    test("photo limits: a page reading hundreds of images is counted by seat and apart from the address's count, which the rest of the API keeps", async () => {
+      const t = await withMedia(), a = await t.upload(t.m.participant.cookie), ip = "198.51.100.7";
+      const get = (path: string) => t.host.fetch(new Request(`${origin}/v1/c/${t.created.id}${path}?ui=2`, { headers: { Origin: origin, Cookie: t.m.participant.cookie, "cf-connecting-ip": ip } }));
+      for (let i = 0; i < 600; i++) expect((await get(`/media/${a.id}/thumb`)).status).toBe(200);
+      expect((await get(`/media/${a.id}/thumb`)).status).toBe(429);
+      // The same address still reads the trip: the images did not use up its 300 a minute.
+      expect((await get("")).status).toBe(200);
+    });
+    test("photo purge: owner purge, terminate and the sweep empty the media directory", async () => {
+      for (const how of ["purge", "terminate", "sweep"] as const) {
+        const t = await withMedia(), { m } = t, prefix = t.host.digest(t.created.id);
+        const a = await t.upload(m.participant.cookie); expect(a.res.status).toBe(201); expect((await t.upload(t.owner)).res.status).toBe(201);
+        expect(readdirSync(join(t.dir, prefix))).toHaveLength(4);
+        if (how === "purge") expect((await t.request("/purge", "POST", { title: "" }, await stepUp(t.request, t.owner))).status).toBe(200);
+        else if (how === "terminate") expect((await t.host.fetch(new Request(origin + `/v1/c/${t.created.id}/terminate`, { method: "POST", headers: { Origin: origin, "Content-Type": "application/json" }, body: JSON.stringify({ id: t.created.id, confirm: true }) }))).status).toBe(200);
+        else { now = +new Date(t.seed.spec.lifecycle.purgeAt) + 1000; await t.host.sweep(now); }
+        expect(readdirSync(t.dir)).toEqual([]);
+        expect((await t.host.store.get(prefix))!.payload).toBeNull();
+        if (how !== "sweep") expect((await t.image(t.owner, a.id)).status).toBe(410);
+      }
+    });
+    test("photo purge: a sweep whose media removal fails leaves the trip for the next sweep", async () => {
+      let failing = true;
+      const t = await withMedia(real => ({ put: (p, n, b) => real.put(p, n, b), get: (p, n) => real.get(p, n), remove: (p, n) => real.remove(p, n), removeAll: p => failing ? Promise.reject(new Error("down")) : real.removeAll(p) }));
+      const prefix = t.host.digest(t.created.id), lines: string[] = []; t.host.log = l => lines.push(l.reason);
+      expect((await t.upload(t.m.participant.cookie)).res.status).toBe(201);
+      now = +new Date(t.seed.spec.lifecycle.purgeAt) + 1000; await t.host.sweep(now);
+      expect((await t.host.store.get(prefix))!.payload).not.toBeNull(); expect(readdirSync(join(t.dir, prefix))).toHaveLength(2); expect(lines).toContain("sweep:media");
+      failing = false; await t.host.sweep(now);
+      expect((await t.host.store.get(prefix))!.payload).toBeNull(); expect(readdirSync(t.dir)).toEqual([]);
+    });
   });
 });
 
@@ -4217,8 +4420,8 @@ describe("after the new screen is out", () => {
 // A sealed trip whose owner seat holds the trip key, and members given it by the confirmation-code handoff (#702), with the
 // browsers' own functions. The seat keys stay in the test, as in the browsers.
 type Keyed = { cookie: string; id: string; grant: string; seat: SeatKeys; pub: { x25519: string; ed25519: string } };
-async function keyedTrip() {
-  const t = await setup(), cookie = await stepUp(t.request, await t.login(t.created.url));
+async function keyedTrip(env: { MEDIA?: MediaStore; CAPSULE_PHOTOS?: string } = {}) {
+  const t = await setup(undefined, env), cookie = await stepUp(t.request, await t.login(t.created.url));
   const seat = await newSeatKeys(), pub = await seatPublic(seat), trip = await newTripKey(), wrap = await wrapTripKey(trip, pub.x25519, t.created.id, 1);
   expect((await t.request("/keys", "PATCH", { type: "seat", ...pub, ephemeral: wrap.ephemeral, generation: 1, wrapped: wrap.wrapped }, cookie)).status).toBe(200);
   const read = async (c: string) => (await (await t.request("", "GET", undefined, c)).json()) as any;
@@ -4343,7 +4546,7 @@ describe("rekey", () => {
     const view = await t.read(by.cookie), grants = await (await t.request("/grants", "GET", undefined, by.cookie)).json();
     const old = await unwrapTripKey(view.seatKey.wrapped, view.seatKey.ephemeral, by.seat.x25519.privateKey, t.created.id, view.sealed.generation, true);
     const key = await newTripKey(), gen = generation ?? view.sealed.generation + 1;
-    const sealed = await resealAll(old, key, t.created.id, gen, { spec: view.spec, document: view.document, footprints: view.footprints.map((p: any) => ({ id: p.id, point: p.point, by: p.by })), members: grants.flatMap((g: any) => g.members).map((m: any) => ({ id: m.id, label: m.label })), grants: grants.map((g: any) => ({ id: g.id, label: g.label })) });
+    const sealed = await resealAll(old, key, t.created.id, gen, { spec: view.spec, document: view.document, footprints: view.footprints.map((p: any) => ({ id: p.id, point: p.point, by: p.by })), media: view.media, members: grants.flatMap((g: any) => g.members).map((m: any) => ({ id: m.id, label: m.label })), grants: grants.map((g: any) => ({ id: g.id, label: g.label })) });
     const seats = await Promise.all(to.map(async s => { const w = await wrapTripKey(key, s.pub.x25519, t.created.id, gen); return { seat: s.id, ...w, signature: await signRekey(by.seat.ed25519.privateKey, { capsuleId: t.created.id, generation: gen, seat: s.id, x25519: s.pub.x25519, ...w }) }; }));
     const body = { generation: gen, ...sealed, seats, confirm: true };
     return { key, old, gen, body, send: (over: object = {}, cookie = by.cookie) => t.request("/rekey", "POST", { ...body, ...over }, cookie, view.document.revision) };
@@ -4390,6 +4593,29 @@ describe("rekey", () => {
     const g = await (await t.request("/grants", "POST", { role: "owner", id: crypto.randomUUID().replaceAll("-", ""), expiresAt: t.seed.spec.lifecycle.purgeAt, confirm: true, rotate: t.owner.grant }, t.owner.cookie)).json();
     const next = await stepUp(t.request, await t.login(g.url));
     expect(await error(await t.request("/rekey", "POST", r.body, next, (await t.read(next)).document.revision))).toEqual([409, "旅行の鍵がありません"]);
+  });
+  test("写真: a photo's key, location and caption are sealed again with the trip; its images stay as they are and open under the new key", async () => {
+    now = during;
+    const dir = mkdtempSync(join(tmpdir(), "capsule-host.media.")); const media = new LocalMediaStore(dir);
+    try {
+      const t = await keyedTrip({ MEDIA: media, CAPSULE_PHOTOS: "1" }), a = await t.hand(t.owner, await t.join());
+      const id = crypto.randomUUID().replaceAll("-", ""), seal = (key: CryptoKey, gen: number, field: string, plain: string) => sealField(key, t.created.id, gen, "photo", id, field, plain);
+      const shown = Buffer.alloc(300, 9).toString("base64");
+      expect((await t.request("/media", "POST", { id, images: { display: shown, thumb: shown }, width: 10, height: 10, thumb: { width: 10, height: 10 }, key: await seal(t.trip, 1, "key", "photo-key"), location: await seal(t.trip, 1, "location", "here"), caption: await seal(t.trip, 1, "caption", "朝") }, a.cookie)).status).toBe(201);
+      const r = await rekey(t, t.owner, [t.owner, a]);
+      expect(r.body.media).toEqual([{ id, key: expect.stringMatching(/^v1\.2\./), location: expect.stringMatching(/^v1\.2\./), caption: expect.stringMatching(/^v1\.2\./) }]);
+      // A photo the host holds that the body leaves out, or a caption it drops, is not the trip as it stands.
+      const refused = async (over: object) => (await r.send(over)).status;
+      expect(await refused({ media: [] })).toBe(409); expect(await refused({ media: [{ ...r.body.media[0]!, caption: undefined }] })).toBe(409);
+      // A key still of the old generation is refused as every ciphertext of one is.
+      expect(await refused({ media: [{ ...r.body.media[0]!, key: await seal(t.trip, 1, "key", "photo-key") }] })).toBe(400);
+      expect((await r.send()).status).toBe(200);
+      const [kept] = t.stored().media;
+      expect(kept).toMatchObject({ id, contributor: a.id, width: 10 }); expect(generations(kept)).toEqual(new Set([2]));
+      const opened = await opens(t, a, 2);
+      for (const [field, plain] of [["key", "photo-key"], ["location", "here"], ["caption", "朝"]] as const) expect(await openField(opened.key, t.created.id, "photo", id, field, kept[field])).toBe(plain);
+      expect(Buffer.from((await media.get(t.host.digest(t.created.id), `${kept.blob}.display`))!).toString("base64")).toBe(shown);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   test("古い世代の書き込み: once replaced, ciphertext of the previous generation is refused; the next generation's passes", async () => {
     now = during;

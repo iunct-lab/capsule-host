@@ -1034,7 +1034,7 @@ async function seat() {
   assert.equal(await member.evaluate(`(async () => (await vfetch("/v1/c/${capsuleId}")).status)()`), 200);
   // (d) #689: a seat that is not the owner's holds no key yet: the page says it waits, and the plan reads as it did.
   assert.deepEqual(await member.evaluate(`[document.querySelector('[data-trip-key]')?.dataset.tripKey, document.querySelector('[data-trip-key]')?.textContent, !!document.querySelector(".timeline, .timeline-list")]`), ["waiting", "鍵を待っています。鍵を持つメンバーと確認コードを伝え合うと受け取れます", true]);
-  // (d2) #690: the confirmation-code handoff between two browsers (docs/design/trip-e2e.md §2.1 案 A). The participant presses
+  // (d2) #690: the confirmation-code handoff between two browsers (docs/ephemeral-trip-capsule.md「5.1 旅行の鍵と受け渡し」). The participant presses
   // 鍵を受け取る, the owner sees the seat waiting and presses 渡す. A wrong code puts nothing on the seat and says so; trying
   // again changes the commitment; then each types the other's code and the participant opens the plan with the key.
   const wrongCode = "確認コードが違います。もう一度やり直してください";
@@ -1435,6 +1435,8 @@ async function passkey() {
   // (i, continued) "パスキーを登録し直す" says what it takes, then the OS checks the current passkey and makes the new one. The old
   // phone is then lost: its passkey is taken off the authenticator, so the purge below can only be checked by the new one.
   await owner.reload(); await owner.evaluate(answerYes);
+  const wrapped = `(async () => !!(await (await vfetch("/v1/c/${capsuleId}")).json()).seatKey?.secret)()`;
+  assert.equal(await owner.evaluate(wrapped), true, "the seat's keys were not wrapped by the owner's passkey before its replacement");
   // The browser's copy of the seat's keys is gone (IndexedDB cleared, the cookie kept): the replacement opens them from the
   // current passkey's PRF first, so the host's wrapped secret is not dropped with nothing to wrap again (#689).
   await owner.evaluate(`new Promise(ok => { const q = indexedDB.deleteDatabase("capsule"); q.onsuccess = q.onerror = q.onblocked = () => ok(true); })`);
@@ -1445,7 +1447,7 @@ async function passkey() {
   for (const credentialId of replaced) await owner.cdp("WebAuthn.removeCredential", { authenticatorId, credentialId });
   // (b) #689: the replacement wrapped the seat's private key with the new passkey's PRF. With the IndexedDB gone and the seat signed
   // out, 「パスキーで戻る」 opens it with the one check and the page says this device holds the key again.
-  assert.equal(await owner.evaluate(`(async () => !!(await (await vfetch("/v1/c/${capsuleId}")).json()).seatKey?.secret)()`), true);
+  assert.equal(await owner.evaluate(wrapped), true);
   await owner.evaluate(`new Promise(ok => { const q = indexedDB.deleteDatabase("capsule"); q.onsuccess = q.onerror = q.onblocked = () => ok(true); })`);
   await owner.evaluate(`(() => { window.confirm = () => true; document.querySelector('footer [data-action="signout"]').click(); return true; })()`);
   await owner.until(`location.pathname === "/"`); await owner.cdp("Page.navigate", { url: `${origin}/c/${capsuleId}` });
@@ -1456,7 +1458,7 @@ async function passkey() {
 }
 async function sealed() {
   const { owner } = await openTrip();
-  // (s) #691: the trip sealed under the trip's key. The screen has no way to start it (§6 の 6), so this page does what the owner's
+  // (s) #691: the trip sealed under the trip's key. The screen has no way to start it, so this page does what the owner's
   // browser will: src/trip-keys.ts is loaded into the page, the seat's private key in IndexedDB opens the trip key, the plan read
   // from the host is sealed and opened back before it is sent, and POST seal goes after the passkey check (as an owner's action).
   // Then the screen draws the plan as before from what it opens, adds with "＋" at the time it offered, moves by the grip,
@@ -1750,7 +1752,7 @@ async function sealed() {
   assert.equal(await reader.evaluate(`document.querySelector("main.empty").textContent.includes("この端末の登録は失効したか、期限が切れました")`), true);
   assert.deepEqual(await reader.evaluate(storedFor(capsuleId)), nothing, "the revoked participant's browser kept the trip's keys or row");
   await reader.close(); await dispose(reader.context); await owner.reload(); await owner.evaluate(answerYes);
-  // (r) #786: チャットで直す and 1 つ前に戻す of the sealed trip, by the page from what it opened (§4). (1) The text copied is the
+  // (r) #786: チャットで直す and 1 つ前に戻す of the sealed trip, by the page from what it opened (spec「5.3 暗号化した旅行で Host にできないこと」). (1) The text copied is the
   // host's of the same trip while it was plain. (2) The same answer gives the same diff; another title for the large change is not
   // sent; the right one applies it, and a reload shows it. (3) An editor may not go back over the owner's change of settings.
   // (4) The owner goes back. (5) An editor's answer that renames the trip changes its items only. (6) A paste with an http link or
@@ -1932,6 +1934,78 @@ async function sealed() {
   assert.equal((await fetch(`${origin}/v1/c/${capsuleId}`)).status, 401, "the capsule is still there (401 without a cookie)");
   await owner.evaluate(`document.querySelector('#dialog [data-action="close"]').click()`);
   await owner.reload(); await owner.evaluate(answerYes);
+  // (t3) #451: the photos under the day's items. On the trip's last day the owner puts items at 11:00, 13:00 and 15:30 by the form
+  // (the page seals them); the participant puts up photos taken at 11:03, 13:02, 15:41 and 00:30 (before the day's first item) and
+  // one without a time. 詳細 shows each under its item, the 00:30 one under 予定の前, and the one without a time on the photos page
+  // only; リスト shows 📷 1 on the 13:00 row. The participant puts the 13:02 one under the 15:30 item with the caption イカ, which the
+  // host holds sealed and the page shows after a reload too; the owner's photo has no such form on the participant's page. The day
+  // does not run off the side at 375px. Last of the sealed trip's scenes, as the items it adds would change what the ones above compare.
+  const member = await takeKey("participant");
+  const lastDay = await owner.evaluate(`(async () => (await (await vfetch("/v1/c/${capsuleId}")).json()).spec.trip.endsOn)()`) as string, lastTaken = lastDay.replaceAll("-", ":"), on = (time: string) => +new Date(`${lastDay}T${time}:00+09:00`);
+  const dayItems = async () => new Map(await owner.evaluate(`(async () => (await (await vfetch("/v1/c/${capsuleId}")).json()).document.items.filter(i => i.day === "${lastDay}" && i.status !== "cancelled" && i.startsAt).map(i => [i.id, i.startsAt]))()`) as Array<[string, string]>);
+  const crowded = [...(await dayItems()).values()].filter(t => [["00:00", "00:30"], ["11:00", "11:03"], ["13:00", "13:02"], ["15:30", "15:41"]].some(([a, b]) => +new Date(t) >= on(a!) && +new Date(t) <= on(b!)));
+  assert.deepEqual(crowded, [], "the last day has an item where this scene's photos go");
+  const pickDay = async (p: NonNullable<typeof owner>, view: "detail" | "list" = "detail") => {
+    await tabTo(p, "days", ".timeline, .timeline-list");
+    await p.evaluate(`document.querySelector('[data-action="day"][data-day="${lastDay}"]').click()`); await p.until(`document.querySelector('[data-action="day"][data-day="${lastDay}"]')?.getAttribute("aria-pressed") === "true"`);
+    await p.evaluate(`document.querySelector('[data-action="timeline-view"][data-view="${view}"]').click()`); await p.until(`!!document.querySelector("${view === "detail" ? ".timeline" : ".timeline-list"}")`);
+  };
+  await owner.reload(); await pickDay(owner);
+  const planned: Record<string, string> = {};
+  for (const [time, name] of [["11:00", "写真確認 唐津"], ["13:00", "写真確認 呼子"], ["15:30", "写真確認 糸島"]] as const) {
+    await owner.evaluate(`document.querySelector('[data-action="new-item"]').click()`); await owner.until(`!!document.querySelector('#dialog form[data-form="item"]')`);
+    const iid = planned[time] = await owner.evaluate(`document.querySelector('#dialog form[data-form="item"]').dataset.id`) as string;
+    await owner.evaluate(`(() => { const f = document.querySelector('#dialog form[data-form="item"]'); for (const [k, v] of [["title", ${JSON.stringify(name)}], ["day", "${lastDay}"], ["time", "${time}"]]) { const i = f.elements.namedItem(k); i.value = v; i.dispatchEvent(new Event("input", { bubbles: true })); } f.requestSubmit(); return true; })()`);
+    for (let i = 0; i < 100 && !(await dayItems()).has(iid); i++) await sleep(200);
+    assert.equal(+new Date((await dayItems()).get(iid)!), on(time), `the ${time} item was not saved at ${time}`);
+    await owner.until(`!document.querySelector("#dialog")?.open`);
+  }
+  const shot = async (time?: string) => { const b = await jpegIn(member, 320, 240); return time ? withExif(b, exifOf({ taken: `${lastTaken} ${time}:00`, offset: "+09:00" })) : b; };
+  const shots = [{ name: "d.jpg", b64: await shot("11:03") }, { name: "e.jpg", b64: await shot("13:02") }, { name: "f.jpg", b64: await shot("15:41") }, { name: "g.jpg", b64: await shot("00:30") }, { name: "h.jpg", b64: await shot() }];
+  await member.reload(); await photoTab(member); await attach(member, shots);
+  await member.until(`${message} === "5 枚を上げました。" && ${loaded(6)}`, 60000);
+  const mineNow = (await member.evaluate(photoRecords) as Array<{ id: string; capturedAt?: string; mine: boolean; itineraryItemId?: string; caption?: string }>).filter(r => r.mine);
+  const at = (time: string) => mineNow.find(r => r.capturedAt === `${lastDay}T${time}:00+09:00`)!.id, untimed = mineNow.find(r => !r.capturedAt)!.id;
+  assert.equal(mineNow.length, 5);
+  assert.deepEqual(await member.evaluate(`[...document.querySelectorAll('[data-photo-day="unknown"] .photo')].map(b => b.dataset.id)`), [untimed], "the photo without a time is not under 時刻の分からない写真");
+  const under = (iid: string) => `[...document.querySelectorAll('[id="item-${iid}"] .event-photos .photo')].map(b => b.dataset.id)`;
+  await pickDay(member); await member.until(loaded(4), 30000);
+  assert.deepEqual(await member.evaluate(`[${under(planned["11:00"]!)}, ${under(planned["13:00"]!)}, ${under(planned["15:30"]!)}, [...document.querySelectorAll("[data-photos-before] .photo")].map(b => b.dataset.id), !!document.querySelector('.timeline .photo[data-id="${untimed}"]')]`),
+    [[at("11:03")], [at("13:02")], [at("15:41")], [at("00:30")], false], "the photos are not under the items they were taken at");
+  await pickDay(member, "list");
+  assert.equal(await member.evaluate(`document.querySelector('[data-action="open-item"][data-id="${planned["13:00"]}"] .row-photos')?.textContent`), "📷 1");
+  // Put under the 15:30 item by hand, with a caption.
+  await pickDay(member); await member.until(loaded(4), 30000);
+  await member.evaluate(`document.querySelector('.photo[data-id="${at("13:02")}"]').click()`); await member.until(`!!document.querySelector('#dialog form[data-form="photo"]')`);
+  await member.evaluate(`(() => { const f = document.querySelector('#dialog form[data-form="photo"]'); f.elements.namedItem("item").value = "${planned["15:30"]}"; f.elements.namedItem("caption").value = "イカ"; ${message} = ""; f.requestSubmit(); return true; })()`);
+  await member.until(`${message} === "写真を直しました。"`, 20000);
+  const moved = (await member.evaluate(photoRecords) as typeof mineNow).find(r => r.id === at("13:02"))!;
+  assert.equal(moved.itineraryItemId, planned["15:30"]); assert.match(moved.caption!, /^v1\.2\./);  // the key was replaced in (u)
+  assert.equal((await member.evaluate(`(async () => (await (await vfetch("/v1/c/${capsuleId}")).text()).includes("イカ"))()`)), false, "the host holds the caption plain");
+  const captions = (iid: string) => `[...document.querySelectorAll('[id="item-${iid}"] figcaption')].map(c => c.textContent)`;
+  for (const fresh of [false, true]) {
+    if (fresh) { await member.reload(); await pickDay(member); }
+    await member.until(`${loaded(4)} && ${captions(planned["15:30"]!)}.join() === "イカ"`, 30000);
+    assert.deepEqual(await member.evaluate(`[${under(planned["13:00"]!)}, ${under(planned["15:30"]!)}]`), [[], [at("13:02"), at("15:41")]]);
+  }
+  await member.size(375, 812, true); assert.equal(await member.evaluate(`document.documentElement.scrollWidth <= 375`), true, "the day with photos runs off the side at 375px"); await member.size(390, 844, true);
+  await photoTab(member); await member.until(loaded(6), 30000);
+  await member.evaluate(`document.querySelector('.photo[data-id="${ownerId}"]').click()`); await member.until(`!!document.querySelector("#dialog img[data-display]")`);
+  assert.equal(await member.evaluate(`!!document.querySelector('#dialog form[data-form="photo"]')`), false, "the participant may choose the item of the owner's photo"); await closeDialog(member);
+  // The photo without a time, put under the 11:00 item by hand, is there and still under 時刻の分からない写真. A caption past 160
+  // characters is not sent; an emptied one is taken off.
+  const photoForm = (pid: string) => member.evaluate(`(async () => { document.querySelector('.photo[data-id="${pid}"]').click(); for (let i = 0; i < 100 && !document.querySelector('#dialog form[data-form="photo"]'); i++) await new Promise(r => setTimeout(r, 100)); return true; })()`);
+  const sendForm = (fields: Record<string, string>) => member.evaluate(`(() => { const f = document.querySelector('#dialog form[data-form="photo"]'); for (const [k, v] of Object.entries(${JSON.stringify(fields)})) f.elements.namedItem(k).value = v; ${message} = ""; f.requestSubmit(); return true; })()`);
+  await photoForm(untimed); await sendForm({ item: planned["11:00"]!, caption: "あ".repeat(161) });
+  await member.until(`${message} === "一言は 160 字までです"`);
+  assert.equal((await member.evaluate(photoRecords) as typeof mineNow).find(r => r.id === untimed)!.itineraryItemId, undefined, "the form sent something with a caption too long");
+  await sendForm({ item: planned["11:00"]!, caption: "" }); await member.until(`${message} === "写真を直しました。"`, 20000);
+  await member.until(`[...document.querySelectorAll('[data-photo-day="unknown"] .photo')].map(b => b.dataset.id).join() === "${untimed}"`);
+  await photoForm(at("13:02")); await sendForm({ caption: "" }); await member.until(`${message} === "写真を直しました。"`, 20000);
+  assert.equal((await member.evaluate(photoRecords) as typeof mineNow).find(r => r.id === at("13:02"))!.caption, undefined, "the emptied caption is still on the photo");
+  await pickDay(member); await member.until(loaded(5), 30000);
+  assert.deepEqual(await member.evaluate(`[${under(planned["11:00"]!)}, ${captions(planned["15:30"]!)}]`), [[at("11:03"), untimed], []]);
+  await member.close(); await dispose(member.context); await owner.reload(); await owner.evaluate(answerYes);
   console.log("Sealed trip verification: sealed from the page (no plain word held by the host), drawn the same, \"＋\" at the offered time, moved by the grip, a change by the 20-second refresh opened (not drawn as ciphertext), a suggestion promoted last of its day, a 準備 line that does not open counted with no edit of the whole list (and named in 旅を保存), 旅を保存 made by the page (the trip page, the Markdown and the ZIP the host gave for the same trip while plain, none asked of the host; for a participant who took the key, the page and the Markdown without a ZIP), チャットで直す made by the page (the host's text and diff of the same trip while plain, a large change's other title not sent, applied and gone back by the owner, an editor's change of the title left out and the owner's change of settings not gone back by an editor, an http link and a paste past 200,000 bytes refused, no GET revise or revise/check asked, no new word sent or held in plain), ここで直す from the page to Anthropic (answered by CDP: the key checked there and kept wrapped, the trip and the request sent with it, the answer applied through the same diff, none of them sent to or held by the host, no other outside origin), no チャットで直す while a record does not open, 写真 (two pictures with a camera's EXIF put up from the participant's page, laid out by the time taken with the portrait upright, none of the viewer's page's field, no EXIF in what the screen shows and ciphertext at the host with no position, 消す by its uploader and the owner and not another's, nothing off the side at 375px), a purge with another title not sent");
   // (w) #842: the top page forgets a trip it lists that is past its deletion, with what this browser kept for it, without the trip
   // being opened, and after another trip's page wrote the list back first; the live trip stays listed with its keys.
@@ -1949,7 +2023,7 @@ async function sealed() {
   // (w, continued) The owner's own browser keeps nothing of the trip it deleted.
   assert.deepEqual(await owner.evaluate(storedFor(deleted)), nothing, "the owner's browser kept the deleted trip's keys or row"); assert.deepEqual(await owner.evaluate(`[window.asked, window.checks]`), [[], 0]);  // the purge is inside the five minutes of the owner's last check above, so it asks for none
   console.log("Kept by the browser: what a browser keeps for a trip (#842: a 401 not saying the seat is gone taking the trip off the list and keeping the keys, the cookie back opening it with the key; a revoked participant's browser saying why it cannot open the trip and keeping no key, row or 開いたときに足あとを残す of it; the top page forgetting a trip past its deletion with its keys after another trip's page wrote the list back, the live trip kept; the owner's browser keeping nothing of the trip it deleted, and a member's opening a deleted trip to 410 keeping nothing either).");
-  // (v) #694: a plain trip moved by its owner (docs/design/trip-e2e.md §5), on trips and browsers of their own. (a) The owner and a
+  // (v) #694: a plain trip moved by its owner (docs/ephemeral-trip-capsule.md「5.4 平文の旅行を移す」), on trips and browsers of their own. (a) The owner and a
   // participant each leave a point, and the participant reads 「オーナーが開くと…」. (b) The owner presses 移す: the passkey is
   // registered as the check (the virtual authenticator answers); reloaded, the title, the items and both points are drawn as before,
   // the host's answer holding none of them plain. (c) The participant's page asks for the key, the owner's lists the seat waiting,
@@ -2051,7 +2125,7 @@ async function sealed() {
     }
   }
   console.log("Move verification: a plain trip moved by its owner with the passkey check (drawn the same, both points kept, no plain word, point or name held by the host), the participant told before and asked for the key after, the key handed over by the codes; without WebAuthn the owner told to use another browser and the trip left plain.");
-  // (w) #695: the trip key replaced (docs/design/trip-e2e.md §8), on a trip and browsers of their own: the owner moves the trip,
+  // (w) #695: the trip key replaced (docs/ephemeral-trip-capsule.md「5.5 旅行の鍵を替える」), on a trip and browsers of their own: the owner moves the trip,
   // and participants take the key by the codes. (1) 替える: B revoked from 招待とメンバー, the owner's page replaces the key
   // (「旅行の鍵を替えました」): every ciphertext the host holds is of generation 2, A reads the trip on reloading, and the key of
   // generation 1 taken out of B's page opens none of it. (2) たどれない席: A gives the key to C, then A is revoked: the owner's

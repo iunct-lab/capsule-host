@@ -1,7 +1,7 @@
 name: CI
 
 # 型・テスト・ビルド（bun run check）と IaC の lint を、PR と main への push で走らせる。
-# AWS には接続しない（認証情報も OIDC も渡さない）。配置は手元の手順のまま（docs/development-and-release.md）。
+# AWS には接続しない（認証情報も OIDC も渡さない）。配置は手元の手順のまま（aws/README.md）。
 on:
   pull_request: {}
   push:

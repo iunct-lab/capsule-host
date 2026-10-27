@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
-Description: Shared ephemeral trip capsules; no user accounts
+Description: Shared ephemeral capsules; no user accounts
 Parameters:
   WebCodeBucket:
     Type: String
@@ -37,7 +37,7 @@ Parameters:
     Type: String
     Default: ''
     AllowedPattern: '(20[0-9]{2}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z)?'
-    Description: When the new screen was out everywhere (docs/development-and-release.md). A trip published at or after it cannot be used until its owner moves it to the sealed form; empty means not started
+    Description: When the new screen was out everywhere (aws/README.md, the SealedFrom section). A trip published at or after it cannot be used until its owner moves it to the sealed form; empty means not started
   Photos:
     Type: String
     Default: '0'
@@ -60,7 +60,7 @@ Parameters:
   PermissionsBoundary:
     Type: String
     Default: ''
-    Description: The boundary on this stack's roles; dev passes capsule-host-agent-dev-boundary (aws/dev-agent.yaml), prod passes none
+    Description: The permissions boundary put on this stack's roles (optional); empty means none
 Conditions:
   # A Web Function refuses an environment variable whose value is empty (a Lambda accepts it); both of these may be empty on purpose, so the variable is left out then.
   HasClaimCountries: !Not [!Equals [!Ref ClaimCountries, '']]
@@ -154,7 +154,7 @@ Resources:
     Properties:
       LogGroupName: !Sub '/aws/lambda/${Host}'
       RetentionInDays: 90
-  # The Web Function serves /v1/* (docs/design/lambda-web-functions.md). CloudFront signs every request with its origin access control and
+  # The Web Function serves /v1/* (aws/README.md「配置手順」). CloudFront signs every request with its origin access control and
   # the endpoint refuses an unsigned one before this code runs, so no secret header travels. The rate limit and the environment count are the
   # cost ceiling API Gateway's throttle used to be: 100 requests per second is the lowest Web Functions allow, and two environments the lowest count.
   WebRole:
@@ -270,7 +270,7 @@ Resources:
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
-  # Photos, as the members' browsers sealed them under the trip's key (docs/design/trip-e2e.md §3.1): only ciphertext, so the bucket's own
+  # Photos, as the members' browsers sealed them under the trip's key (docs/ephemeral-trip-capsule.md「5.2 暗号化するもの・平文に残すもの」): only ciphertext, so the bucket's own
   # encryption is no protection from the operator, only the default. No public access and no CloudFront route: the Web Function reads it for
   # a seat. A trip's photos are removed with the trip (src/cloud-host.ts); 181 days is a day more than the longest a trip lives, the last resort.
   Media:

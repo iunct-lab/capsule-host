@@ -1,17 +1,17 @@
-// A member's own entries are sealed in the browser, so the host keeps ciphertext only (#343, docs/design/private-entries-e2e.md).
+// A member's own entries are sealed in the browser, so the host keeps ciphertext only (#343, docs/ephemeral-trip-capsule.md「5.6 自分だけの予定・日記の鍵」).
 // Each seat has one random memo key, wrapped with a key derived from its passkey's PRF output and kept on the seat; the browser
 // that unwrapped it keeps it in IndexedDB as a key that cannot be taken out. crypto.subtle only: the screen and aws/verify.ts
 // (under bun) share these functions.
 import type { Spec } from "./schema";
 const INFO = "capsule private entries v1";
-// What the passkey's PRF is evaluated at: the same for every trip and seat, so one passkey gives one output (§2.4).
+// What the passkey's PRF is evaluated at: the same for every trip and seat, so one passkey gives one output (spec「5.6 自分だけの予定・日記の鍵」).
 export const PRF_INPUT = new TextEncoder().encode(INFO);
 const text = (s: string) => new TextEncoder().encode(s);
 // base64url without padding. Built a character at a time: a sealed body is too long to spread into one call.
 export const b64 = (b: ArrayBuffer | Uint8Array) => { let s = ""; for (const c of new Uint8Array(b)) s += String.fromCharCode(c); return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""); };
 export const unb64 = (s: string) => Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0));
 // Ciphertext is `v1.` and the base64url of a fresh 12-byte IV followed by the AES-GCM output (its 16-byte tag included).
-// Under a trip's key it also names the key's generation, `v1.<generation>.` (docs/design/trip-e2e.md §3); base64url has no
+// Under a trip's key it also names the key's generation, `v1.<generation>.` (docs/ephemeral-trip-capsule.md「5.2 暗号化するもの・平文に残すもの」); base64url has no
 // `.`, so the two forms never mix.
 export const pack = (iv: Uint8Array, data: ArrayBuffer, generation?: number) => { const out = new Uint8Array(12 + data.byteLength); out.set(iv); out.set(new Uint8Array(data), 12); return `v1.${generation === undefined ? "" : `${generation}.`}${b64(out)}`; };
 export function unpack(sealed: string) {
@@ -54,7 +54,7 @@ export async function open(key: CryptoKey, sealed: string, aad: string): Promise
 export type PlainEntry = { id: string; kind: "item" | "diary"; day: string; startsAt?: string; endsAt?: string; title: string; body: string; place?: { label: string; publicUrl?: string } };
 export type SealedEntry = Omit<PlainEntry, "title" | "body" | "place"> & { title: string; body: string; place?: string };
 // Each field is sealed against the entry's plain parts, so a ciphertext moved to another entry or field, or a date or time
-// rewritten where the host keeps it, no longer opens (§3). The times are the strings as written.
+// rewritten where the host keeps it, no longer opens (spec「5.6 自分だけの予定・日記の鍵」). The times are the strings as written.
 export const aadOf = (e: Pick<PlainEntry, "id" | "kind" | "day" | "startsAt" | "endsAt">, field: "title" | "body" | "place") => `${e.id}/${field}/${e.kind}/${e.day}/${e.startsAt ?? ""}/${e.endsAt ?? ""}`;
 export async function sealEntry(key: CryptoKey, e: PlainEntry): Promise<SealedEntry> {
   const { title, body, place, ...plain } = e;
@@ -67,7 +67,7 @@ export async function openEntry(key: CryptoKey, e: SealedEntry): Promise<PlainEn
     return { ...plain, title: await open(key, e.title, aadOf(e, "title")), body: await open(key, e.body, aadOf(e, "body")), ...(e.place ? { place: JSON.parse(await open(key, e.place, aadOf(e, "place"))) } : {}) };
   } catch { return null; }
 }
-// A member's own plans and diary as Markdown, made in the browser from what it could open (the host has ciphertext only, §4.3).
+// A member's own plans and diary as Markdown, made in the browser from what it could open (the host has ciphertext only, spec「5.6 自分だけの予定・日記の鍵」).
 // Times read in the trip's zone. The Markdown escaping lives here and src/export.ts uses it too.
 export const md = (s: string) => s.replace(/[\\`*_{}\[\]()<>#!|]/g, "\\$&");
 export function privateMarkdown(spec: Spec, entries: PlainEntry[], unreadable: number, exportedAt: string) {

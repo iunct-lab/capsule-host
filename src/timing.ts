@@ -3,7 +3,7 @@ import { localDay, type Item } from "./schema";
 // The one rule for the time the host gives an item from its neighbours: when it is moved, promoted from a suggestion, and
 // what the edit form offers for an item that has none. A time chosen this way is a placeholder (`timeTentative`), not a decision.
 export const HOUR = 3600000, HALF_HOUR = 1800000, STEP = 300000;
-// What placing an item reads: its day and times, never its words, so a sealed item is placed the same way (docs/design/trip-e2e.md §3.1).
+// What placing an item reads: its day and times, never its words, so a sealed item is placed the same way (docs/ephemeral-trip-capsule.md「5.2 暗号化するもの・平文に残すもの」).
 export type Timed = Pick<Item, "id" | "day" | "startsAt" | "endsAt" | "timezone">;
 const instant = (at?: string) => at === undefined ? undefined : +new Date(at);
 

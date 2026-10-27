@@ -1,13 +1,12 @@
 // A trip is revised the way it was made: by a chat assistant, outside the host. The owner hands it the trip as it stands
 // and the recipe it was made from. Candidates and talk go out by their words only; who wrote them, when, memories
 // and the version stay in the host. Runs in the host and the browser (no node: modules): a sealed trip is revised and
-// undone in the browser from the opened trip with these same functions (docs/design/trip-e2e.md §4).
+// undone in the browser from the opened trip with these same functions (docs/ephemeral-trip-capsule.md「5.3 暗号化した旅行で Host にできないこと」).
 import { checkTrip, validate, type Spec, type Document, type Item, type SealedDocument } from "./schema";
 import { recipe } from "./recipe";
 import { extract, explain } from "./paste";
+import { PASTE_LIMIT } from "./fields";
 
-// The largest answer taken in, in bytes.
-export const PASTE_LIMIT = 200_000;
 
 export const revisable = (spec: Spec, document: Document) =>
   ({ schemaVersion: 1 as const, spec, document: { items: document.items, checklist: document.checklist, notes: document.notes, budget: document.budget, suggestions: document.suggestions.map(({ id, body, promoted }) => ({ id, body, promoted })), comments: document.comments.map(({ id, body }) => ({ id, body })) } });

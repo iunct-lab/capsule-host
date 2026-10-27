@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { host, viewerIp } from "./aws-handler";
-// The entry of the Lambda Web Function behind CloudFront (docs/design/lambda-web-functions.md). CloudFront's origin access control
+// The entry of the Lambda Web Function behind CloudFront (aws/README.md「配置手順」). CloudFront's origin access control
 // signs every request and Lambda refuses an unsigned one before this runs, so nothing here checks a secret header. A request
 // without CloudFront-Viewer-Address (a signed direct call that left it out) has no viewer to name: refused, never given an address.
 const BODY_LIMIT = 2 * 1024 * 1024 + 64 * 1024;

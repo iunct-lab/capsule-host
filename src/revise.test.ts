@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
-import { revisable, reviseText, merge, settle, diff, reviseTrip, undoTrip, PASTE_LIMIT } from "./revise";
+import { revisable, reviseText, merge, settle, diff, reviseTrip, undoTrip } from "./revise";
+import { PASTE_LIMIT } from "./fields";
 import { CloudHost } from "./cloud-host";
 import { LocalD1 } from "./local-d1";
 import { validate } from "./schema";

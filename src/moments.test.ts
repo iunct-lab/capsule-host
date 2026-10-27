@@ -1,6 +1,6 @@
 import { test, expect } from "bun:test";
 import type { Item } from "./schema";
-import { itemAt, linkPhotos, photoDays, photoInstant, photosPageShown, photosUploadable, type Shown } from "./moments";
+import { itemAt, linkPhotos, photoDays, photoInstant, photoPlace, photosPageShown, photosUploadable, type Shown } from "./moments";
 
 const day = "2026-09-24", at = (time: string, on = day) => `${on}T${time}:00+09:00`;
 const spec = { timezone: "Asia/Tokyo", trip: { startsOn: day, endsOn: "2026-09-25", destinations: ["唐津"] } };
@@ -96,4 +96,16 @@ test("photos off: no page unless photos are there, and nothing to put up; on: th
   expect(photosUploadable({ ...trip, photos: false }, true)).toBe(false);
   expect([{ ...trip, role: "viewer" }, { ...trip, state: "frozen" }, { ...trip, sealed: null }, { ...trip, photos: undefined }].map(v => photosUploadable(v, true))).toEqual([false, false, false, false]);
   expect(photosUploadable(trip, false)).toBe(false);
+});
+
+test("place: a photo without its own place takes the footprint nearest its time, within 30 minutes", () => {
+  const point = (time: string, lat: number) => ({ at: at(time), lat, lng: 130 });
+  // 29 minutes away is near enough; 31 is not.
+  expect(photoPlace(null, at("13:02"), [point("12:33", 1), point("13:34", 2)])).toEqual({ lat: 1, lng: 130, from: "footprint" });
+  expect(photoPlace(null, at("13:02"), [point("12:31", 1), point("13:33", 2)])).toBeNull();
+  // The nearest, and the earlier of two as near.
+  expect(photoPlace(null, at("13:00"), [point("13:20", 1), point("13:05", 2), point("12:55", 3)])).toEqual({ lat: 3, lng: 130, from: "footprint" });
+  // Its own place comes first; a photo without a time takes none.
+  expect(photoPlace({ lat: 9, lng: 9 }, at("13:00"), [point("13:00", 1)])).toEqual({ lat: 9, lng: 9, from: "photo" });
+  expect(photoPlace(null, undefined, [point("13:00", 1)])).toBeNull();
 });

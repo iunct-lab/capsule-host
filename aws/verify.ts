@@ -3,7 +3,7 @@ import { randomBytes, randomInt } from "node:crypto";
 import { invoke } from "./invoke";
 import { fakeAuthenticator, testTrip } from "../src/test-fixture";
 import { regionsOf } from "../src/mapdata";
-import { openName, openPoint, sealName, sealPoint, openTrip, resealTrip, sealOperation, sealMove, confirmationCodes, matchesCommitment, newAttempt, newHandoffKeys, newSeatKeys, newTripKey, seatPublic, signEdge, unwrapSeatSecret, unwrapTripKey, wrapSeatSecret, wrapTripKey, acceptRekey, openField, sealPhoto, openPhotoImage, reachableSeats, resealAll, signRekey, type SeatKeys } from "../src/trip-keys";
+import { openName, openPoint, sealName, sealPoint, openTrip, resealTrip, sealOperation, sealMove, confirmationCodes, matchesCommitment, newAttempt, newHandoffKeys, newSeatKeys, newTripKey, seatPublic, signEdge, unwrapSeatSecret, unwrapTripKey, wrapSeatSecret, wrapTripKey, acceptRekey, openField, sealField, sealPhoto, openPhotoImage, reachableSeats, resealAll, signRekey, type SeatKeys } from "../src/trip-keys";
 import { assistSealingKey, newMemoKey, open as openEntryText, openEntry, seal as sealText, sealEntry, unwrapMemoKey, wrapMemoKey, wrappingKey, type SealedEntry } from "../src/private-entries";
 
 // Publishes a disposable fictional capsule through IAM Lambda Invoke, verifies it through CloudFront, then purges it.
@@ -78,7 +78,7 @@ if (!stackName) throw new Error("この関数は CloudFormation のスタック�
 const webEndpoint = await cli("cloudformation", "describe-stacks", "--stack-name", stackName, "--query", "Stacks[0].Outputs[?OutputKey=='WebEndpoint'].OutputValue | [0]") as string | null;
 if (!webEndpoint) throw new Error("スタック出力 WebEndpoint がありません。aws/template.yaml を配置してください");
 // The line (SealedFrom, aws/README.md) is read from the Host's own settings, never passed in. After it, the plain trip this run
-// publishes opens to nothing but its owner's move (docs/design/trip-e2e.md §5): its scenes give way to checks of the line, and
+// publishes opens to nothing but its owner's move (docs/ephemeral-trip-capsule.md「5.4 平文の旅行を移す」): its scenes give way to checks of the line, and
 // the sealed and moved trips' scenes keep to what such a trip allows before its move (#893). Its time is not printed.
 const sealedFrom = await cli("lambda", "get-function-configuration", "--function-name", functionName, "--query", "Environment.Variables.CAPSULE_SEALED_FROM") as string | null;
 if (sealedFrom && Number.isNaN(Date.parse(sealedFrom))) throw new Error("CAPSULE_SEALED_FROM は時刻として読めません（Host も起動のときに断ります）");
@@ -217,7 +217,7 @@ try {
   const opened = await unwrapMemoKey(wrapped, await wrappingKey(prf, capsuleId), capsuleId);
   assert.deepEqual(await Promise.all(kept.map(k => openEntry(opened, k))), [plan, diary]);
   const ownerView = await request(api("")); assert.equal(ownerView.headers.get("ETag"), '"2"'); const seen = await ownerView.text(); assert.ok(!seen.includes(marker) && !seen.includes(sealed.body));
-  // The trip's key (#689, docs/design/trip-e2e.md §2.1): the owner's browser makes it and the seat's key pair, and hands in the
+  // The trip's key (#689, docs/ephemeral-trip-capsule.md「5.1 旅行の鍵と受け渡し」): the owner's browser makes it and the seat's key pair, and hands in the
   // public keys, the trip key wrapped to the seat's X25519 key, and the private keys wrapped by a PRF output (random bytes
   // stand in), after the passkey check. The seat reads them back and opens them; a participant's first put is refused; the
   // grants list shows public keys only. It moves no revision. Their plain bytes are looked for in the table below (dev).
@@ -239,7 +239,7 @@ try {
   assert.deepEqual(selfSeat.publicKey, seatPub); assert.ok(!("seatKey" in selfSeat) && !("secret" in selfSeat));
   assert.ok(![tripWrap.wrapped, tripWrap.ephemeral, seatWrap.x25519, seatWrap.ed25519].some(v => grantsText.includes(v)));
   assert.equal((await request(api(""))).headers.get("ETag"), '"2"');
-  // The handoff by confirmation codes (#690, docs/design/trip-e2e.md §2.1 案 A), both screens played here with the same functions:
+  // The handoff by confirmation codes (#690, docs/ephemeral-trip-capsule.md「5.1 旅行の鍵と受け渡し」), both screens played here with the same functions:
   // the participant waits with a commitment, the owner gives a throwaway key, the participant reveals its public keys, both
   // compute the two codes from what each kept (they match), the owner wraps the trip key to the participant's public key and
   // both sign the other's keys. A seat with no key cannot give (403); the host computes no code and holds no plain key.
@@ -308,7 +308,7 @@ try {
     assert.equal((await invoke(functionName, profile, region, { path: "/v1/capsules/list", payload: {} })).body.find((c: { id: string }) => c.id === capsuleId).mustSeal, true);
     console.log("plain trip after the line: 409 画面を更新してください without ui=2, 409 オーナーがこの旅行を移すまで開けません for an invite, an edit and a footprint, mustSeal for the owner and in the operator's list");
   }
-  // The trip sealed under the trip's key (#691, docs/design/trip-e2e.md §3): a third disposable capsule whose title, an item and
+  // The trip sealed under the trip's key (#691, docs/ephemeral-trip-capsule.md「5.2 暗号化するもの・平文に残すもの」): a third disposable capsule whose title, an item and
   // a suggestion carry a marker. Its owner puts the trip key on the seat, seals the plan it reads with src/trip-keys.ts and posts
   // it after the passkey check; the plan opens back the same, a participant may post (sealed) but not add an item, theme.css and
   // the operator's list read as before, export is 409, and on dev the stored payload of this capsule holds no marker. The purge
@@ -371,7 +371,7 @@ try {
   assert.equal((await request(sAt("/key"), "PUT", { wrapped: assistWrapped }, sealedOwner)).status, 204);
   assert.equal((await (await request(sAt(""), "GET", undefined, sealedOwner)).json()).assistWrapped, assistWrapped);
   console.log("sealed trip: exports hold no plain words, GET undo holds the step back sealed, the assist key is wrapped by the browser, CSP allows api.anthropic.com only");
-  // Footprints, names and the history of the sealed trip (#693, docs/design/trip-e2e.md §3.1): a participant's point and name
+  // Footprints, names and the history of the sealed trip (#693, docs/ephemeral-trip-capsule.md「5.2 暗号化するもの・平文に残すもの」): a participant's point and name
   // sealed against the id the browser chose open back the same, the same seat within the minute is 429 and a viewer 403; the
   // owner names the participant and an invite in ciphertext only, and the history lines name the invite and the seats by id.
   const nameMarker = `sealed-name-${randomBytes(6).toString("hex")}`, point = { lat: Number(`35.68${randomInt(10, 100)}7`), lng: 139.7671, accuracy: 20 };
@@ -388,13 +388,17 @@ try {
   const memberSeat = (await (await request(sAt(""), "GET", undefined, sMember)).json()).self.id as string;
   assert.equal((await request(sAt("/members"), "PATCH", { id: memberSeat, label: nameMarker }, sealedOwner)).status, 400);
   assert.equal((await request(sAt("/members"), "PATCH", { id: memberSeat, label: await sealName(sTrip, sealedId, 1, "member", memberSeat, nameMarker) }, sealedOwner)).status, 200);
+  // #438: a second participant, whom the host refuses the first one's photo (made before the viewer, whose lines the history check below reads first).
+  const otherGrant = gid(), otherMade = photosOn ? await request(sAt("/grants"), "POST", { role: "participant", id: otherGrant, label: await sealName(sTrip, sealedId, 1, "grant", otherGrant, "AWS確認用（別）"), seats: 1, expiresAt: sealedSeed.spec.lifecycle.purgeAt, confirm: true }, sealedOwner) : undefined;
+  if (otherMade) assert.equal(otherMade.status, 201);
+  const sOther = otherMade ? await enter((await otherMade.json()).url) : "";
   const viewerGrant = gid(), viewerMade = await request(sAt("/grants"), "POST", { role: "viewer", id: viewerGrant, label: await sealName(sTrip, sealedId, 1, "grant", viewerGrant, nameMarker), seats: 1, expiresAt: sealedSeed.spec.lifecycle.purgeAt, confirm: true }, sealedOwner);
   assert.equal(viewerMade.status, 201); const sViewer = await enter((await viewerMade.json()).url);
   assert.equal((await leave(sViewer)).status, 403);
   const sGrantsText = await (await request(sAt("/grants"), "GET", undefined, sealedOwner)).text();
   assert.ok(!sGrantsText.includes(nameMarker), "the grants list holds a plain name of the sealed trip");
   assert.equal(await openName(sTrip, sealedId, "grant", viewerGrant, JSON.parse(sGrantsText).find((g: { id: string }) => g.id === viewerGrant).label), nameMarker);
-  // Photos (#437, docs/design/trip-e2e.md §3.1): the participant puts up one, its two images sealed under a key of the photo's own that
+  // Photos (#437, docs/ephemeral-trip-capsule.md「5.2 暗号化するもの・平文に残すもの」): the participant puts up one, its two images sealed under a key of the photo's own that
   // the trip key seals, standing in for a picture with random bytes. The host hands back the ciphertext as it came, to every seat of the
   // trip and to no one else, holds no position in plain, and the images open under the trip key. The photo goes through the key's
   // replacement and the purge below (on dev, the bucket holds two objects for it until then and none after).
@@ -421,6 +425,16 @@ try {
     assert.notEqual(Buffer.compare(Buffer.from(photo.display).subarray(12, 12 + 64), plainImage.subarray(0, 64)), 0);
     photosAt = stackName === "capsule-host-dev" ? await photoPrefix(sealedId) : "";
     if (photosAt) assert.equal(await photoObjects(photosAt), 2, "the photo's two images are not the bucket's two objects");
+    // #438: the photo put under an item by hand and captioned — by the seat that put it up, not by another participant or a viewer.
+    const itemId = (await (await request(sAt(""), "GET", undefined, sealedOwner)).json()).document.items[0].id as string;
+    assert.equal((await request(sAt("/media"), "PATCH", { type: "link", id: photoId, itemId }, sViewer)).status, 403, "a viewer chose the photo's item");
+    assert.equal((await request(sAt("/media"), "PATCH", { type: "link", id: photoId, itemId }, sOther)).status, 403, "another participant chose the photo's item");
+    assert.equal((await request(sAt("/media"), "PATCH", { type: "caption", id: photoId, caption: await sealField(sTrip, sealedId, 1, "photo", photoId, "caption", "別の一言") }, sOther)).status, 403, "another participant wrote the photo's caption");
+    assert.equal((await request(sAt("/media"), "PATCH", { type: "link", id: photoId, itemId }, sMember)).status, 200);
+    assert.equal((await request(sAt("/media"), "PATCH", { type: "caption", id: photoId, caption: await sealField(sTrip, sealedId, 1, "photo", photoId, "caption", "AWS確認の一言") }, sMember)).status, 200);
+    const linked = (await (await request(sAt(""), "GET", undefined, sViewer)).json()).media[0];
+    assert.equal(linked.itineraryItemId, itemId, "the chosen item is not on the photo");
+    assert.equal(await openField(sTrip, sealedId, "photo", photoId, "caption", linked.caption), "AWS確認の一言");
   }
   const sHistory = await (await request(sAt("/history"), "GET", undefined, sealedOwner)).json() as Array<Record<string, unknown>>;
   assert.deepEqual([sHistory[0]!.event, sHistory[0]!.grant, typeof sHistory[0]!.seat, sHistory[1]!.event, sHistory[1]!.grant], ["sessions", viewerGrant, "string", "grants", viewerGrant]);
@@ -436,7 +450,7 @@ try {
     assert.equal(stored.filter(p => p.includes(String(point.lat)) || p.includes(nameMarker)).length, 0, "a sealed trip's point or name is readable in DynamoDB");
     console.log("footprints and names sealed by the trip key (no plain point or name in the table's stored payloads on dev)");
   }
-  // The trip key replaced (#695, docs/design/trip-e2e.md §8) in the same sealed trip: the owner hands the key to the participant (A)
+  // The trip key replaced (#695, docs/ephemeral-trip-capsule.md「5.5 旅行の鍵を替える」) in the same sealed trip: the owner hands the key to the participant (A)
   // and to a second participant (B) by the handoff, as the browsers do (the codes are the screens' and are not compared here). B is
   // revoked: the owner's GET says to replace the key, the owner's browser seals the trip again under generation 2 and wraps it to
   // the seats it reaches (POST rekey). A opens it and takes it as the owner's; B's key of generation 1 opens none of it, and B's
@@ -507,12 +521,18 @@ try {
   assert.equal((await request(sAt("/keys"), "PATCH", { type: "keep" }, sealedOwner)).status, 200);
   assert.equal((await (await request(sAt(""), "GET", undefined, sealedOwner)).json()).rekey, null);
   console.log("trip key replaced: after a member's revocation the owner sealed the trip again under generation 2 (the remaining member reading it, the revoked member's key opening none of it); after recover the new owner was asked and kept the key");
+  // #108: a delegation link is taken under its trip by the owner seat alone (before and after the line): a participant's or a
+  // viewer's seat is refused before any link is looked at, and the owner's goes on to the link (a made-up one: 401). No link
+  // is made here, as a creator's passkey cannot be.
+  const delegation = { secret: "A".repeat(43), challenge: "AAAA", clientDataJSON: "AAAA", authenticatorData: "AAAA", publicKey: "AAAA", algorithm: -7 };
+  for (const seat of [sMember, sViewer]) assert.equal((await request(sAt("/creators/register"), "POST", delegation, seat)).status, 403);
+  assert.equal((await request(sAt("/creators/register"), "POST", delegation, sealedOwner)).status, 401);
   assert.equal((await request(sAt("/purge"), "POST", { title: "" }, sealedOwner)).status, 200);
   assert.equal((await request(sAt(""), "GET", undefined, sealedOwner)).status, 410);
   if (photosOn) assert.equal((await request(sAt(`/media/${photoId}/display`), "GET", undefined, sealedOwner)).status, 410);
-  if (photosAt) { assert.equal(await photoObjects(photosAt), 0, "the purged trip's photos are still in the bucket"); console.log("photos: put up by a participant, the images returned as they came to every seat and to no other, the photo's key sealed again with the trip's, its objects gone from the bucket with the trip"); }
+  if (photosAt) { assert.equal(await photoObjects(photosAt), 0, "the purged trip's photos are still in the bucket"); console.log("photos: put up by a participant, the images returned as they came to every seat and to no other, its item and sealed caption chosen by that seat and not by another participant or a viewer, the photo's key sealed again with the trip's, its objects gone from the bucket with the trip"); }
   sealedId = "";
-  // Moving a plain trip (#694, docs/design/trip-e2e.md §5): a fourth disposable capsule, plain, whose title, an item, a post, the
+  // Moving a plain trip (#694, docs/ephemeral-trip-capsule.md「5.4 平文の旅行を移す」): a fourth disposable capsule, plain, whose title, an item, a post, the
   // participant's name and an invite's name carry a marker, and where the participant and the owner each leave a point. The owner
   // reads it (GET "", GET seal, GET grants), seals all of it with src/trip-keys.ts sealMove and posts it after the passkey check:
   // it opens back the same, a request without the new screen's mark (ui=2) is asked to reload, the operator's list says sealed,
@@ -736,6 +756,11 @@ try {
   assert.equal(refusedCreator.status, 401); assert.equal((await refusedCreator.json()).error, "サインインできませんでした");
   assert.equal((await request("/v1/creators/signout", "POST", {}, "")).status, 401);
   for (const action of ["enroll", "list", "revoke"]) assert.equal((await request(`/v1/creators/${action}`, "POST", action === "list" ? {} : { label: "x", confirm: true }, "")).status, 401);
+  // #108: a delegation link needs a creator's cookie and passkey, taking one needs the trip's owner seat, and revoking a
+  // delegated creator needs the cookie of the creator who delegated.
+  assert.equal((await request("/v1/creators/enroll", "POST", { confirm: true, ownerOf: capsuleId }, "")).status, 401);
+  assert.equal((await request(api("/creators/register"), "POST", { secret: "A".repeat(43), challenge, ...nonsense, publicKey: "AAAA", algorithm: -7 }, "")).status, 401);
+  assert.equal((await request("/v1/creators/revoke", "POST", { creator: "nobody", confirm: true }, "")).status, 401);
   // A creator's trips nobody owns yet are theirs alone: without a creator's cookie there is nothing to list, take or delete.
   for (const body of [{}, { id: capsuleId, owner: true }, { id: capsuleId, purge: true, confirm: true }]) assert.equal((await request("/v1/creators/trips", "POST", body, "")).status, 401);
   // The IAM publisher reaches all three of its creator paths. Enroll without a name and revoke of nobody are refused by the
@@ -813,8 +838,8 @@ try {
   assert.ok(edge !== true, "the access log holds a CloudFront edge's address, not the viewer's");
   console.log(`access log address: ${edge === undefined ? "unknown" : "not an edge (viewer)"}`);
   // After the line, the plain trip's scenes were not run (the dev run without the line goes through them): the summary says what was.
-  if (afterLine) console.log("AWS verification passed (after the line): the plain trip published after it (409 画面を更新してください without ui=2; 409 オーナーがこの旅行を移すまで開けません for an invite, an edit and a footprint; mustSeal for the owner and in the operator's list), a plain trip moved by its owner alone (opened back the same, an older screen asked to reload, listed as sealed), the trip key replaced after a member's revocation (every ciphertext of the next generation in the stored payload, the remaining member reading it, the revoked member's old key not opening it), the new owner asked after recover and keeping the key, a trip sealed under the owner's trip key and its participant invited after the seal (opened back the same, a participant's sealed post taken and item refused, theme.css as before, the operator's list sealed and no longer mustSeal, export 409, a footprint and names sealed, 429 within the minute, 403 for a viewer, purged without a title), function URL direct 403 (always), generation and key registration closed without a creator, no CORS, OPTIONS refused, a cookie moved to another capsule refused; CloudFront's access log and the Host's refused lines (401 / 403 / 429 with IP, path and status; no cookie, invite secret, #k= or title), assets (app.js carrying its packages' notices), IAM-only publish, idempotent publish (a fresh owner link while the seat is free), edge-only API, seat binding, paste endpoints closed without a creator, creator endpoints, the build read by the publisher only, operator list and terminate (IAM only, no title, 410 after), the page's Permissions-Policy, the page files compressed (br / gzip), both map files by range (206), the plain trip purged by its owner with the new screen's mark.");
-  else console.log("AWS verification passed: a plain trip moved by its owner (its points and names sealed with it, opened back the same, an older screen asked to reload, listed as sealed), the trip key replaced after a member's revocation (every ciphertext of the next generation in the stored payload, the remaining member reading it, the revoked member's old key not opening it), the new owner asked after recover and keeping the key, a trip sealed under the owner's trip key (opened back the same, a participant's sealed post taken and item refused, theme.css and the operator's list as before, export 409, purged without a title), function URL direct 403 (always), generation and key registration closed without a creator, no CORS, OPTIONS refused, a cookie moved to another capsule refused, viewer/editor owner-only actions refused; CloudFront's access log and the Host's refused lines (401 / 403 / 429 with IP, path and status; no cookie, invite secret, #k= or title), owner approval, assets (app.js carrying its packages' notices), IAM-only publish, idempotent publish (a fresh owner link while the seat is free), edge-only API, seat binding, per-member revoke (its 401 saying the seat is gone, a signed-out copy's not), permissions, the owner's history of invites (not the editor's), an editor's own viewer invites (another role refused, issued, listed, named in the owner's list, revoked by it and not by a viewer), Origin, revision conflicts, ZIP, the trip page as one file (every role, no private entry), owner recovery, passkey endpoints, paste endpoints closed without a creator, creator endpoints, the build read by the publisher only, operator list and terminate (IAM only, no title, 410 after), revising and undo, editors revising without the settings, reordering a day (the host's time a placeholder, the end carried along; an item without a time given one), an item's end (saved, refused before its start), an item added after another (placed there, its time fitted; another day refused), the 準備 list and 費用メモ changed by the owner (not by a participant), a participant's 候補 rewritten and removed by the owner (not by the participant), a passkey check before the owner's important actions (428 on the cookie alone; reading and editing not asked), no passkey swapped in on the cookie alone, a member signing out (a copy of the cookie refused), creator sign-out closed without a cookie, trip keys put by the owner's browser (wrapped only; not in the table's stored payloads on dev; a participant refused), trip key handed over by confirmation codes (wrapped only), a member's own entry sealed as the screen seals it and read back by that member only (not in the owner's trip or the ZIP; on dev, not in the table's stored payloads either), the page's Permissions-Policy (the position open, the camera and microphone closed), the page files compressed (br / gzip), the footprint map's parts and both map files by range (206), a footprint left by a participant and an automatic one by the owner, read by the owner (no revision moved; the automatic one marked), refused to a viewer, who reads both after the participant's seat was revoked.");
+  if (afterLine) console.log("AWS verification passed (after the line): the plain trip published after it (409 画面を更新してください without ui=2; 409 オーナーがこの旅行を移すまで開けません for an invite, an edit and a footprint; mustSeal for the owner and in the operator's list), a plain trip moved by its owner alone (opened back the same, an older screen asked to reload, listed as sealed), the trip key replaced after a member's revocation (every ciphertext of the next generation in the stored payload, the remaining member reading it, the revoked member's old key not opening it), the new owner asked after recover and keeping the key, a trip sealed under the owner's trip key and its participant invited after the seal (opened back the same, a participant's sealed post taken and item refused, theme.css as before, the operator's list sealed and no longer mustSeal, export 409, a footprint and names sealed, 429 within the minute, 403 for a viewer, purged without a title), function URL direct 403 (always), generation and key registration closed without a creator, no CORS, OPTIONS refused, a cookie moved to another capsule refused; CloudFront's access log and the Host's refused lines (401 / 403 / 429 with IP, path and status; no cookie, invite secret, #k= or title), assets (app.js carrying its packages' notices), IAM-only publish, idempotent publish (a fresh owner link while the seat is free), edge-only API, seat binding, paste endpoints closed without a creator, creator endpoints (a delegation link closed without a creator, taken under the trip by its owner seat alone), the build read by the publisher only, operator list and terminate (IAM only, no title, 410 after), the page's Permissions-Policy, the page files compressed (br / gzip), both map files by range (206), the plain trip purged by its owner with the new screen's mark.");
+  else console.log("AWS verification passed: a plain trip moved by its owner (its points and names sealed with it, opened back the same, an older screen asked to reload, listed as sealed), the trip key replaced after a member's revocation (every ciphertext of the next generation in the stored payload, the remaining member reading it, the revoked member's old key not opening it), the new owner asked after recover and keeping the key, a trip sealed under the owner's trip key (opened back the same, a participant's sealed post taken and item refused, theme.css and the operator's list as before, export 409, purged without a title), function URL direct 403 (always), generation and key registration closed without a creator, no CORS, OPTIONS refused, a cookie moved to another capsule refused, viewer/editor owner-only actions refused; CloudFront's access log and the Host's refused lines (401 / 403 / 429 with IP, path and status; no cookie, invite secret, #k= or title), owner approval, assets (app.js carrying its packages' notices), IAM-only publish, idempotent publish (a fresh owner link while the seat is free), edge-only API, seat binding, per-member revoke (its 401 saying the seat is gone, a signed-out copy's not), permissions, the owner's history of invites (not the editor's), an editor's own viewer invites (another role refused, issued, listed, named in the owner's list, revoked by it and not by a viewer), Origin, revision conflicts, ZIP, the trip page as one file (every role, no private entry), owner recovery, passkey endpoints, paste endpoints closed without a creator, creator endpoints (a delegation link closed without a creator, taken under the trip by its owner seat alone), the build read by the publisher only, operator list and terminate (IAM only, no title, 410 after), revising and undo, editors revising without the settings, reordering a day (the host's time a placeholder, the end carried along; an item without a time given one), an item's end (saved, refused before its start), an item added after another (placed there, its time fitted; another day refused), the 準備 list and 費用メモ changed by the owner (not by a participant), a participant's 候補 rewritten and removed by the owner (not by the participant), a passkey check before the owner's important actions (428 on the cookie alone; reading and editing not asked), no passkey swapped in on the cookie alone, a member signing out (a copy of the cookie refused), creator sign-out closed without a cookie, trip keys put by the owner's browser (wrapped only; not in the table's stored payloads on dev; a participant refused), trip key handed over by confirmation codes (wrapped only), a member's own entry sealed as the screen seals it and read back by that member only (not in the owner's trip or the ZIP; on dev, not in the table's stored payloads either), the page's Permissions-Policy (the position open, the camera and microphone closed), the page files compressed (br / gzip), the footprint map's parts and both map files by range (206), a footprint left by a participant and an automatic one by the owner, read by the owner (no revision moved; the automatic one marked), refused to a viewer, who reads both after the participant's seat was revoked.");
 } finally {
   // A failure here must not keep the first capsule from its purge below.
   if (sealedId) try { const r = await invoke(functionName, profile, region, { path: `/v1/c/${sealedId}/terminate`, payload: { id: sealedId, confirm: true } }); console.log([200, 410].includes(r.statusCode) ? "The sealed disposable capsule was terminated." : `The sealed disposable capsule was not terminated (${r.statusCode}); check it with aws/capsules.ts list.`); } catch (e) { console.log(`The sealed disposable capsule was not terminated: ${(e as Error).message}`); }

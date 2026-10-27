@@ -4,9 +4,9 @@
 
 // `contributor` is the uploader's `Session.id`; it stays in the host and the page is told only whether a photo is its own.
 // `itineraryItemId` is the item a member chose for the photo by hand; the host does not set it (which item a photo goes under is
-// worked out by `linkPhotos` in src/moments.ts each time it is drawn). What the browser sealed (docs/design/trip-e2e.md §3.1) is
+// worked out by `linkPhotos` in src/moments.ts each time it is drawn). What the browser sealed (docs/ephemeral-trip-capsule.md「5.2 暗号化するもの・平文に残すもの」) is
 // ciphertext of the trip key: `location` and `caption`, and `key`, the random key the photo's two images are sealed under, so a
-// new trip key has these few strings to seal again and no image to fetch and send back (§8). The images are in the MediaStore,
+// new trip key has these few strings to seal again and no image to fetch and send back (spec「5.5 旅行の鍵を替える」). The images are in the MediaStore,
 // under `blob`, a name the host gives each upload: an upload that loses a race or fails can take back its own images, and no other
 // upload can write over a committed photo's.
 export type PhotoAsset = { id: string; contributor: string; capturedAt?: string; uploadedAt: string; width: number; height: number; thumb: { width: number; height: number }; itineraryItemId?: string; blob: string; key: string; location?: string; caption?: string };

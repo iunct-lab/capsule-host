@@ -3,7 +3,7 @@ import { CIPHER, validate, validateSealed, sealedOperationSchema, type SealedDoc
 import { b64, pack, unpack } from "./private-entries";
 import { testTrip } from "./test-fixture";
 
-// A stand-in ciphertext of the right form: the host cannot tell it from a real one, and needs not (§4).
+// A stand-in ciphertext of the right form: the host cannot tell it from a real one, and needs not (spec「5.3 暗号化した旅行で Host にできないこと」).
 const fake = () => `v1.1.${b64(crypto.getRandomValues(new Uint8Array(40)))}`;
 function sealedTrip(): { spec: SealedSpec; document: SealedDocument } {
   const { spec, document } = testTrip();
@@ -26,7 +26,7 @@ function sealedTrip(): { spec: SealedSpec; document: SealedDocument } {
 const created = Date.parse("2026-09-01T00:00:00Z");
 
 describe("the sealed trip's form", () => {
-  test("sealed trip shape: ciphertext where docs/design/trip-e2e.md §3.1 seals, the plain parts as they are", () => {
+  test("sealed trip shape: ciphertext where docs/ephemeral-trip-capsule.md「5.2 暗号化するもの・平文に残すもの」 seals, the plain parts as they are", () => {
     const t = sealedTrip();
     expect(() => validateSealed(t.spec, t.document, created)).not.toThrow();
     // A plain trip is still checked by the plain rules only, and a sealed one does not pass them.

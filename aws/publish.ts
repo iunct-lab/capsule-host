@@ -25,7 +25,7 @@ const deployed: { src?: string } = await invoke(functionName, profile, region, {
   if (!e.message.includes("Unsupported publisher path")) throw e;
   return stop("配置済みのHostが古く、何から作ったかを返せません。Hostを配置し直してください（aws/README.md「配置手順」）。");
 });
-if (deployed.src !== local.src) stop(`配置済みのHostと手元（${local.commit}）でsrcが違います（Host ${deployed.src ?? "unknown"} / 手元 ${local.src}）。同じsrcで使ってください: Hostを手元のコミットで配置し直す（aws/README.md「配置手順」）か、手元をそのHostを配置したコミット（docs/releases.md の同じ環境の最新の行。srcのツリーハッシュが同じならどのコミットでもよい）に合わせる（git fetch のあと git switch --detach <コミット>）。`);
+if (deployed.src !== local.src) stop(`配置済みのHostと手元（${local.commit}）でsrcが違います（Host ${deployed.src ?? "unknown"} / 手元 ${local.src}）。同じsrcで使ってください: Hostを手元のコミットで配置し直す（aws/README.md「配置手順」）か、手元をそのHostを配置したコミット（srcのツリーハッシュが同じならどのコミットでもよい）に合わせる（git fetch のあと git switch --detach <コミット>）。`);
 if (approvedHash !== hash) {
   console.log(`検証済み旅程 SHA-256: ${hash}\n内容・共有範囲を確認して、このハッシュを末尾に指定してください。まだ送信していません。`);
 } else if (await Bun.file(destination).exists()) {

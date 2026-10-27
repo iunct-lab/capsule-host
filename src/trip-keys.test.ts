@@ -49,7 +49,7 @@ describe("trip keys", () => {
   });
 });
 
-describe("確認コードの受け渡し（§2.1 案 A）", () => {
+describe("確認コードの受け渡し（spec「5.1 旅行の鍵と受け渡し」）", () => {
   const cap = "trip-a";
   const parties = async () => {
     const giverSeat = await seatPublic(await newSeatKeys()), memberSeat = await seatPublic(await newSeatKeys());

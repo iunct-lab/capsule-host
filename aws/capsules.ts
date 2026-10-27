@@ -1,7 +1,7 @@
 import { invoke } from "./invoke";
 // The operator's view of the Host: every live capsule by its id, kind, state, dates and counts (never its title, plan or
 // members' names), whether its plan is sealed (`sealed`) and whether it cannot be used until its owner moves
-// it (`mustSeal`: published after the host's SealedFrom, docs/design/trip-e2e.md §5), and ending one at once.
+// it (`mustSeal`: published after the host's SealedFrom, docs/ephemeral-trip-capsule.md「5.4 平文の旅行を移す」), and ending one at once.
 // Only this IAM-authorized command reaches either; no browser can.
 const usage = [
   "Usage: bun aws/capsules.ts list <function> <profile> [region]",

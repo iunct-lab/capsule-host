@@ -1,4 +1,4 @@
-// The trip's key and each seat's key pair (docs/design/trip-e2e.md §2.1). The browser makes them; the host keeps only
+// The trip's key and each seat's key pair (docs/ephemeral-trip-capsule.md「5.1 旅行の鍵と受け渡し」). The browser makes them; the host keeps only
 // public keys and what is already wrapped, so it can open nothing. crypto.subtle only (X25519, Ed25519, HKDF, AES-GCM):
 // the screen and aws/verify.ts (under bun) share these functions. Ciphertext has the shape of private-entries.ts (`v1.`).
 import { b64, pack, unb64, unpack } from "./private-entries";
@@ -31,7 +31,7 @@ const tripAad = (capsuleId: string, generation: number) => text(`${capsuleId}/${
 
 // The trip key for one seat: a throwaway X25519 pair, ECDH with the seat's public key, HKDF, AES-GCM. The throwaway
 // private key is not kept, so only the seat's private key opens it.
-// A handoff (§2.1 案 A) passes its own throwaway pair (newHandoffKeys), whose public half the member's screen has already
+// A handoff (spec「5.1 旅行の鍵と受け渡し」) passes its own throwaway pair (newHandoffKeys), whose public half the member's screen has already
 // confirmed with the codes; without one a fresh pair is made as before.
 export async function wrapTripKey(trip: CryptoKey, seatX25519: string, capsuleId: string, generation: number, ephemeralPair?: CryptoKeyPair): Promise<{ wrapped: string; ephemeral: string }> {
   const eph = ephemeralPair ?? await crypto.subtle.generateKey("X25519", false, ["deriveBits"]) as CryptoKeyPair;
@@ -68,7 +68,7 @@ export async function unwrapSeatSecret(wrapped: SeatPublic, prf: BufferSource, c
   return { x25519: await one(wrapped.x25519, "x25519", "X25519", ["deriveBits"]), ed25519: await one(wrapped.ed25519, "ed25519", "Ed25519", ["sign"]) };
 }
 
-// The confirmation-code handoff (docs/design/trip-e2e.md §2.1 案 A). Pure functions only: the screen keeps the values it
+// The confirmation-code handoff (docs/ephemeral-trip-capsule.md「5.1 旅行の鍵と受け渡し」). Pure functions only: the screen keeps the values it
 // saw (never re-reads them from the host) and the host calls none of these, so it never computes or holds a code.
 const raw = (b64url: string) => unb64(b64url);
 const concat = (...parts: Uint8Array[]) => {
@@ -110,7 +110,7 @@ export async function newHandoffKeys(): Promise<{ pair: CryptoKeyPair; ephemeral
   return { pair, ephemeral: b64(await crypto.subtle.exportKey("raw", pair.publicKey)) };
 }
 
-// The edge (§2.1 "確かめた公開鍵の名簿"): this seat's signature over another seat's confirmed public keys.
+// The edge (spec「5.1 旅行の鍵と受け渡し」): this seat's signature over another seat's confirmed public keys.
 type EdgeTarget = { seat: string; x25519: string; ed25519: string };
 const edgeText = (o: EdgeTarget, capsuleId: string) => text(`capsule edge v1/${capsuleId}/${o.seat}/${o.x25519}/${o.ed25519}`);
 export async function signEdge(ed25519Private: CryptoKey, other: EdgeTarget, capsuleId: string): Promise<string> {
@@ -123,9 +123,9 @@ export async function verifyEdge(ed25519Public: string, signature: string, other
   } catch { return false; }
 }
 
-// A trip's words, sealed record by record under the trip's key (docs/design/trip-e2e.md §3, §3.1). The associated data
+// A trip's words, sealed record by record under the trip's key (docs/ephemeral-trip-capsule.md「5.2 暗号化するもの・平文に残すもの」). The associated data
 // names where the words belong, `<capsule id>/<kind>/<record id>/<field>`, so ciphertext moved to another trip, record or
-// field no longer opens. An item's date and times are not in it: the host rewrites them when it places an item (§3).
+// field no longer opens. An item's date and times are not in it: the host rewrites them when it places an item (spec「5.2 暗号化するもの・平文に残すもの」).
 export type RecordKind = "spec" | "module" | "heading" | "item" | "suggestion" | "comment" | "reflection" | "checklist" | "budget" | "notes" | "footprint" | "photo" | "member" | "grant";
 const recordAad = (capsuleId: string, kind: RecordKind, recordId: string, field: string) => text(`${capsuleId}/${kind}/${recordId}/${field}`);
 export async function sealField(key: CryptoKey, capsuleId: string, generation: number, kind: RecordKind, recordId: string, field: string, plain: string): Promise<string> {
@@ -138,7 +138,7 @@ export async function openField(key: CryptoKey, capsuleId: string, kind: RecordK
   return new TextDecoder().decode(await crypto.subtle.decrypt({ name: "AES-GCM", iv, additionalData: recordAad(capsuleId, kind, recordId, field) }, key, data));
 }
 
-// A footprint's position, one ciphertext per point (docs/design/trip-e2e.md §3.1, the footprint row): `lat`, `lng` and
+// A footprint's position, one ciphertext per point (docs/ephemeral-trip-capsule.md「5.2 暗号化するもの・平文に残すもの」, the footprint row): `lat`, `lng` and
 // `accuracy` as one JSON. The range is checked before sealing and again after opening, since the host no longer sees it.
 export async function sealPoint(key: CryptoKey, capsuleId: string, generation: number, id: string, point: PlainPoint): Promise<string> {
   const { lat, lng, accuracy } = pointSchema.parse(point);
@@ -151,9 +151,9 @@ export async function openPoint(key: CryptoKey, capsuleId: string, id: string, s
     return p.success ? p.data : null;
   } catch { return null; }
 }
-// A photo (docs/design/trip-e2e.md §3.1, the photo rows). Each image is sealed under a key of the photo's own, a random AES-GCM key
+// A photo (docs/ephemeral-trip-capsule.md「5.2 暗号化するもの・平文に残すもの」, the photo rows). Each image is sealed under a key of the photo's own, a random AES-GCM key
 // that the trip's key seals into the photo's record as `key`: a new trip key seals that one short string again and no image has to
-// come back to the browser (§8). An image is its 12-byte IV, the sealed bytes and the 16-byte tag, the form the host measures
+// come back to the browser (spec「5.5 旅行の鍵を替える」). An image is its 12-byte IV, the sealed bytes and the 16-byte tag, the form the host measures
 // (src/media.ts SEALED_OVERHEAD); what names it is the AAD `<capsule id>/photo/<photo id>/<thumb|display>`. The location is one
 // ciphertext of the trip's key, as a footprint's point is, with the accuracy left out when the photo had none.
 export type PhotoSize = "thumb" | "display";
@@ -187,7 +187,7 @@ export async function openPhotoLocation(key: CryptoKey, capsuleId: string, id: s
     return p.success ? p.data : null;
   } catch { return null; }
 }
-// A name (§3.1, the `Session` and `Grant` rows, and a footprint's copy of its member's name): a seat's or an invite's
+// A name (spec「5.2 暗号化するもの・平文に残すもの」, the `Session` and `Grant` rows, and a footprint's copy of its member's name): a seat's or an invite's
 // `label`, or a footprint's `by`. The same 1–80 characters as an author's, before sealing and after opening.
 type Named = "member" | "grant" | "footprint";
 const nameField = (kind: Named) => kind === "footprint" ? "by" : "label";
@@ -197,7 +197,7 @@ export async function sealName(key: CryptoKey, capsuleId: string, generation: nu
   return sealField(key, capsuleId, generation, kind, id, nameField(kind), n.data);
 }
 // A name not in the form of ciphertext is one the host gave ("自分用", "招待リンク", "オーナー", "メンバー3") and is shown as
-// it is; no table tells the host's names apart (docs/design/private-entries-e2e.md §1). Ciphertext that does not open is null.
+// it is; no table tells the host's names apart (docs/ephemeral-trip-capsule.md「5.6 自分だけの予定・日記の鍵」). Ciphertext that does not open is null.
 export async function openName(key: CryptoKey, capsuleId: string, kind: Named, id: string, value: string): Promise<string | null> {
   try { unpack(value); } catch { return value; }
   try {
@@ -252,13 +252,13 @@ export async function sealTrip(key: CryptoKey, capsuleId: string, generation: nu
   };
 }
 
-// A plain trip as the owner's browser reads it (GET "", GET seal, GET grants), to move it at once (docs/design/trip-e2e.md §5).
+// A plain trip as the owner's browser reads it (GET "", GET seal, GET grants), to move it at once (docs/ephemeral-trip-capsule.md「5.4 平文の旅行を移す」).
 export type MoveInput = {
   spec: Spec; document: Document; previous: Previous | null;
   footprints: Array<{ id: string; lat: number; lng: number; accuracy: number; by: string }>;
   grants: Array<{ id: string; label: string; members: Array<{ id: string; label: string }> }>;
 };
-// The body of the one POST seal that moves a plain trip (§5): the trip as sealTrip seals it, each footprint's point and
+// The body of the one POST seal that moves a plain trip (spec「5.4 平文の旅行を移す」): the trip as sealTrip seals it, each footprint's point and
 // `by`, and each member's and invite's name. The host's own invite names stay as they are (#712); the history's names
 // are not sent, the host drops them. A trip too large to move goes again with `dropPrevious`.
 export async function sealMove(key: CryptoKey, capsuleId: string, generation: number, input: MoveInput, { dropPrevious = false } = {}) {
@@ -290,7 +290,7 @@ function sealedFields(t: { spec: SealedSpec; document: Partial<SealedDocument> }
 }
 // Words kept as JSON are compared as values: an answer may write an item's fields in another order.
 const JSON_FIELDS = ["item/sealed", "spec/destinations", "spec/travelers", "budget/amount"];
-// The next trip a revise or an undo made in this browser, sealed for the host (§4). A record whose words are the same as in one
+// The next trip a revise or an undo made in this browser, sealed for the host (spec「5.3 暗号化した旅行で Host にできないこと」). A record whose words are the same as in one
 // of `from` (the trip as this browser opened it; for an undo, the step back too) keeps that ciphertext, in `from`'s order, so the
 // host can see that what it must keep did not change; a new or changed record is sealed anew. A post kept keeps its seat
 // (by its list and id: a suggestion and a comment may share an id).
@@ -310,7 +310,7 @@ export async function resealTrip(key: CryptoKey, capsuleId: string, generation: 
   return { spec: await sealSpec(key, capsuleId, generation, next.spec, f), document };
 }
 
-// Opens what the host sent and checks the words as the host checks a plain trip, before anything is shown (§4): a place's
+// Opens what the host sent and checks the words as the host checks a plain trip, before anything is shown (spec「5.3 暗号化した旅行で Host にできないこと」): a place's
 // link that is not public https is dropped, and a record that does not open or does not pass the plain shape is left out
 // and named in `unreadable` ("<kind>/<id>"), never shown with made-up words. null when the Spec itself does not open.
 export async function openTrip(key: CryptoKey, capsuleId: string, sealed: { spec: SealedSpec; document: SealedDocument }): Promise<{ spec: Spec; document: Document; unreadable: string[] } | null> {
@@ -341,7 +341,7 @@ export async function openTrip(key: CryptoKey, capsuleId: string, sealed: { spec
     }))).flat();
   const items = await each("item", d.items, async i => {
     const { sealed: words, ...plain } = i, item = { ...JSON.parse(await f("item", i.id, "sealed", words)), ...plain };
-    // A link that is not public https is dropped, the rest of the item kept (§4).
+    // A link that is not public https is dropped, the rest of the item kept (spec「5.3 暗号化した旅行で Host にできないこと」).
     if (item.place?.publicUrl !== undefined && itemSchema.safeParse(item).error?.issues.some(x => x.path.join(".") === "place.publicUrl")) delete item.place.publicUrl;
     return item;
   }, itemSchema);
@@ -387,11 +387,11 @@ export async function sealOperation(key: CryptoKey, capsuleId: string, generatio
   }
 }
 
-// Replacing the trip key with the next generation (docs/design/trip-e2e.md §8). The owner's browser walks the edges from its own
+// Replacing the trip key with the next generation (docs/ephemeral-trip-capsule.md「5.5 旅行の鍵を替える」). The owner's browser walks the edges from its own
 // seat, wraps the new key to the seats it reaches and signs each wrap; a member's browser takes a new generation only when it is
-// signed by an owner seat it reaches by its own edges, so the operator cannot place a key of its own (§8 (1)).
+// signed by an owner seat it reaches by its own edges, so the operator cannot place a key of its own (spec「5.5 旅行の鍵を替える」).
 // `since`: a seat whose pair was made again (a passkey registered later) keeps its previous public keys and their signature over
-// the new ones, for one generation of pairs (§8 (3)): edges signed over the previous keys still lead to it.
+// the new ones, for one generation of pairs (spec「5.5 旅行の鍵を替える」): edges signed over the previous keys still lead to it.
 export type KeyedSeat = { id: string; role: Role; x25519: string; ed25519: string; edges: Array<{ seat: string; signature: string }>; since?: { x25519: string; ed25519: string; signature: string } };
 const successionText = (capsuleId: string, seat: string, next: SeatPublic) => text(`capsule seat successor v1/${capsuleId}/${seat}/${next.x25519}/${next.ed25519}`);
 export async function signSuccession(oldEd25519Private: CryptoKey, previous: SeatPublic, a: { capsuleId: string; seat: string; x25519: string; ed25519: string }): Promise<NonNullable<KeyedSeat["since"]>> {
@@ -446,7 +446,7 @@ export async function acceptRekey(a: { self: { id: string; ed25519: string }; kn
 }
 // The whole sealed trip opened with the old key and sealed again under the new generation: the trip, each footprint's point and
 // name, each member's and invite's name. A name the host gave stays as it is. Nothing that fails to open is dropped quietly: it
-// throws, and the key is not replaced. `previous` is not sealed again; the host drops it (§8 (5)).
+// throws, and the key is not replaced. `previous` is not sealed again; the host drops it (spec「5.5 旅行の鍵を替える」).
 const isCipher = (v: string) => { try { unpack(v); return true; } catch { return false; } };
 export async function resealAll(oldKey: CryptoKey, newKey: CryptoKey, capsuleId: string, generation: number, t: {
   spec: SealedSpec; document: SealedDocument; footprints: Array<{ id: string; point: string; by: string }>; members: Array<{ id: string; label: string }>; grants: Array<{ id: string; label: string }>;

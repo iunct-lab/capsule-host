@@ -23,7 +23,7 @@ for (const [entry, target, outdir, naming] of [["aws-handler.ts", "node", "aws",
 }
 await copyFile(root + "src/index.html", root + "dist/public/index.html");
 await copyFile(root + "src/style.css", root + "dist/public/app.css");
-// The map's worker and stylesheet as MapLibre ships them, under the names src/map.ts asks for (docs/design/footprint-basemap.md),
+// The map's worker and stylesheet as MapLibre ships them, under the names src/map.ts asks for (aws/README.md「足あとの地図の背景（地図データ）」),
 // behind MapLibre's notice: the worker opens with only a link to the licence and the stylesheet with none.
 const maplibre = root + "node_modules/maplibre-gl";
 for (const [from, to] of [["maplibre-gl-worker.mjs", "maplibre-worker.mjs"], ["maplibre-gl.css", "map.css"]]) {

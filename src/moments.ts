@@ -36,6 +36,17 @@ export function itemAt(items: Item[], at: number, timezone: string): Item | unde
   return under;
 }
 
+// Where a photo was taken: its own place when it has one, or else the place of the footprint nearest the time it was taken, any
+// member's, if one was left within 30 minutes of it (the earlier of two as near). Worked out as the page shows the photo, never stored.
+export const PLACE_WITHIN = 30 * 60 * 1000;
+export function photoPlace<P extends { at: string; lat: number; lng: number }>(own: { lat: number; lng: number } | null, capturedAt: string | undefined, points: P[]): { lat: number; lng: number; from: "photo" | "footprint" } | null {
+  if (own) return { lat: own.lat, lng: own.lng, from: "photo" };
+  const at = +new Date(capturedAt ?? NaN); if (!Number.isFinite(at)) return null;
+  let near: P | undefined, gap = Infinity;
+  for (const p of points) { const d = Math.abs(+new Date(p.at) - at); if (d <= PLACE_WITHIN && (d < gap || (d === gap && +new Date(p.at) < +new Date(near!.at)))) { near = p; gap = d; } }
+  return near ? { lat: near.lat, lng: near.lng, from: "footprint" } : null;
+}
+
 // With photos off (the operator's switch) the page is not shown unless photos are already there, and nothing can be put up; a viewer,
 // a trip whose sharing has ended, a trip that is not sealed and a browser without the key put up nothing either.
 export const photosPageShown = (v: { photos?: boolean; media?: unknown[] }) => Boolean(v.photos || v.media?.length);

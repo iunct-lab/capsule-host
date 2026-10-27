@@ -1,8 +1,10 @@
 import { z, ZodError } from "zod";
+import { instant, cipher, CIPHER, author, localDay } from "./fields";
+import type { State } from "./kit";
 
-// zod 4 compiles a fast path with `new Function`; the page's CSP has no 'unsafe-eval' (src/cloud-host.ts), so in the browser
-// that throws partway through a parse. Every bundle that parses imports this module.
-z.config({ jitless: true });
+// The values every kind shares (the zod setting among them) are src/fields.ts's; they are exported from here as before.
+export { instant, cipher, CIPHER, author, pointSchema, localDay, seen, sameTitle, type PlainPoint } from "./fields";
+
 
 const short = z.string().trim().min(1).max(160);
 const identifier = short.regex(/^[a-zA-Z0-9_-]+$/);
@@ -10,12 +12,9 @@ const text = z.string().trim().max(4000);
 const day = z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine(v => {
   const n = new Date(v); return !isNaN(+n) && n.toISOString().slice(0, 10) === v;
 }, "実在する日付を指定してください");
-// zod 3's `.datetime({ offset: true })`, which zod 4 narrowed (seconds required, the offset only as ±hh:mm). Trips and entries
-// stored under zod 3 hold what it took: seconds optional, the offset as Z, ±hh:mm or ±hhmm. A real date, as zod 3 checked.
-export const instant = z.stringFormat("date-time", /^((\d\d[2468][048]|\d\d[13579][26]|\d\d0[48]|[02468][048]00|[13579][26]00)-02-29|\d{4}-((0[13578]|1[02])-(0[1-9]|[12]\d|3[01])|(0[469]|11)-(0[1-9]|[12]\d|30)|(02)-(0[1-9]|1\d|2[0-8])))T([01]\d|2[0-3]):[0-5]\d(:[0-5]\d(\.\d+)?)?(Z|([+-]\d{2}:?\d{2}))$/);
 const zone = z.string().max(80).refine(v => { try { new Intl.DateTimeFormat("en", { timeZone: v }); return true; } catch { return false; } });
 const url = z.string().url().max(2000).refine(v => { try { const u = new URL(v); return u.protocol === "https:" && !u.username && !u.password; } catch { return false; } }, "公開HTTPS URLのみ使用できます");
-// The page kinds, with the label's type as the argument: plain words, or ciphertext in a sealed trip (§3.1).
+// The page kinds, with the label's type as the argument: plain words, or ciphertext in a sealed trip (spec「5.2 暗号化するもの・平文に残すもの」).
 const modulesOf = <L extends z.ZodTypeAny>(label: L) => z.discriminatedUnion("kind", [
   z.object({ id: identifier, kind: z.literal("day-timeline"), label }).strict(),
   z.object({ id: identifier, kind: z.literal("places"), label, groupBy: z.enum(["area", "category"]).optional() }).strict(),
@@ -70,8 +69,7 @@ export const documentSchema = z.object({
 export type Spec = z.infer<typeof specSchema>;
 export type Document = z.infer<typeof documentSchema>;
 export type Item = z.infer<typeof itemSchema>;
-export type Role = "owner" | "editor" | "participant" | "viewer";
-export type State = "active" | "reflection" | "frozen" | "purged";
+export type { Role, State } from "./kit";
 // The rules on the parts the host can read: the purge date, each item's day and time within the trip, unique ids, the size.
 function rules<S extends SpecPlain & { timezone: string }, D extends { items: Array<{ id: string; day: string; startsAt?: string; timezone?: string }> } & Record<"suggestions" | "checklist" | "comments" | "reflections" | "budget", Array<{ id: string }>>>(s: S, d: D, createdAt: number) {
   if (+new Date(s.lifecycle.purgeAt) > createdAt + 180 * 86400000) throw new Error("削除期限は作成から180日以内です");
@@ -113,12 +111,10 @@ export const problems = (error: ZodError, prefix: string): Problem[] => error.is
   message: i.code !== "invalid_value" || i.values.length < 2 ? i.message
     : "input" in i && i.input === undefined ? "指定してください" : `次のいずれかを指定してください: ${i.values.join(" | ")}`,
 }));
-// A sealed trip as the host keeps it (docs/design/trip-e2e.md §3.1): the words are `v1.<generation>.` ciphertext under the
+// A sealed trip as the host keeps it (docs/ephemeral-trip-capsule.md「5.2 暗号化するもの・平文に残すもの」): the words are `v1.<generation>.` ciphertext under the
 // trip's key, the parts the host works with stay plain. Each limit is that of the longest plain text the field allows
 // (3 bytes a character, JSON's quotes), sealed. The host checks only the plain parts and the ciphertext's form; the words
-// are checked by the browser, before sealing and after opening (§4).
-export const CIPHER = { short: 700, text: 16_100, item: 64_000, destinations: 40_000, travelers: 100_000, amount: 100 };
-export const cipher = (max: number) => z.string().regex(/^v1\.[1-9][0-9]{0,5}\.[A-Za-z0-9_-]+$/).max(max);
+// are checked by the browser, before sealing and after opening (spec「5.3 暗号化した旅行で Host にできないこと」).
 export const sealedSpecSchema = z.object({
   schemaVersion: z.literal(1), kind: z.literal("trip"), title: cipher(CIPHER.short), summary: cipher(CIPHER.text).optional(),
   locale: z.enum(["ja", "en"]), timezone: zone,
@@ -153,12 +149,7 @@ export type SealedItem = z.infer<typeof sealedItemSchema>;
 export function validateSealed(spec: unknown, document: unknown, createdAt: number) {
   return rules(sealedSpecSchema.parse(spec), sealedDocumentSchema.parse(document), createdAt);
 }
-// A footprint's position (#480): at most a kilometre off. The host checks it of a plain trip's footprint; of a sealed trip's,
-// the screen checks it before sealing and after opening (docs/design/trip-e2e.md §4).
-export const pointSchema = z.object({ lat: z.number().min(-90).max(90), lng: z.number().min(-180).max(180), accuracy: z.number().min(0).max(1000) }).strict();
-export type PlainPoint = z.infer<typeof pointSchema>;
-// What a member asks of the trip's document (PATCH document). The screen checks a plain one with this before sealing it (§4).
-export const author = z.string().trim().min(1).max(80);
+// What a member asks of the trip's document (PATCH document). The screen checks a plain one with this before sealing it (spec「5.3 暗号化した旅行で Host にできないこと」).
 const body = z.string().trim().min(1).max(4000);
 const posts = z.enum(["suggestions", "comments"]);
 export const operationSchema = z.discriminatedUnion("type", [
@@ -203,15 +194,6 @@ export type SealedOperation = z.infer<typeof sealedOperationSchema>;
 // (`allowed`: the ids of the items it already held without a time).
 export function untimed(document: Document, allowed: string[] = []) {
   return document.items.flatMap((i, n) => i.startsAt || allowed.includes(i.id) ? [] : [{ path: `document.items.${n}.startsAt`, message: "開始時刻を書いてください（決まっていなければ妥当な時刻と timeTentative: true）" }]);
-}
-// The title typed to confirm a purge or a large change, as a phone types it: a space after a predicted word, full-width
-// spaces and letters. What is compared is what a person sees, not the code points. The screen compares it for a sealed trip,
-// whose title the host cannot read (docs/design/trip-e2e.md §4).
-export const seen = (t: string) => t.normalize("NFKC").replace(/\s+/g, " ").trim();
-export const sameTitle = (given: string | undefined, title: string) => given !== undefined && seen(given) === seen(title);
-export function localDay(now: number, timezone: string) {
-  const parts = new Intl.DateTimeFormat("en", { timeZone: timezone, year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(now);
-  return ["year", "month", "day"].map(k => parts.find(p => p.type === k)!.value).join("-");
 }
 export function stateOf(spec: Pick<Spec, "lifecycle" | "timezone"> & { trip: { endsOn: string } }, forced: string | null, now: number): State {
   if (now >= +new Date(spec.lifecycle.purgeAt)) return "purged";

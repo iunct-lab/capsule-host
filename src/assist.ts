@@ -6,7 +6,7 @@ export const ASSIST_LIMIT = 6000;
 // The model when CAPSULE_ASSIST_MODEL names none. The host and, for a sealed trip, the browser call the same one (#692).
 export const ASSIST_MODEL = "claude-haiku-5-5";
 // Revising a trip (#658): the bytes of the trip and the request one call may carry, and what the model is told. The host uses
-// these for a plain trip; a sealed trip's browser sends the same to Anthropic itself (docs/design/trip-e2e.md §4).
+// these for a plain trip; a sealed trip's browser sends the same to Anthropic itself (docs/ephemeral-trip-capsule.md「5.3 暗号化した旅行で Host にできないこと」).
 export const REVISE_LIMIT = 120_000;
 // The recipe is written for a chat that may ask what it needs. A call here has one answer and nobody to ask (#658): what is missing
 // is decided and said in the notes. This overrides the recipe's "ask" in both uses; the date rule is for a new trip only.

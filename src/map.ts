@@ -1,6 +1,6 @@
 // The footprint map's background (#563): MapLibre draws the points over map tiles kept on the host's own origin, so no
 // outside domain sees where the trip went — unless a member taps a place's map link, which opens that place in a map service. Built apart from app.js as dist/public/map.js and imported only when the map is
-// shown; the worker and the stylesheet are served beside it under fixed names. Values: docs/design/footprint-basemap.md.
+// shown; the worker and the stylesheet are served beside it under fixed names. Values: aws/README.md「足あとの地図の背景（地図データ）」.
 import { AttributionControl, LngLatBounds, Map as MapLibre, Marker, addProtocol, setWorkerUrl, type LayerSpecification } from "maplibre-gl";
 import { Protocol } from "pmtiles";
 import { regionsOf } from "./mapdata";

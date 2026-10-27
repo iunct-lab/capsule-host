@@ -5,6 +5,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Anthropic from "@anthropic-ai/sdk";
 import { CloudHost, secure } from "./cloud-host";
+import { tripKit } from "./trip-kit";
+import { refuse, type DomainKit } from "./kit";
+import { z } from "zod";
 import { open as openKey, seal as sealKey } from "./key-store";
 import { exportFiles, tripHtml, tripMarkdown, zip } from "./export";
 import { LocalD1 } from "./local-d1";
@@ -38,6 +41,30 @@ test("anonymous and forged identity headers cannot create or discover private tr
     expect(result.status).toBe(401);
     expect((await host.fetch(new Request(origin + "/v1/preview"))).status).toBe(404);
     expect(db.db.query("SELECT * FROM trip_capsules").all()).toHaveLength(0);
+  } finally { db.close(); }
+});
+test("a spec whose kind has no kit is refused with 400 and nothing is stored", async () => {
+  const db = new LocalD1(), host = new CloudHost({ DB: db, CAPSULE_HMAC_KEY: "secret".repeat(10), CAPSULE_ORIGIN: origin }, () => +new Date("2026-09-17T00:00:00Z"), async () => "creator-1");
+  try {
+    for (const kind of ["poll", "constructor", undefined]) {
+      const trip = testTrip(), res = await host.fetch(new Request(origin + "/v1/publish", { method: "POST", headers: { Origin: origin, "Content-Type": "application/json" }, body: JSON.stringify({ spec: { ...trip.spec, kind }, document: trip.document, confirm: true }) }));
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({ error: "対応していない種類です" });
+    }
+    expect(db.db.query("SELECT * FROM trip_capsules").all()).toHaveLength(0);
+  } finally { db.close(); }
+});
+test("a kind without dates offers neither footprints nor a member's own entries (404)", async () => {
+  const db = new LocalD1(), now = +new Date("2026-09-25T03:00:00Z");
+  const host = new CloudHost({ KITS: { trip: { ...tripKit, period: undefined } }, DB: db, CAPSULE_HMAC_KEY: "secret".repeat(10), CAPSULE_ORIGIN: origin }, () => now, async () => "creator-1");
+  const req = (path: string, method = "GET", body?: unknown, cookie?: string) => host.fetch(new Request(origin + path, { method, headers: { Origin: origin, "Content-Type": "application/json", ...(cookie ? { Cookie: cookie } : {}) }, ...(body ? { body: JSON.stringify(body) } : {}) }));
+  try {
+    const created = await (await req("/v1/publish", "POST", { ...testTrip(), confirm: true })).json(), path = `/v1/c/${created.id}`;
+    const owner = (await req(path + "/sessions", "POST", { secret: new URL(created.url).hash.slice(3) })).headers.get("Set-Cookie")!.split(";")[0]!;
+    for (const [action, body] of [["/private", { type: "remove", id: "x" }], ["/footprints", { type: "add", lat: 35.68, lng: 139.76, accuracy: 20 }]] as const) {
+      const res = await req(path + action, "PATCH", body, owner);
+      expect([res.status, await res.json()]).toEqual([404, { error: "この種類では使えません" }]);
+    }
   } finally { db.close(); }
 });
 test("publisher cannot read trips without capability; invite role and CAS survive independent requests", async () => {
@@ -218,7 +245,7 @@ describe("a loopback origin for local development", () => {
   });
   test("CSP: images and scripts come only from the host itself; connections also go to Anthropic, and nowhere else", async () => {
     // The footprint map's background (#563) comes from the same origin: MapLibre's worker is a file beside app.js and the
-    // map tiles are ranges of /map/*.pmtiles, so the policy needs nothing added (docs/design/footprint-basemap.md §2).
+    // map tiles are ranges of /map/*.pmtiles, so the policy needs nothing added (aws/README.md「足あとの地図の背景（地図データ）」).
     // The one outside origin is Anthropic's API, which a sealed trip's browser calls with the member's own key (#692 回答 B).
     const csp = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self' https://api.anthropic.com; base-uri 'none'; frame-ancestors 'none'; form-action 'self'";
     // The page itself (src/main.ts passes it through secure(), as every answer of the host) and an answer of the API.
@@ -1906,6 +1933,114 @@ describe("creators", () => {
     phone.setCounter(1); expect(await account(t.cookieOf(await t.signIn(phone)))).toBe(false);
     now += 1; phone.setCounter(2); expect(await account(t.cookieOf(await t.signIn(phone)))).toBe(true);
   });
+
+  // #108: a creator hands the right to create to one trip's owner. The link is redeemed under that trip, by its owner seat only.
+  async function delegation() {
+    const t = creatorHost(), phone = fakeAuthenticator(), creator = t.cookieOf(await t.register(await t.enroll(), phone));
+    const req = (path: string, method = "GET", body?: unknown, cookie?: string) => t.host.fetch(new Request(origin + path, { method, headers: { Origin: origin, "Content-Type": "application/json", ...(cookie ? { Cookie: cookie } : {}) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) }));
+    // A trip made by `by`, whose owner seat this test's browser takes.
+    const trip = async (by = creator) => {
+      const made = await (await req("/v1/publish", "POST", { ...testTrip(), confirm: true }, by)).json();
+      const seat = await req(`/v1/c/${made.id}/sessions`, "POST", { secret: new URL(made.url).hash.slice(3) });
+      return { id: made.id as string, owner: seat.headers.get("Set-Cookie")!.split(";")[0]! };
+    };
+    // Each step is a passkey ceremony; the clock moves on so that the per-IP sign-in limit is not what answers.
+    const delegate = async (cookie: string, device: ReturnType<typeof fakeAuthenticator>, ownerOf: string) => { now += 61000; const c = await t.challenge(); return t.post("enroll", { confirm: true, ownerOf, challenge: c, id: device.id, ...device.assert(c) }, cookie); };
+    const redeem = async (id: string, secret: string, cookie?: string, device = fakeAuthenticator()) => { now += 61000; const c = await t.challenge(); return req(`/v1/c/${id}/creators/register`, "POST", { secret, challenge: c, ...device.register(c) }, cookie); };
+    const secretOf = async (r: Response) => { expect(r.status).toBe(201); return new URL((await r.json()).url).hash.slice("#delegate=".length); };
+    const account = async (cookie: string) => (await (await req("/v1/account", "GET", undefined, cookie)).json()).creator;
+    return { ...t, phone, creator, req, trip, delegate, redeem, secretOf, account };
+  }
+
+  test("a creator delegates the right to create to a trip's owner, whose passkey makes them a creator who cannot read any trip", async () => {
+    const t = await delegation(), mine = await t.trip();
+    // The creator's cookie alone is not enough: a passkey of theirs is checked in the same request.
+    expect((await t.post("enroll", { confirm: true, ownerOf: mine.id }, t.creator)).status).toBe(401);
+    expect((await t.post("enroll", { confirm: true, ownerOf: mine.id })).status).toBe(401);
+    const issued = await t.delegate(t.creator, t.phone, mine.id); expect(issued.status).toBe(201);
+    const { url } = await issued.json(); expect(url).toStartWith(`${origin}/c/${mine.id}#delegate=`);
+    const secret = new URL(url).hash.slice("#delegate=".length);
+    // Not outside a trip, not under another trip, not without the owner's cookie, and not by an editor of the trip.
+    const c = await t.challenge();
+    expect((await t.post("register", { secret, challenge: c, ...fakeAuthenticator().register(c) })).status).toBe(401);
+    const other = await t.trip();
+    expect((await t.redeem(other.id, secret, other.owner)).status).toBe(401);
+    expect((await t.redeem(mine.id, secret)).status).toBe(401);
+    const owner = await stepUp((p, m, b, c) => t.req(`/v1/c/${mine.id}${p}`, m, b, c), mine.owner);
+    for (const role of ["editor", "participant", "viewer"]) {
+      const invite = await (await t.req(`/v1/c/${mine.id}/grants`, "POST", { role, label: role, expiresAt: testTrip().spec.lifecycle.purgeAt, confirm: true }, owner)).json();
+      const member = (await t.req(`/v1/c/${mine.id}/sessions`, "POST", { secret: new URL(invite.url).hash.slice(3) })).headers.get("Set-Cookie")!.split(";")[0]!;
+      expect((await t.redeem(mine.id, secret, member)).status).toBe(403);
+    }
+    // A browser that makes no passkey becomes nobody, and the link stays usable.
+    now += 61000; const noPasskey = await t.challenge();
+    expect((await t.req(`/v1/c/${mine.id}/creators/register`, "POST", { secret, challenge: noPasskey }, owner)).status).toBe(400);
+    const device = fakeAuthenticator(), made = await t.redeem(mine.id, secret, owner, device);
+    expect(made.status).toBe(201); expect(await made.json()).toEqual({ label: "作成者A の委任" });
+    const delegated = t.cookieOf(made);
+    // Used once only.
+    expect((await t.redeem(mine.id, secret, owner)).status).toBe(401);
+    // The new creator publishes and signs in again with the passkey, and reads no trip with the creator's right, not even their own.
+    expect(await t.account(delegated)).toMatchObject({ label: "作成者A の委任", delegated: true, delegates: [] });
+    const theirs = await (await t.req("/v1/publish", "POST", { ...testTrip(), confirm: true }, delegated)).json(); expect(theirs.id).toBeString();
+    now += 61000; expect((await t.signIn(device)).status).toBe(200);
+    for (const id of [mine.id, theirs.id]) {
+      expect((await t.req(`/v1/c/${id}`, "GET", undefined, delegated)).status).toBe(401);
+      expect((await t.req(`/v1/c/${id}/grants`, "GET", undefined, delegated)).status).toBe(401);
+      expect((await t.req(`/v1/c/${id}/recover`, "POST", { confirm: true }, delegated)).status).toBe(401);
+    }
+    // No handing it on.
+    expect((await t.delegate(delegated, device, theirs.id)).status).toBe(403);
+    // The one who delegated sees them; the IAM list names who delegated.
+    expect(await t.account(t.creator)).toMatchObject({ delegated: false, delegates: [{ id: expect.any(String), label: "作成者A の委任", created: expect.any(Number), device: expect.any(String) }] });
+    const [listed] = (await t.account(t.creator)).delegates, self = (await t.list()).find(c => c.label === "作成者A")!;
+    expect((await t.list()).find(c => c.id === listed.id)).toMatchObject({ delegatedBy: self.id });
+    expect(t.row()!.payload).not.toContain(secret);
+  });
+
+  test("a creator revokes the creators they delegated to, and nobody else", async () => {
+    const t = await delegation(), mine = await t.trip();
+    const delegated = t.cookieOf(await t.redeem(mine.id, await t.secretOf(await t.delegate(t.creator, t.phone, mine.id)), mine.owner));
+    const id = (await t.account(t.creator)).delegates[0].id;
+    const other = t.cookieOf(await t.register(await t.enroll("作成者B"), fakeAuthenticator()));
+    expect((await t.post("revoke", { creator: id, confirm: true })).status).toBe(401);
+    expect((await t.post("revoke", { creator: id, confirm: true }, other)).status).toBe(404);
+    // Not themself, not a passkey.
+    const self = (await t.list()).find(c => c.label === "作成者A")!.id;
+    expect((await t.post("revoke", { creator: self, confirm: true }, t.creator)).status).toBe(404);
+    expect((await t.post("revoke", { passkey: t.phone.id, confirm: true }, t.creator)).status).toBe(400);
+    expect((await t.req("/v1/publish", "POST", { ...testTrip(), confirm: true }, delegated)).status).toBe(201);
+    expect((await t.post("revoke", { creator: id, confirm: true }, t.creator)).status).toBe(200);
+    expect((await t.req("/v1/publish", "POST", { ...testTrip(), confirm: true }, delegated)).status).toBe(401);
+    expect((await t.account(t.creator)).delegates).toEqual([]);
+    expect((await t.post("revoke", { creator: id, confirm: true }, t.creator)).status).toBe(404);
+  });
+
+  test("delegation links are 3 a creator, apart from the IAM publisher's 20, and go with the passkey or the creator that made them", async () => {
+    const t = await delegation(), mine = await t.trip(), statuses: number[] = [];
+    for (let i = 0; i < 4; i++) statuses.push((await t.delegate(t.creator, t.phone, mine.id)).status);
+    expect(statuses).toEqual([201, 201, 201, 429]);
+    // A device link of the same creator is counted apart from their delegation links, and the IAM publisher's 20 as well.
+    now += 61000; const c = await t.challenge();
+    expect((await t.post("enroll", { confirm: true, challenge: c, id: t.phone.id, ...t.phone.assert(c) }, t.creator)).status).toBe(201);
+    for (let i = 0; i < 20; i++) { now += 5000; await t.enroll(`作成者${i}`); }
+    now += 61000; const full = await t.asPublisher(() => t.post("enroll", { label: "21人目", confirm: true }));
+    expect(full.status).toBe(429); expect((await full.json()).error).toContain("登録リンクが多すぎます");
+    // The IAM publisher revokes the passkey a link was asked for from: the link, not used yet, goes with it.
+    now += 86400000;
+    const tablet = fakeAuthenticator(), b = t.cookieOf(await t.register(await t.enroll("作成者B"), tablet)), theirs = await t.trip(b);
+    const pending = await t.secretOf(await t.delegate(b, tablet, theirs.id));
+    expect((await t.asPublisher(() => t.post("revoke", { passkey: tablet.id, confirm: true }))).status).toBe(200);
+    expect((await t.redeem(theirs.id, pending, theirs.owner)).status).toBe(401);
+    // Revoking the creator takes theirs too; the creators they delegated to stay (another person's right).
+    now += 61000; const again = t.cookieOf(await t.signIn(t.phone));
+    const kept = t.cookieOf(await t.redeem(mine.id, await t.secretOf(await t.delegate(again, t.phone, mine.id)), mine.owner));
+    const left = await t.secretOf(await t.delegate(again, t.phone, mine.id));
+    const self = (await t.list()).find(c => c.label === "作成者A")!.id;
+    expect((await t.asPublisher(() => t.post("revoke", { creator: self, confirm: true }))).status).toBe(200);
+    expect((await t.redeem(mine.id, left, mine.owner)).status).toBe(401);
+    expect((await t.req("/v1/publish", "POST", { ...testTrip(), confirm: true }, kept)).status).toBe(201);
+  });
 });
 describe("what a creator may do", () => {
   // A creator may make a new trip and see how to make one. Nothing more: no trip opens to a creator's cookie.
@@ -1928,7 +2063,7 @@ describe("what a creator may do", () => {
   test("only a signed-in creator is shown the recipe, has a paste checked and publishes", async () => {
     const t = await signedIn();
     expect(await (await t.req("/v1/account")).json()).toEqual({ signedIn: false, canCreate: false, creator: null, localOnly: false, assistKey: false });
-    expect(await (await t.req("/v1/account", "GET", undefined, t.creator)).json()).toEqual({ signedIn: false, canCreate: true, creator: { label: "作成者A" }, localOnly: false, assistKey: false });
+    expect(await (await t.req("/v1/account", "GET", undefined, t.creator)).json()).toEqual({ signedIn: false, canCreate: true, creator: { label: "作成者A", delegated: false, delegates: [] }, localOnly: false, assistKey: false });
     expect((await t.req("/v1/recipe")).status).toBe(401);
     expect((await t.req("/v1/check", "POST", { text: JSON.stringify(testTrip()) })).status).toBe(401);
     expect((await t.req("/v1/publish", "POST", trip())).status).toBe(401);
@@ -3536,7 +3671,7 @@ describe("revising on the host with a member's own API key", () => {
 });
 
 // The names a seal brings with the trip (src/trip-keys.ts sealMove): every footprint, member and invite, read as the owner's
-// browser reads them just before (docs/design/trip-e2e.md §5).
+// browser reads them just before (docs/ephemeral-trip-capsule.md「5.4 平文の旅行を移す」).
 async function moveNames(t: Awaited<ReturnType<typeof setup>>, trip: CryptoKey, owner: string) {
   const view = await (await t.request("", "GET", undefined, owner)).json(), grants = await (await t.request("/grants", "GET", undefined, owner)).json();
   const { footprints, members, grants: named } = await sealMove(trip, t.created.id, 1, { spec: view.spec, document: view.document, previous: null, footprints: view.footprints, grants });
@@ -3659,7 +3794,7 @@ describe("sealed trip", () => {
     const raw = async (body: object, cookie = t.owner) => t.request("/document", "PATCH", body, cookie, (await read()).v.document.revision);
     return { ...t, read, send, raw };
   }
-  // What the screen sends to revise or go back (docs/design/trip-e2e.md §4): the next trip reviseTrip / undoTrip made from the
+  // What the screen sends to revise or go back (docs/ephemeral-trip-capsule.md「5.3 暗号化した旅行で Host にできないこと」): the next trip reviseTrip / undoTrip made from the
   // opened one, sealed, with the memories and the kept posts' seats as the host keeps them. `spec`: ciphertext kept as it is.
   type Sealed = Awaited<ReturnType<typeof sealedTrip>>;
   const sealedNext = async (t: Sealed, v: { spec: object; document: Record<string, Array<{ id: string; seat?: string }>> }, next: { spec: Parameters<typeof sealTrip>[3]["spec"]; document: Parameters<typeof sealTrip>[3]["document"] }, spec?: object, step?: Record<string, Array<{ id: string; seat?: string }>>) => {
@@ -4076,6 +4211,69 @@ describe("sealed footprints and names", () => {
       expect((await t.request("/revoke", "POST", { member: seat.id, confirm: true }, await stepUp(t.request, t.owner))).status).toBe(200);
       expect((await t.list(t.owner)).map(p => p.id)).toEqual([d.id]); expect((await t.image(t.owner, d.id)).status).toBe(200);
     });
+    test("photo link: the uploader, owner and editor choose the item; another participant and a viewer get 403", async () => {
+      const t = await withMedia(), { m } = t;
+      const link = (cookie: string, id: string, itemId: string | null) => t.request("/media", "PATCH", { type: "link", id, itemId }, cookie);
+      const a = await t.upload(m.participant.cookie), revision = t.stored().document.revision;
+      expect(await error(await link(m.other.cookie, a.id, "dinner"))).toEqual([403, "自分の写真だけ直せます"]);
+      expect((await link(m.viewer.cookie, a.id, "dinner")).status).toBe(403);
+      const r = await link(m.participant.cookie, a.id, "dinner");
+      expect(r.status).toBe(200); expect((await r.json()).photo).toMatchObject({ id: a.id, itineraryItemId: "dinner", mine: true });
+      expect((await t.list(m.viewer.cookie))[0]).toMatchObject({ id: a.id, itineraryItemId: "dinner" });
+      for (const cookie of [t.owner, m.editor.cookie]) expect((await link(cookie, a.id, "walk")).status).toBe(200);
+      expect((await t.list(m.viewer.cookie))[0]).toMatchObject({ itineraryItemId: "walk" });
+      expect(await error(await link(t.owner, a.id, "nowhere"))).toEqual([400, "予定が見つかりません"]);
+      expect(await error(await link(t.owner, "0".repeat(32), "walk"))).toEqual([404, "写真が見つかりません"]);
+      // `null` gives it back to its time.
+      const back = await link(m.participant.cookie, a.id, null);
+      expect(back.status).toBe(200); expect((await back.json()).photo).not.toHaveProperty("itineraryItemId");
+      expect(t.stored().media[0]).not.toHaveProperty("itineraryItemId");
+      // Nothing of it moves the trip's revision, nor goes into the capsule's history.
+      expect((await t.request("", "GET", undefined, t.owner)).headers.get("ETag")).toBe(`"${revision}"`);
+      expect(t.stored().audit.some((l: { event: string }) => l.event === "media")).toBe(false);
+      // Once sharing has ended it stays as it is.
+      expect((await t.request("/freeze", "POST", { confirm: true }, await stepUp(t.request, t.owner), t.stored().document.revision)).status).toBe(200);
+      expect(await error(await link(t.owner, a.id, "dinner"))).toEqual([403, "共有終了後は変更できません"]);
+    });
+    test("photo link: a chosen item keeps the photo when its time changes and lets it go when the item is removed", async () => {
+      const t = await withMedia(), { m } = t, a = await t.upload(m.participant.cookie);
+      expect((await t.request("/media", "PATCH", { type: "link", id: a.id, itemId: "dinner" }, m.participant.cookie)).status).toBe(200);
+      const read = async () => { const v = await (await t.request("", "GET", undefined, t.owner)).json(); return { v, plain: (await openTrip(t.trip, t.created.id, v))! }; };
+      // The item moves to another time: the photo stays with it.
+      let { v, plain } = await read();
+      const dinner = plain.document.items.find(i => i.id === "dinner")!;
+      const op = await sealOperation(t.trip, t.created.id, 1, { type: "item", item: { ...dinner, startsAt: dinner.startsAt!.replace("T19:00", "T20:30") } }, plain.document);
+      expect((await t.request("/document", "PATCH", op, t.owner, v.document.revision)).status).toBe(200);
+      expect((await t.list(t.owner))[0]).toMatchObject({ itineraryItemId: "dinner" });
+      // The chat's revise takes the item out: the photo goes back to its time.
+      ({ v, plain } = await read());
+      const next = structuredClone(revisable(plain.spec, plain.document)); next.document.items = next.document.items.filter(i => i.id !== "dinner");
+      const r = reviseTrip(plain, JSON.stringify(next), { author: "オーナー", at: new Date(now).toISOString(), created: t.stored().created, now, keepSpec: true });
+      if (!r.ok) throw new Error(JSON.stringify(r));
+      const s = await sealTrip(t.trip, t.created.id, 1, r.next);
+      expect((await t.request("/revise", "POST", { spec: v.spec, document: { ...s.document, reflections: v.document.reflections }, confirm: true }, t.owner, v.document.revision)).status).toBe(200);
+      expect((await t.list(t.owner))[0]).not.toHaveProperty("itineraryItemId");
+      expect(t.stored().media[0]).not.toHaveProperty("itineraryItemId");
+    });
+    test("photo caption: a sealed caption by the uploader, owner and editor; a plain one is 400; null removes it", async () => {
+      const t = await withMedia(), { m } = t, a = await t.upload(m.participant.cookie);
+      const caption = (cookie: string, value: string | null) => t.request("/media", "PATCH", { type: "caption", id: a.id, caption: value }, cookie);
+      const sealed = (text: string, generation = 1) => sealField(t.trip, t.created.id, generation, "photo", a.id, "caption", text);
+      expect(await error(await caption(m.other.cookie, await sealed("イカ")))).toEqual([403, "自分の写真だけ直せます"]);
+      expect((await caption(m.viewer.cookie, await sealed("イカ"))).status).toBe(403);
+      expect((await caption(m.participant.cookie, "イカ")).status).toBe(400);
+      expect((await caption(m.participant.cookie, await sealed("イカ", 2))).status).toBe(409);
+      const r = await caption(m.participant.cookie, await sealed("イカ"));
+      expect(r.status).toBe(200);
+      expect(await openField(t.trip, t.created.id, "photo", a.id, "caption", (await r.json()).photo.caption)).toBe("イカ");
+      expect(JSON.stringify(t.stored())).not.toContain("イカ");
+      for (const cookie of [t.owner, m.editor.cookie]) expect((await caption(cookie, await sealed("朝市"))).status).toBe(200);
+      const [seen] = await t.list(m.viewer.cookie) as Array<{ caption?: string }>;
+      expect(await openField(t.trip, t.created.id, "photo", a.id, "caption", seen!.caption!)).toBe("朝市");
+      const gone = await caption(m.participant.cookie, null);
+      expect(gone.status).toBe(200); expect((await gone.json()).photo).not.toHaveProperty("caption");
+      expect(t.stored().media[0]).not.toHaveProperty("caption");
+    });
     test("photo: no seat, a revoked seat or another trip's cookie gets no image", async () => {
       const t = await withMedia(), { m } = t, a = await t.upload(m.participant.cookie);
       expect((await t.image("", a.id)).status).toBe(401);
@@ -4196,7 +4394,7 @@ describe("sealed footprints and names", () => {
 
 describe("moving a plain trip", () => {
   // A plain trip with words of every kind, a step back, two seats' points and names of its own, moved by its owner's browser as
-  // src/trip-keys.ts sealMove does it: GET seal, GET grants, then one POST seal (docs/design/trip-e2e.md §5).
+  // src/trip-keys.ts sealMove does it: GET seal, GET grants, then one POST seal (docs/ephemeral-trip-capsule.md「5.4 平文の旅行を移す」).
   type Setup = Awaited<ReturnType<typeof setup>>;
   const during = +new Date("2026-09-25T01:00:00Z"), here = { lat: 35.6812, lng: 139.7671, accuracy: 20 };
   const words = ["テスト旅行", "集合", "駅前の広場", "旅のしおり", "朝市に行きたい", "相談の言葉", "傘を持つ", "宿代", "98765", "旅のメモの言葉", "直した予定の題", "35.6812", "139.7671", "名前を変えた人", "家族への招待", "オーナー", "メンバー2"];
@@ -4320,7 +4518,7 @@ describe("moving a plain trip", () => {
 });
 
 describe("after the new screen is out", () => {
-  // CAPSULE_SEALED_FROM: a trip published at or after it is not used plain (docs/design/trip-e2e.md §5). The line is put in the
+  // CAPSULE_SEALED_FROM: a trip published at or after it is not used plain (docs/ephemeral-trip-capsule.md「5.4 平文の旅行を移す」). The line is put in the
   // host's clock between two trips; a request without ui=2 is an older screen's.
   type Setup = Awaited<ReturnType<typeof setup>>;
   const error = async (r: Response) => [r.status, (await r.json()).error];
@@ -4671,3 +4869,85 @@ describe("rekey", () => {
   });
 });
 
+
+// A second kind of capsule, made here and not in src/ (#211): a note one text long, with nothing but a title and a deadline.
+// It goes through the host as it is, so the invites, roles, deadline and deletion are the host's, the same as a trip's.
+type NoteSpec = { schemaVersion: 1; kind: "test-note"; title: string; lifecycle: { purgeAt: string } };
+type NoteDocument = { revision: number; text: string };
+const noteSpec = z.object({ schemaVersion: z.literal(1), kind: z.literal("test-note"), title: z.string().min(1).max(160), lifecycle: z.object({ purgeAt: z.string().datetime({ offset: true }) }).strict() }).strict();
+const noteDocument = z.object({ revision: z.number().int().min(1), text: z.string().max(4000) }).strict();
+const noteKit: DomainKit<NoteSpec, NoteDocument> = {
+  kind: "test-note",
+  publish(spec, document, now) { try { return noteKit.validate(spec, document, now, false); } catch { return refuse(400, "メモと期限を確認してください"); } },
+  validate(spec, document, createdAt, sealed) {
+    if (sealed) throw new Error("a note is never sealed");
+    const v = { spec: noteSpec.parse(spec), document: noteDocument.parse(document) };
+    if (+new Date(v.spec.lifecycle.purgeAt) > createdAt + 180 * 86400000) throw new Error("too far");
+    return v;
+  },
+  stateOf: (spec, forced, now) => now >= +new Date(spec.lifecycle.purgeAt) ? "purged" : forced === "frozen" ? "frozen" : "active",
+  accent: () => "#336699",
+  refusal: (_, after, now) => +new Date(after.lifecycle.purgeAt) <= now ? "削除期限は今より後にしてください" : undefined,
+  exports: { zip: async (_, __, document) => zip({ "note.txt": document.text }), name: () => "note.zip", markdown: (_, d) => d.text, html: (_, d) => `<p>${d.text}</p>` },
+  recipe: { text: "メモを書いてください", generate: "メモを書いてください" },
+  judge: () => ({ ok: false, reason: "not-json" }),
+  apply({ document, role }, input) {
+    const op = z.object({ type: z.literal("write"), text: z.string().max(4000) }).strict().parse(input);
+    if (role === "participant") refuse(403, "書けるのはオーナー・編集者だけです");
+    document.text = op.text; document.revision++;
+    return {};
+  },
+};
+describe("a second domain kit", () => {
+  const purgeAt = "2026-10-16T00:00:00+09:00";
+  const make = (env: { CAPSULE_SEALED_FROM?: string } = {}) => {
+    const db = new LocalD1(); dbs.push(db);
+    const host = new CloudHost({ KITS: { trip: tripKit, "test-note": noteKit }, DB: db, CAPSULE_HMAC_KEY: key, CAPSULE_ORIGIN: origin, ...env }, () => now, async () => "test");
+    const send = (path: string, method = "GET", body?: unknown, cookie?: string, revision = 1) => host.fetch(new Request(origin + path, { method, headers: { Origin: origin, "Content-Type": "application/json", "If-Match": `"${revision}"`, ...(cookie ? { Cookie: cookie } : {}) }, ...(body ? { body: JSON.stringify(body) } : {}) }));
+    const publish = (spec: unknown, document: unknown) => send("/v1/publish", "POST", { spec, document, confirm: true });
+    const join = async (path: string, url: string) => (await send(path + "/sessions", "POST", { secret: new URL(url).hash.slice(3) })).headers.get("Set-Cookie")!.split(";")[0]!;
+    return { db, host, send, publish, join };
+  };
+  const note = { spec: { schemaVersion: 1, kind: "test-note", title: "架空のメモ", lifecycle: { purgeAt } }, document: { revision: 1, text: "" } };
+  test("published, joined, written, refused to a viewer, exported and gone at its deadline, through the host as it is, beside a trip", async () => {
+    const t = make();
+    const published = await t.publish(note.spec, note.document); expect(published.status).toBe(201);
+    const created = await published.json() as { id: string; url: string }, path = `/v1/c/${created.id}`;
+    const owner = await stepUp((p, m, b, c) => t.send(path + p, m, b, c), await t.join(path, created.url));
+    expect((await t.send(path + "/document", "PATCH", { type: "write", text: "持ち物: 傘" }, owner)).status).toBe(200);
+    const read = await (await t.send(path, "GET", undefined, owner)).json();
+    expect([read.spec.kind, read.document, read.state, read.role]).toEqual(["test-note", { revision: 2, text: "持ち物: 傘" }, "active", "owner"]);
+    expect(await (await t.send(path + "/theme.css", "GET", undefined, owner)).text()).toBe(":root{--accent:#336699}");
+    // A viewer joins by the owner's invite and reads it, and may not write.
+    const invite = await (await t.send(path + "/grants", "POST", { role: "viewer", label: "見るだけ", expiresAt: purgeAt, confirm: true }, owner)).json() as { url: string };
+    const viewer = await t.join(path, invite.url);
+    expect((await (await t.send(path, "GET", undefined, viewer)).json()).document.text).toBe("持ち物: 傘");
+    expect((await t.send(path + "/document", "PATCH", { type: "write", text: "x" }, viewer, 2)).status).toBe(403);
+    // What it does not have is not offered.
+    for (const action of ["/revise", "/undo", "/seal"]) expect([(await t.send(path + action, "GET", undefined, owner)).status]).toEqual([404]);
+    for (const action of ["/seal", "/rekey"]) expect([(await t.send(path + action, "POST", { confirm: true }, owner, 2)).status]).toEqual([404]);
+    expect((await t.send(path + "/footprints", "PATCH", { type: "add", lat: 35.68, lng: 139.76, accuracy: 20 }, owner)).status).toBe(404);
+    const exported = await t.send(path + "/export", "GET", undefined, owner);
+    expect([exported.status, exported.headers.get("Content-Disposition")]).toEqual([200, 'attachment; filename="note.zip"']);
+    expect(Buffer.from(await exported.arrayBuffer()).includes("note.txt")).toBe(true);
+    // A trip on the same host is published and read as before.
+    const trip = await (await t.publish(testTrip().spec, testTrip().document)).json() as { id: string; url: string };
+    expect((await (await t.send(`/v1/c/${trip.id}`, "GET", undefined, await t.join(`/v1/c/${trip.id}`, trip.url))).json()).spec.kind).toBe("trip");
+    // A kind the host was not given is refused; past its deadline the note is gone.
+    expect((await new CloudHost({ DB: t.db, CAPSULE_HMAC_KEY: key, CAPSULE_ORIGIN: origin }, () => now, async () => "test").fetch(new Request(origin + "/v1/publish", { method: "POST", headers: { Origin: origin, "Content-Type": "application/json" }, body: JSON.stringify({ ...note, confirm: true }) }))).status).toBe(400);
+    now = +new Date(purgeAt);
+    expect((await t.send(path, "GET", undefined, owner)).status).toBe(410);
+  });
+  test("a kind with no sealed form is not published after the line, where nothing is used plain; a trip still is", async () => {
+    const t = make({ CAPSULE_SEALED_FROM: new Date(now - 1000).toISOString() });
+    const refused = await t.publish(note.spec, note.document);
+    expect([refused.status, await refused.json()]).toEqual([400, { error: "この種類は、この Host では発行できません" }]);
+    expect((await t.publish(testTrip().spec, testTrip().document)).status).toBe(201);
+    // Before the line it is.
+    expect((await make({ CAPSULE_SEALED_FROM: new Date(now + 60000).toISOString() }).publish(note.spec, note.document)).status).toBe(201);
+  });
+});
+test("the host itself knows no domain: it imports none of the trip's modules", () => {
+  const source = readFileSync(join(import.meta.dir, "cloud-host.ts"), "utf8");
+  for (const module of ["./schema", "./export", "./revise", "./recipe", "./paste", "./validate", "./timing", "./trip-kit"]) expect(source).not.toContain(`from "${module}"`);
+});

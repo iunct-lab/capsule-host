@@ -68,7 +68,7 @@ function notice(text: string, error = false) { const el = document.querySelector
 // seat's passkey for an owner, a fresh sign-in for a creator. It is then sent once more as it was.
 async function api(action = "", method = "GET", body?: unknown, revision = view?.document.revision, retried = false): Promise<any> {
   const url = action.startsWith("/") ? action : `/v1/c/${id}/${action}`.replace(/\/$/, "");
-  // ui=2: this screen draws a sealed trip and moves a plain one; the host asks an older screen to reload (docs/ephemeral-trip-capsule.md「5.4 平文の旅行を移す」).
+  // ui=2: this screen draws a sealed trip and seals one at first; the host asks an older screen to reload (docs/design/trip-e2e.md §5).
   const res = await fetch(url.startsWith("/v1/c/") ? `${url}${url.includes("?") ? "&" : "?"}ui=2` : url, { method, headers: { ...(body !== undefined ? { "Content-Type": "application/json" } : {}), ...(revision !== undefined ? { "If-Match": `"${revision}"` } : {}) }, ...(body !== undefined ? { body: JSON.stringify(body) } : {}) });
   if (res.status === 428 && !retried) {
     try { await (url.startsWith("/v1/c/") ? stepUp() : creatorCheck()); } catch (err) { throw (err as Error).name === "NotAllowedError" ? new Error("パスキーの操作を中止しました。") : err; }
@@ -659,8 +659,8 @@ function sealNames() {
     }
   });
 }
-// What a sealed trip sends as a name: sealed against its seat or invite. A plain trip's goes as it is.
-const nameFor = async (kind: "member" | "grant", rid: string, name: string) => view.sealed && tripKey ? sealName(tripKey, id!, view.sealed.generation, kind, rid, name) : name;
+// What a trip sends as a name: sealed against its seat or invite.
+const nameFor = async (kind: "member" | "grant", rid: string, name: string) => { if (!view.sealed || !tripKey) throw new Error("この端末には旅行の鍵がありません"); return sealName(tripKey, id!, view.sealed.generation, kind, rid, name); };
 const newGrantId = () => crypto.randomUUID().replaceAll("-", "");
 // A sealed trip's footprints (docs/ephemeral-trip-capsule.md「5.2 暗号化するもの・平文に残すもの」, the footprint row), opened into the shape the plain trip's come in,
 // so the map, the list, the narrowing and `autoDue` draw them as before. One that does not open or is out of range (spec「5.3 暗号化した旅行で Host にできないこと」) is left
@@ -679,8 +679,7 @@ async function openFootprints(list: HostFootprint[]): Promise<Footprint[]> {
 // trip's key against an id chosen here, with this seat's name then as `by` (spec「5.2 暗号化するもの・平文に残すもの」「5.3 暗号化した旅行で Host にできないこと」); the host checks the rest.
 async function sendFootprint(point: PlainPoint, auto?: true): Promise<Footprint[]> {
   const add = (body: object) => api("footprints", "PATCH", { type: "add", ...body, ...auto && { auto } }) as Promise<{ footprints: HostFootprint[] }>;
-  if (!view.sealed) return (await add(point)).footprints as Footprint[];
-  if (!tripKey) throw new Error("この端末には旅行の鍵がありません");
+  if (!tripKey || !view.sealed) throw new Error("この端末には旅行の鍵がありません");
   if (!pointSchema.safeParse(point).success) throw new Error("位置を確認してください");
   const fid = crypto.randomUUID().replaceAll("-", ""), generation = view.sealed.generation;
   const me = (view.self && await openName(tripKey, id!, "member", view.self.id, view.self.label)) || "（名前なし）";
@@ -689,8 +688,7 @@ async function sendFootprint(point: PlainPoint, auto?: true): Promise<Footprint[
 // Every change to the trip's document goes through here. A sealed trip's is the same plain operation, checked and sealed under
 // the trip's key just before it is sent (spec「5.3 暗号化した旅行で Host にできないこと」): a word the plain trip would refuse is refused here, before anything leaves.
 async function sendOperation(op: unknown) {
-  if (!view.sealed) return api("document", "PATCH", op);
-  if (!tripKey) throw new Error("この端末には旅行の鍵がありません");
+  if (!tripKey || !view.sealed) throw new Error("この端末には旅行の鍵がありません");
   let sealed: unknown;
   try { sealed = await sealOperation(tripKey, id!, view.sealed.generation, op, view.document); }
   catch (err) { throw plainError(err); }
@@ -1171,18 +1169,16 @@ function boundaryRows() {
   buttons.forEach((button, k) => { if (gaps[k]) { button.classList.add('boundary-wrapped'); button.style.setProperty('--wrapped-gaps', String(gaps[k])); } });
 }
 new ResizeObserver(boundaryRows).observe(app);
-// A plain trip is moved to the sealed form once, by its owner's browser at a press (docs/ephemeral-trip-capsule.md「5.4 平文の旅行を移す」): until then it is
-// used as before. A trip published after the host's line (`mustSeal`) shows this alone. A browser without WebAuthn cannot move it.
-const moveBanner = () => !id || view.sealed || !["active", "reflection"].includes(view.state) ? ""
-  : view.role !== "owner" ? `<p class="muted" data-move="member">オーナーが開くと、この旅行は運用者にも読めない形になります</p>`
-  : !passkeys ? `<p class="warning" data-move="no-passkey">${view.mustSeal ? "この旅行は、パスキーの使えるブラウザでオーナーが移すまで開けません" : "このブラウザでは旅行を移せません。パスキーの使える別のブラウザ（Safari・Chrome など）で開いてください"}</p>`
-  : `<div class="preview-banner" data-move="owner"><div><strong>この旅行を、メンバーにだけ読める形に移します。</strong><p>移すと、運用者にも読めなくなります。</p></div>${button("移す", "move-trip", "primary")}</div>`;
-// The trip as the host has it now, with the step back (GET seal) and every member's and invite's name, sealed under the trip's key
-// and put back in one POST seal (src/trip-keys.ts sealMove), whose passkey check api() asks for (428). Too large with the step
-// back, it goes once more without it; too large still, it stays plain. A point or a seat added meanwhile: read again, once.
-let moving = false;
-async function moveTrip() {
-  if (moving) return; moving = true;
+// A trip is sealed once, by its owner's browser as the seat is taken (docs/design/trip-e2e.md §5): until then the host lets nobody
+// else in and the owner only seal it (`mustSeal`), so this is all the page shows. A browser without WebAuthn cannot seal it.
+const sealBanner = () => !id || !view.mustSeal || !["active", "reflection"].includes(view.state) ? ""
+  : !passkeys ? `<p class="warning" data-seal="no-passkey">この旅行は、パスキーの使えるブラウザ（Safari・Chrome など）で開いてください</p>`
+  : `<div class="preview-banner" data-seal="owner"><div><strong>この旅行を、メンバーにだけ読める形にします。</strong><p>運用者にも読めなくなります。</p></div>${button("暗号化する", "seal-trip", "primary")}</div>`;
+// The trip as the host has it now, with every member's and invite's name, sealed under the trip's key and put in one POST seal
+// (src/trip-keys.ts sealMove), whose passkey check api() asks for (428). A point or a seat added meanwhile: read again, once.
+let sealing = false;
+async function sealFirst() {
+  if (sealing) return; sealing = true;
   try {
     await ensureTripKey();
     const generation = view.seatKey?.generation;
@@ -1190,24 +1186,20 @@ async function moveTrip() {
     for (let attempt = 0; ; attempt++) {
       const now = await api() as View, { previous } = await api("seal"), grants = await api("grants");
       const input = { spec: now.spec, document: now.document, previous, footprints: (now.footprints ?? []).map(({ id, lat, lng, accuracy, by }) => ({ id, lat, lng, accuracy, by })), grants };
-      try {
-        try { await api("seal", "POST", await sealMove(tripKey, id!, generation, input), now.document.revision); }
-        catch (err) { if ((err as { status?: number }).status !== 413) throw err; await api("seal", "POST", await sealMove(tripKey, id!, generation, input, { dropPrevious: true }), now.document.revision); }
-        break;
-      } catch (err) {
-        if ((err as { status?: number }).status === 413) { notice("旅程が大きすぎて移せません。予定や投稿を減らしてください", true); return; }
+      try { await api("seal", "POST", await sealMove(tripKey, id!, generation, input), now.document.revision); break; }
+      catch (err) {
         if (attempt === 0 && (err as { status?: number }).status === 409 && (err as Error).message.endsWith("もう一度移してください")) continue;
         throw err;
       }
     }
-    await reload(); notice("旅行を、メンバーにだけ読める形に移しました。");
-  } catch (err) { notice((err as Error).message, true); } finally { moving = false; }
+    await reload(); notice("旅行を、メンバーにだけ読める形にしました。");
+  } catch (err) { notice((err as Error).message, true); } finally { sealing = false; }
 }
 function render() {
   mapCamera = unmountMap?.(); unmountMap = undefined; mapData = undefined;
   if (locked || view.mustSeal) {
     document.title = "旅のカプセル";
-    app.innerHTML = `<header class="topbar"><a class="brand" href="/" aria-label="ホーム（旅のカプセル）"><span class="brand-icon">旅</span> <span class="brand-name">旅のカプセル</span></a><div class="top-actions"><a class="button quiet" href="/">ホーム</a><span class="role">${roleNames[view.role]}</span>${button("再読込", "reload", "quiet")}</div></header><main><section class="content">${view.mustSeal ? moveBanner() || `<p class="warning" data-move="closed">共有が終わったため、この旅行は開けません</p>` : `<p class="warning" data-sealed="locked">${e(locked)}</p>`}</section><footer>${passkeys ? button(view.passkey ? "パスキーを登録し直す" : "パスキーで戻れるようにする", "passkey-register", "quiet") : ""}${button("この端末からログアウト", "signout", "quiet")}${keyStatus()}${handoffWaiting()}</footer></main>`;
+    app.innerHTML = `<header class="topbar"><a class="brand" href="/" aria-label="ホーム（旅のカプセル）"><span class="brand-icon">旅</span> <span class="brand-name">旅のカプセル</span></a><div class="top-actions"><a class="button quiet" href="/">ホーム</a><span class="role">${roleNames[view.role]}</span>${button("再読込", "reload", "quiet")}</div></header><main><section class="content">${view.mustSeal ? sealBanner() || `<p class="warning" data-seal="closed">共有が終わったため、この旅行は開けません</p>` : `<p class="warning" data-sealed="locked">${e(locked)}</p>`}</section><footer>${passkeys ? button(view.passkey ? "パスキーを登録し直す" : "パスキーで戻れるようにする", "passkey-register", "quiet") : ""}${button("この端末からログアウト", "signout", "quiet")}${keyStatus()}${handoffWaiting()}</footer></main>`;
     return;
   }
   document.title = `${view.spec.title} · 旅のカプセル`;
@@ -1222,7 +1214,6 @@ function render() {
   const remaining = Math.max(0, Math.ceil((+new Date(s.lifecycle.purgeAt) - Date.now()) / 86400000));
   app.innerHTML = `<header class="topbar"><a class="brand" href="/" aria-label="ホーム（旅のカプセル）"><span class="brand-icon">旅</span> <span class="brand-name">旅のカプセル</span> <span class="brand-en">TRIP CAPSULE</span></a><div class="top-actions">${id ? '<a class="button quiet" href="/">ホーム</a>' : ""}<span class="role">${roleNames[view.role]}</span>${id ? button("再読込", "reload", "quiet") : ""}${id ? button("旅を保存", "save", "secondary") : ""}${id && revisable() && view.role === "editor" && editable() ? button("チャットで直す", "revise", "secondary") : ""}${id && (view.role === "owner" || view.role === "editor") ? button("共有・管理", "manage", "primary") : ""}</div></header>
     <div class="lifecycle ${remaining <= 7 ? "urgent" : ""}"><span>● ${stateNames[view.state]}</span><span>${dateLabel(s.lifecycle.purgeAt.slice(0, 10))} に自動削除 · あと${remaining}日${remaining <= 7 && editor() ? " — 削除前に「旅を保存」で書き出してください" : ""}</span></div>
-    ${moveBanner()}
     ${view.unreadable?.length ? `<p class="warning" data-unreadable="${view.unreadable.length}">この端末で開けない記録が ${view.unreadable.length} 件あります</p>` : ""}
     ${view.state === "draft" ? `<div class="preview-banner"><div><strong>このしおりは公開前のプレビューです。</strong><p>内容・表示名・削除期限を確認して保存します。保存しただけでは招待リンクは配られません。</p></div>${button("内容を確認して作成", "publish", "primary")}</div>` : ""}
     <main><section class="hero"><div class="hero-copy"><span class="eyebrow">${e(s.presentation?.kicker ?? "A LITTLE GETAWAY")}</span><h1>${e(s.title)}</h1><p>${e(s.summary ?? "")}</p><div class="trip-meta"><span>${dateLabel(s.trip.startsOn)} — ${dateLabel(s.trip.endsOn)}</span><span>${e(s.timezone)}</span></div><div class="people">${(s.presentation?.travelers ?? []).map(t => `<span>${e(t.name.slice(0, 1))}</span>`).join("")}<small>${(s.presentation?.travelers ?? []).map(t => e(t.name) + (t.note ? `（${e(t.note)}）` : "")).join("・")}</small></div></div><div class="postcard" aria-hidden="true"><div class="postcard-top">POSTCARD <span>${e(s.presentation?.postcardLabel ?? s.trip.destinations[0]!)}</span></div><div class="landscape"><div class="sun"></div><div class="island one"></div><div class="island two"></div><div class="sea"></div><div class="boat">⛵</div></div><div class="postcard-bottom">${e(s.presentation?.postcardCaption ?? "旅に、出かけよう。").replace(/\n/g, "<br>")}<span>TRIP<br>CAPSULE</span></div></div></section>
@@ -1383,7 +1374,7 @@ const saveNotes: Record<"markdown" | "json" | "ics" | "html", string> = {
 // kept at hand for the tap. A fetch that failed is forgotten, so the tap asks again.
 // A sealed trip's exports are made here from the trip this browser opened, with the host's own functions (src/export.ts,
 // docs/ephemeral-trip-capsule.md「5.3 暗号化した旅行で Host にできないこと」); a plain trip's come from the host as before.
-const exported = async (kind: "html" | "md") => view.sealed ? (kind === "html" ? tripHtml : tripMarkdown)(view.spec, view.document) : (await api(kind === "html" ? "export.html" : "export.md")).text as string;
+const exported = async (kind: "html" | "md") => (kind === "html" ? tripHtml : tripMarkdown)(view.spec, view.document);
 let savedPage: Promise<string> | undefined, pageText: string | undefined;
 function fetchPage() {
   const fetched = savedPage = exported("html");
@@ -1447,7 +1438,7 @@ document.addEventListener("click", async event => {
     if (action === "cancel-diary") { editingDiaryId = ""; render(); }
     if (action === "save-private") savePrivateMarkdown();
     if (action === "receive-key") void receiveKey();
-    if (action === "move-trip") void moveTrip();
+    if (action === "seal-trip") void sealFirst();
     if (action === "give-key") void giveKey(b.dataset.id!, b.dataset.label ?? "メンバー");
     if (action === "handoff-submit") { const input = dialog.querySelector<HTMLInputElement>("[data-handoff-input]"); const typed = input?.value.trim() ?? ""; if (typed) { const resolve = codeResolver; codeResolver = undefined; resolve?.(typed); } else input?.focus(); }
     if (action === "read-private") try { await readWithPasskey(); await openAll(); if (dialog.open) dialog.close(); render(); notice("自分だけのメモを読めるようにしました。"); } catch (err) { passkeyError(err); }
@@ -1493,7 +1484,7 @@ document.addEventListener("click", async event => {
       const request = document.querySelector<HTMLTextAreaElement>("[data-revise-request]")?.value.trim() ?? "";
       // The request goes first: were the text cut short where it is pasted, the request would be the part lost (#306).
       // A sealed trip's text is made here from the trip this browser opened, as the host makes a plain one's (spec「5.3 暗号化した旅行で Host にできないこと」).
-      const made: Promise<string> = view.sealed ? Promise.resolve(reviseText(view.spec, view.document, view.role !== "owner")) : api("revise").then(r => r.text as string);
+      const made: Promise<string> = Promise.resolve(reviseText(view.spec, view.document, view.role !== "owner"));
       const text = made.then(t => request ? `## 直してほしいこと\n\n${request}\n\n---\n\n${t}` : t);
       try { await navigator.clipboard.write([new ClipboardItem({ "text/plain": text.then(t => new Blob([t], { type: "text/plain" })) })]); notice(request ? "今の旅程と直し方に、直してほしいことを付けてコピーしました。チャットに貼って、そのまま送ってください。" : "今の旅程と直し方をコピーしました。チャットに貼って、直してほしいことを書いてください。"); }
       catch {
@@ -1615,7 +1606,7 @@ document.addEventListener("submit", async event => {
   const form = event.target as HTMLFormElement; if (!form.dataset.form) return; event.preventDefault();
   const f = formValues(form), submit = form.querySelector<HTMLButtonElement>('button[type="submit"],button:not([type])'); if (submit) submit.disabled = true;
   try {
-    if (form.dataset.form === "revise-key") { if (view.sealed) await wrapAssistKey(f.key ?? ""); else await api("key", "PUT", { key: f.key }); await reload(); redrawHostRevise(); notice("API キーを登録しました。"); }
+    if (form.dataset.form === "revise-key") { await wrapAssistKey(f.key ?? ""); await reload(); redrawHostRevise(); notice("API キーを登録しました。"); }
     if (form.dataset.form === "assist-key") { await api("/v1/account/key", "PUT", { key: f.key }); await creationHome(); notice("API キーを登録しました。"); }
     if (form.dataset.form === "create") {
       if (!canCreate) throw new Error("旅行の発行権限が必要です");
@@ -1695,12 +1686,12 @@ document.addEventListener("submit", async event => {
     }
     if (form.dataset.form === "revise" && revising) {
       // The text and version are the ones the diff on screen was computed from, so what is applied is what was shown.
-      try { await api("revise", "POST", revising.next ? await resealed(revising.next, revising.large, f.title) : { text: revising.text, confirm: true, ...(f.title !== undefined ? { title: f.title } : {}) }, revising.revision); }
+      try { await api("revise", "POST", await resealed(revising.next, revising.large, f.title), revising.revision); }
       catch (err) { if ((err as { status?: number }).status !== 409) throw err; notice("別の人が更新しました。差分を出し直します。", true); await checkRevise(); return; }
       revising = undefined; dialog.close(); await reload(); notice(`反映しました。「${view.role === "owner" ? "共有・管理" : "チャットで直す"}」から 1 つ前に戻せます。`);
     }
     if (form.dataset.form === "undo" && undoing) {
-      try { await api("undo", "POST", undoing.next ? await resealed(undoing.next, undoing.large, f.title, undoing.step) : { confirm: true, ...(f.title !== undefined ? { title: f.title } : {}) }, undoing.revision); }
+      try { await api("undo", "POST", await resealed(undoing.next, undoing.large, f.title, undoing.step), undoing.revision); }
       catch (err) { if ((err as { status?: number }).status !== 409) throw err; notice("別の人が更新しました。差分を出し直します。", true); await showUndo(); return; }
       undoing = undefined; dialog.close(); await reload(); notice("1 つ前に戻しました。");
     }
@@ -1708,10 +1699,10 @@ document.addEventListener("submit", async event => {
     if (form.dataset.form === "purge") { if (view.sealed && !sameTitle(f.title, view.spec.title)) throw new Error("確認用のタイトルが一致しません"); await api("purge", "POST", { title: view.sealed ? "" : f.title }); await forgetTrip(id!); dialog.close(); unmountMap?.(); unmountMap = undefined; app.innerHTML = '<main class="empty"><h1>カプセルを削除しました。</h1><p>すべてのリンクが失効しました。</p><a href="/">プレビューに戻る</a></main>'; }
     if (form.dataset.form === "settings") {
       if (confirm(`タイトル：${view.spec.title} → ${f.title}\n日程：${view.spec.trip.startsOn}〜${view.spec.trip.endsOn} → ${f.start}〜${f.end}\nテーマ：${view.spec.theme.preset} → ${f.theme}\n削除日：${view.spec.lifecycle.purgeAt.slice(0, 10)} → ${f.purge}\nこの変更を反映しますか？`)) { const spec = structuredClone(view.spec); spec.title = f.title!; spec.trip = { startsOn: f.start!, endsOn: f.end!, destinations: f.destination!.split(/[、,]/).map(x => x.trim()).filter(Boolean) }; spec.theme.preset = f.theme as Spec["theme"]["preset"]; spec.lifecycle.purgeAt = `${f.purge}T00:00:00+09:00`;
-        // A sealed trip's settings go sealed: the words checked as a plain Spec first, then its title, destinations and labels sealed.
-        if (view.sealed && !tripKey) throw new Error("この端末には旅行の鍵がありません");
-        let sealedSpec: unknown; if (view.sealed) try { sealedSpec = await sealSpec(tripKey!, id!, view.sealed.generation, specSchema.parse(spec)); } catch (err) { throw plainError(err); }
-        await api("spec", "PATCH", { spec: view.sealed ? sealedSpec : spec, confirm: true }); dialog.close(); await reload(); }
+        // The settings go sealed: the words checked as a plain Spec first, then its title, destinations and labels sealed.
+        if (!view.sealed || !tripKey) throw new Error("この端末には旅行の鍵がありません");
+        let sealedSpec: unknown; try { sealedSpec = await sealSpec(tripKey, id!, view.sealed.generation, specSchema.parse(spec)); } catch (err) { throw plainError(err); }
+        await api("spec", "PATCH", { spec: sealedSpec, confirm: true }); dialog.close(); await reload(); }
     }
     if (form.dataset.form === "publish") {
       const spec = structuredClone(view.spec), doc = structuredClone(view.document), delta = +new Date(f.start!) - +new Date(spec.trip.startsOn);
@@ -1794,8 +1785,8 @@ function renderDiff(d: Diff) {
 const approval = (form: string, d: Diff, label: string) => `<form data-form="${form}">${d.large ? `<p class="warning">大きな変更です（題か日程が変わる、今の予定の半分以上が削除・変更される、または今ある候補・相談が変更・削除されます）。</p><label>確認のため、今の題「${e(view.spec.title)}」を入力${d.title ? "（変更後の題ではありません）" : ""}<input name="title" required autocomplete="off"></label>` : `<label class="check"><input type="checkbox" required><span>この差分で${e(label)}</span></label>`}<button class="primary">${e(label)}</button></form>`;
 // `next` (a sealed trip): the trip the diff on screen was made from here, sent sealed when it is applied.
 type Next = { spec: Spec; document: Document };
-let revising: { text: string; revision: number; next?: Next; large?: boolean } | undefined;
-let undoing: { revision: number; next?: Next; large?: boolean; step?: { spec: SealedSpec; document: Partial<SealedDocument> } } | undefined;
+let revising: { text: string; revision: number; next: Next; large?: boolean } | undefined;
+let undoing: { revision: number; next: Next; large?: boolean; step?: { spec: SealedSpec; document: Partial<SealedDocument> } } | undefined;
 // A sealed trip with a record this browser cannot open is not revised or undone here: the trip sent back would drop it.
 const revisable = () => !view.unreadable?.length;
 const notRevisable = "この端末で開けない記録があるため、チャットで直す・1 つ前に戻すは使えません（反映すると、その記録が消えるため）。";
@@ -1811,7 +1802,7 @@ async function resealed(next: Next, large: boolean | undefined, title: string | 
   return { spec: step ? step.spec : view.role === "owner" ? t.spec : sealedNow.spec, document: { ...t.document, reflections: sealedNow.document.reflections }, confirm: true as const };
 }
 // A sealed trip's step back is opened here (GET undo gives it sealed) and set against the trip as this browser opened it (spec「5.3 暗号化した旅行で Host にできないこと」).
-async function sealedUndo(): Promise<{ diff: Diff; revision: number; next?: Next; step?: { spec: SealedSpec; document: Partial<SealedDocument> } }> {
+async function sealedUndo(): Promise<{ diff: Diff; revision: number; next: Next; step?: { spec: SealedSpec; document: Partial<SealedDocument> } }> {
   const got = await api("undo") as { previous: Previous<SealedSpec, SealedDocument>; revision: number };
   if (got.revision !== view.document.revision) await reload();
   if (!revisable()) throw new Error(notRevisable);
@@ -1825,13 +1816,13 @@ async function sealedUndo(): Promise<{ diff: Diff; revision: number; next?: Next
   return { diff: r.diff, revision: got.revision, next: r.next, step: got.previous };
 }
 async function showUndo() {
-  const back = view.sealed ? await sealedUndo() : await api("undo") as { diff: Diff; revision: number; next?: Next; step?: undefined };
+  const back = await sealedUndo();
   undoing = { revision: back.revision, next: back.next, large: back.diff.large, step: back.step };
   modal("1 つ前に戻す", `<p>最後に「チャットで直す」で反映する前の旅程（${view.role === "owner" ? "設定と" : ""}予定・候補・相談・準備リスト・メモ・費用メモ）に戻します。反映の後に手で直した予定・メモ${view.role === "owner" ? "・設定" : ""}も戻ります（下の差分に出ます）。反映の後に書かれた候補・相談・思い出とチェックの状態は残ります。戻せるのは 1 回だけです。</p><h3>戻すと変わるところ</h3>${renderDiff(back.diff) || "<p>今の旅程から変わるところはありません。</p>"}${approval("undo", back.diff, "戻す")}`);
 }
 // Revising on the host with this member's own Anthropic API key (#658). The key is the seat's alone: it is sent once, kept sealed,
 // and never shown again; nobody else in the trip, nor the creator, can use it.
-const sentDirect = () => view.sealed ? "鍵はこの端末のパスキーで包んで置き、旅程と鍵はこの端末から Anthropic に直接送ります（このサービスには届きません）。" : "";
+const sentDirect = () => "鍵はこの端末のパスキーで包んで置き、旅程と鍵はこの端末から Anthropic に直接送ります（このサービスには届きません）。";
 const hostRevise = () => `<div data-host-revise>${view.assistKey
   ? `<h3>自分の API キーで、ここで直す</h3><p class="muted">下の「直してほしいこと」を、あなた自身の Anthropic API キーで直します。できた案は、同じ差分の確認に出ます。費用はあなたの Anthropic アカウントに請求されます。旅程と書いた内容は Anthropic に送られます。${sentDirect()}</p><div class="admin-actions">${button("ここで直す（1 分ほどかかります）", "revise-assist", "primary")}${button("API キーを削除", "revise-key-delete", "quiet danger-text")}</div><hr>`
   : `<h3>自分の API キーで、ここで直す</h3><p class="muted">自分の Anthropic API キーを登録すると、コピーして貼る手間なしに、ここで直せます。鍵はあなたの席だけのもので、ほかのメンバーや作成者は使えません。暗号化して保管し、画面には二度と表示しません。費用はあなたの Anthropic アカウントに請求されます。${sentDirect()}</p><form data-form="revise-key"><label>Anthropic API キー<input name="key" type="password" autocomplete="off" required placeholder="sk-ant-…"></label><button class="primary">鍵を登録</button></form><hr>`}</div>`;
@@ -1843,25 +1834,11 @@ async function reviseAssist() {
   if (!request || !paste || !run) return;
   const label = run.textContent; run.disabled = true; run.textContent = "作成中…（1 分ほどかかります）";
   try {
-    if (view.sealed) {
-      const out = await sealedAssist(request.value).catch((err: Error) => ({ failed: err.message }));
-      if (!run.isConnected) return;
-      if ("failed" in out) { problems([out.failed]); notice(out.failed, true); return; }
-      if (out.text === undefined) { problems([pasteReasons["cut-off"].replace("チャットの返事を最後まで貼ってください。", "直してほしいことを短くしてもう一度試してください。")]); notice("できた案を確認してください。", true); return; }
-      paste.value = out.text; await checkRevise(); return;
-    }
-    const job = await api("revise/assist", "POST", { instruction: request.value }) as { id: string };
-    for (const end = Date.now() + 380_000; Date.now() < end;) {
-      await new Promise(r => setTimeout(r, 3000));
-      if (!run.isConnected) return;  // the dialog was closed
-      const state = await api(`revise/assist/${job.id}`) as { state: string; result?: { ok: boolean; text?: string; reason?: string }; message?: string };
-      if (state.state === "done") {
-        if (!state.result?.ok) { problems([pasteReasons["cut-off"].replace("チャットの返事を最後まで貼ってください。", "直してほしいことを短くしてもう一度試してください。")]); notice("できた案を確認してください。", true); return; }
-        paste.value = state.result.text ?? ""; await checkRevise(); return;
-      }
-      if (state.state === "failed") { problems([state.message ?? assistFailed]); notice(state.message ?? assistFailed, true); return; }
-    }
-    problems([assistFailed]); notice(assistFailed, true);
+    const out = await sealedAssist(request.value).catch((err: Error) => ({ failed: err.message }));
+    if (!run.isConnected) return;
+    if ("failed" in out) { problems([out.failed]); notice(out.failed, true); return; }
+    if (out.text === undefined) { problems([pasteReasons["cut-off"].replace("チャットの返事を最後まで貼ってください。", "直してほしいことを短くしてもう一度試してください。")]); notice("できた案を確認してください。", true); return; }
+    paste.value = out.text; await checkRevise(); return;
   } catch (err) { notice((err as Error).message, true); }
   finally { run.disabled = false; run.textContent = label; }
 }
@@ -1911,11 +1888,11 @@ async function sealedAssist(request: string): Promise<{ text?: string }> {
 async function checkRevise() {
   const field = document.querySelector<HTMLTextAreaElement>("[data-revise-paste]"), out = document.querySelector<HTMLElement>(".revise-diff"); if (!field || !out) return;
   out.hidden = true; revising = undefined; problems([]);
-  const result = view.sealed ? await sealedCheck(field.value) : await api("revise/check", "POST", { text: field.value }) as { ok: boolean; reason?: keyof typeof pasteReasons; messages?: string[]; diff?: Diff; revision?: number; next?: Next };
+  const result = await sealedCheck(field.value);
   if (!result.ok) { problems(result.reason ? [pasteReasons[result.reason]] : result.messages ?? []); notice("貼った内容を確認してください。", true); return; }
   // The title asked for is the trip's as the host has it: someone may have renamed it since this page loaded.
   if (result.revision !== view.document.revision) await reload();
-  revising = { text: field.value, revision: result.revision!, next: result.next, large: result.diff!.large };
+  revising = { text: field.value, revision: result.revision!, next: result.next!, large: result.diff!.large };  // an answer that passed carries the trip it makes
   const d = result.diff!, rows = renderDiff(d);
   out.innerHTML = !rows ? "<p>今の旅程から変わるところはありません。</p>" : `<h3>反映すると変わるところ</h3>${rows}${approval("revise", d, "反映する")}`;
   out.hidden = false; out.scrollIntoView({ block: "start", behavior: "smooth" });

@@ -39,8 +39,8 @@ test("Authorization is dropped, and a signed-in read gets the Host's own answer"
   try {
     const published = await host.fetch(new Request(origin + "/v1/publish", { method: "POST", headers: { Origin: origin, "Content-Type": "application/json" }, body: JSON.stringify({ ...testTrip(), confirm: true }) }));
     expect(published.status).toBe(201);
-    const created = await published.json() as { id: string; url: string }, url = `${origin}/v1/c/${created.id}`;
-    const session = await host.fetch(new Request(url + "/sessions", { method: "POST", headers: { Origin: origin, "Content-Type": "application/json" }, body: JSON.stringify({ secret: new URLSearchParams(new URL(created.url).hash.slice(1)).get("k") }) }));
+    const created = await published.json() as { id: string; url: string }, base = `${origin}/v1/c/${created.id}`, url = `${base}?ui=2`;  // as the new screen reads it
+    const session = await host.fetch(new Request(base + "/sessions", { method: "POST", headers: { Origin: origin, "Content-Type": "application/json" }, body: JSON.stringify({ secret: new URLSearchParams(new URL(created.url).hash.slice(1)).get("k") }) }));
     expect(session.status).toBe(200);
     const cookie = session.headers.get("Set-Cookie")!.split(";")[0]!;
     const direct = await host.fetch(new Request(url, { headers: { cookie, "cf-connecting-ip": "198.51.100.7" } }));

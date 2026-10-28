@@ -3,7 +3,7 @@ import { z } from "zod";
 import Anthropic from "@anthropic-ai/sdk";
 import { CloudStore, type D1, type CapsuleStore, type CloudRow } from "./cloud-store";
 import { LocalKeyStore, open, seal, type KeyStore } from "./key-store";
-import { ASSIST_LIMIT, ASSIST_MODEL, REVISE_LIMIT, anthropicGenerate, todayLine, type Follow, type Generated } from "./assist";
+import { ASSIST_LIMIT, ASSIST_MODEL, anthropicGenerate, todayLine, type Follow, type Generated } from "./assist";
 import { instant as isoTime, localDay, sameTitle, author, pointSchema, cipher, CIPHER, PASTE_LIMIT } from "./fields";
 import { Refused, type DomainKit, type Envelope, type Role, type Versioned } from "./kit";
 import { kits as registered, kitOf, DEFAULT_KIND } from "./kits";
@@ -76,7 +76,6 @@ type Capsule = { sealed?: { generation: number }; spec: Envelope; document: Vers
 // `owner`: the owner seat handed over (rotation of the owner invite, /recover): its owner is asked. The rest are replaced at once.
 type Departure = { seat: string; at: number; why: "revoke" | "rotate" | "expired" | "owner" };
 // What the host does by reading a trip's words (export, revise, undo) waits for the browser to do it (spec「5.3 暗号化した旅行で Host にできないこと」).
-function plain(c: Capsule) { if (c.sealed) throw new Fault(409, "暗号化した旅行では、まだ使えません", "sealed"); }
 // A creator may publish new trips and nothing else: no seat in any capsule comes with it. One row holds every creator, so
 // enrolling, signing in and revoking are the same version CAS as a capsule edit. An enrollment is a one-time link, dropped once used.
 // `unowned` names the trips a creator made that may still have no owner, so the creator can finish or delete them later (#320).
@@ -97,7 +96,7 @@ function fail(status: number, text: string): never { throw new Fault(status, tex
 const token = () => randomBytes(32).toString("base64url");
 // A generation: the job row and the creator's running row are kept past its deadline only briefly; the host-wide slots (2) are rows too.
 const ASSIST_DEADLINE = 360_000, ASSIST_SLOTS = 2;
-type AssistJob = { who: string; subject: string; state: "running" | "done" | "failed"; deadline: number; text?: string; result?: unknown; message?: string; kind?: "revise"; sealed?: string; system?: string; capsule?: string; seat?: string };
+type AssistJob = { who: string; subject: string; state: "running" | "done" | "failed"; deadline: number; text?: string; result?: unknown; message?: string; system?: string };
 const reasonText = (reason?: string) => reason === "cut-off" ? "答えが途中で切れています" : reason === "many" ? "旅程が 2 つ以上あります。1 つだけ返してください" : "旅程の JSON が見つかりません。JSON だけを返してください";
 const ASSIST_FAILED = "生成に失敗しました。もう一度試すか、作り方をコピーしてチャットで作ってください";
 const PASSKEY_WINDOW = 5 * 60000, PASSKEY_CEREMONIES = 100;  // a capsule holds at most 50 members, so this is twice what a real five minutes can need
@@ -198,7 +197,7 @@ export class CloudHost {
   keys: KeyStore;
   kits: Record<string, DomainKit>;
   // `KITS`: the kinds this host publishes and opens (src/kits.ts by default; a test adds its own).
-  constructor(public env: { KITS?: Record<string, DomainKit>; DB?: D1; STORE?: CapsuleStore; KEYS?: KeyStore; MEDIA?: MediaStore; VERIFY_KEY?: (apiKey: string) => Promise<boolean>; ASSIST?: { generate: (apiKey: string, model: string, text: string, system?: string, follow?: Follow) => Promise<Generated>; dispatch?: (id: string) => Promise<void> }; CAPSULE_ASSIST_MODEL?: string; CAPSULE_HMAC_KEY: string; CAPSULE_ORIGIN: string; CAPSULE_CLAIM_COUNTRIES?: string; CAPSULE_DISABLED_ACTIONS?: string; CAPSULE_SEALED_FROM?: string; CAPSULE_PHOTOS?: string }, public clock = () => Date.now(), public publisherIdentity: (req: Request) => Promise<string | null> = async () => null) {
+  constructor(public env: { KITS?: Record<string, DomainKit>; DB?: D1; STORE?: CapsuleStore; KEYS?: KeyStore; MEDIA?: MediaStore; VERIFY_KEY?: (apiKey: string) => Promise<boolean>; ASSIST?: { generate: (apiKey: string, model: string, text: string, system?: string, follow?: Follow) => Promise<Generated>; dispatch?: (id: string) => Promise<void> }; CAPSULE_ASSIST_MODEL?: string; CAPSULE_HMAC_KEY: string; CAPSULE_ORIGIN: string; CAPSULE_CLAIM_COUNTRIES?: string; CAPSULE_DISABLED_ACTIONS?: string; CAPSULE_PHOTOS?: string }, public clock = () => Date.now(), public publisherIdentity: (req: Request) => Promise<string | null> = async () => null) {
     // Publisher authorization only permits creation; all trip access requires a capability session.
     const origin = new URL(env.CAPSULE_ORIGIN);
     if (origin.origin !== env.CAPSULE_ORIGIN || (origin.protocol !== "https:" && !["127.0.0.1", "localhost", "[::1]"].includes(origin.hostname))) throw new Error("公開ホストはHTTPSが必要です");
@@ -208,17 +207,13 @@ export class CloudHost {
     if (!env.KEYS && !env.DB) throw new Error("Missing key store");
     this.keys = env.KEYS ?? new LocalKeyStore(env.DB!, () => this.clock());
     this.kits = env.KITS ?? registered;
-    if (env.CAPSULE_SEALED_FROM) { this.sealedFrom = Date.parse(env.CAPSULE_SEALED_FROM); if (Number.isNaN(this.sealedFrom)) throw new Error("CAPSULE_SEALED_FROM は時刻で指定してください"); }
   }
-  // The line after which a trip was published once the new screen was out (docs/ephemeral-trip-capsule.md「5.4 平文の旅行を移す」, aws/README.md「旅程の暗号化を始めた後に発行した旅行（`SealedFrom`）」):
-  // such a trip is not used plain. Until the operator sets it, there is none.
-  sealedFrom: number | undefined;
   // Photos are off until the operator turns them on (CAPSULE_PHOTOS=1): nothing is put up while they are off, and what is there
   // is still read, taken out and deleted with the trip.
   get photosOn() { return this.env.CAPSULE_PHOTOS === "1"; }
-  // A trip published after the line and not moved yet: only its owner may come in, to take the seat, check a passkey, put the
-  // keys, move it or delete it.
-  mustSeal(c: Capsule) { return !c.sealed && this.sealedFrom !== undefined && c.created >= this.sealedFrom; }
+  // A trip not sealed yet (docs/design/trip-e2e.md §5, the third step of handing out: no trip is used plain): only its owner may
+  // come in, to take the seat, check a passkey, put the keys, seal it or delete it.
+  mustSeal(c: Capsule) { return !c.sealed; }
   digest(s: string) { return createHmac("sha256", this.env.CAPSULE_HMAC_KEY).update(s).digest("hex"); }
   equal(a: string, b: string) { return timingSafeEqual(Buffer.from(this.digest(a), "hex"), Buffer.from(this.digest(b), "hex")); }
   async json(req: Request) {
@@ -254,7 +249,8 @@ export class CloudHost {
     for (let i = 0; i < 3; i++) {
       const row = await this.store.get(key);
       if (!row?.payload) return;
-      const { text: _, sealed: __, ...job } = JSON.parse(row.payload) as AssistJob;  // neither the wish nor the sealed key stays
+      // Neither the wish nor a sealed key stays (a row made before the host stopped revising on its own may hold one).
+      const { text: _, sealed: __, ...job } = JSON.parse(row.payload) as AssistJob & { sealed?: string };
       if (job.state !== "running" || job.deadline <= this.clock()) return;  // a late answer does not overwrite the failure the poll already gave
       if (await this.store.save(row, JSON.stringify({ ...job, ...patch }), row.purge_at, this.clock())) return;
     }
@@ -294,21 +290,8 @@ export class CloudHost {
     const job = row?.payload ? JSON.parse(row.payload) as AssistJob : undefined;
     if (!job || job.state !== "running" || job.text === undefined) return;
     try {
-      let sealed = job.sealed ?? (job.kind === "revise" ? undefined : await this.keys.get(job.subject));
-      let problemsOf = (text: string): string[] => { const j = this.made.judge(text, this.clock()); return j.ok ? [] : j.messages?.length ? j.messages : [reasonText(j.reason)]; };
-      if (job.kind === "revise") {
-        // The seat is read again now: one that was revoked, lost its role or its key since the request does not get its key used.
-        const capsule = job.capsule && job.seat ? await this.store.get(this.digest(job.capsule)) : null;
-        const c = capsule?.payload ? JSON.parse(capsule.payload) as Capsule : undefined, seat = c?.sessions.find(x => x.id === job.seat);
-        const grant = seat && c?.grants.find(g => g.id === seat.grantId);
-        const live = Boolean(seat && grant && grant.revoked === null && grant.expires > this.clock() && seat.expires > this.clock() && !seat.pending && (grant.role === "owner" || grant.role === "editor") && seat.assistKey && seat.assistKey === job.sealed);
-        // A trip sealed since the request is not sent out: the host cannot read its words (spec「5.3 暗号化した旅行で Host にできないこと」).
-        if (c?.sealed) return await this.finishAssist(id, { state: "failed", message: "暗号化した旅行では、まだ使えません" });
-        if (!live) sealed = undefined;
-        else problemsOf = (text: string) => {
-          try { const r = this.revision(c!, text, seat!.label, grant!.role !== "owner"); return r.ok ? [] : r.messages?.length ? r.messages : [reasonText(r.reason)]; } catch { return []; }
-        };
-      }
+      const sealed = await this.keys.get(job.subject);
+      const problemsOf = (text: string): string[] => { const j = this.made.judge(text, this.clock()); return j.ok ? [] : j.messages?.length ? j.messages : [reasonText(j.reason)]; };
       if (!sealed) return await this.finishAssist(id, { state: "failed", message: "Anthropic の API キーを登録してください" });
       const apiKey = open(this.env.CAPSULE_HMAC_KEY, job.subject, sealed), model = this.env.CAPSULE_ASSIST_MODEL ?? ASSIST_MODEL, call = this.env.ASSIST?.generate ?? anthropicGenerate;
       let out = await call(apiKey, model, job.text, job.system);
@@ -319,7 +302,7 @@ export class CloudHost {
         if (problems.length) try { const again = await call(apiKey, model, job.text, job.system, { answer: out.text, problems: problems.slice(0, 10) }); if (again.kind === "text" && again.text.trim()) out = again; } catch { /* keep the first answer */ }
       }
       if (out.kind === "refused") await this.finishAssist(id, { state: "failed", message: "この希望からは旅程を作れませんでした。内容を変えて試してください" });
-      else await this.finishAssist(id, { state: "done", result: out.kind === "cut-off" ? { ok: false, reason: "cut-off" } : job.kind === "revise" ? (out.text.trim() ? { ok: true, text: out.text } : { ok: false, reason: "empty" }) : this.made.judge(out.text, this.clock()) });
+      else await this.finishAssist(id, { state: "done", result: out.kind === "cut-off" ? { ok: false, reason: "cut-off" } : this.made.judge(out.text, this.clock()) });
     } catch (e) {
       const status = (e as { status?: number }).status, kind = (e as { error?: { error?: { type?: string } } }).error?.error?.type;
       // What Anthropic said is for the one whose key it was: its status and type go to the log, its sentence only to them.
@@ -612,13 +595,6 @@ export class CloudHost {
   }
   // Revising and going back, which a kind may not have.
   revising(c: Capsule) { return this.kit(c).revise ?? fail(404, "この種類では使えません"); }
-  // A chat's answer to "revise this", against the plain capsule as it stands.
-  revision(c: Capsule, text: string, author: string, keepSpec = false) {
-    plain(c);
-    const now = this.clock(), r = this.revising(c).revise(c, text, { author, at: new Date(now).toISOString(), now, keepSpec });
-    if (!r.ok && r.tooLong) fail(413, "貼り付けが長すぎます。旅程の部分だけを貼ってください");
-    return r;
-  }
   // The next sealed capsule a member's browser made by revising (`undo`: going back), as its kit checks it (docs/ephemeral-trip-capsule.md「5.3 暗号化した旅行で Host にできないこと」).
   // `keepSpec`: an editor's, which keeps the settings. A new post is this member's.
   resealed(c: Capsule, member: Session, input: unknown, how: { undo: boolean; keepSpec: boolean }) {
@@ -741,8 +717,8 @@ export class CloudHost {
       await this.rate(`create:${ownerKey}`, 5);
       const b = z.object({ confirm: z.literal(true), spec: z.unknown(), document: z.unknown(), operationId: z.string().regex(/^[a-f0-9]{32}$/).optional() }).strict().parse(await this.json(req));
       const kit = kitOf(b.spec, this.kits) ?? fail(400, "対応していない種類です");
-      // After the line nothing new is used plain, and a kind with no sealed form could never be moved to it (mustSeal).
-      if (!kit.sealed && this.sealedFrom !== undefined && now >= this.sealedFrom) fail(400, "この種類は、この Host では発行できません");
+      // No trip is used plain, and a kind with no sealed form could never be sealed (mustSeal).
+      if (!kit.sealed) fail(400, "この種類は、この Host では発行できません");
       const data = kit.publish(b.spec, b.document, now);
       if (+new Date(data.spec.lifecycle.purgeAt) <= now) fail(400, "未来の期限を指定してください");
       // A publisher that lost the response retries with the same operation id. The capsule id is derived from it, so the
@@ -876,10 +852,9 @@ export class CloudHost {
         // Until the owner approves, nothing but the code that member shows the owner is given out.
         if (member.pending) { if (action === "" && req.method === "GET") return Response.json({ error: "オーナーの承認待ちです。画面のコードをオーナーに伝えてください", pending: true, code: member.code }, { status: 403 }); fail(403, "オーナーの承認待ちです"); }
         if (action === "theme.css" && req.method === "GET") return new Response(`:root{--accent:${kit.accent(c.spec)}}`, { headers: { "Content-Type": "text/css" } });
-        // The new screen marks its requests (ui=2). An older one cannot draw ciphertext, nor move a trip that must be moved: it is
-        // asked to reload. A plain trip published before the line works with it as before (docs/ephemeral-trip-capsule.md「5.4 平文の旅行を移す」).
-        if ((c.sealed || this.mustSeal(c)) && url.searchParams.get("ui") !== "2") throw new Fault(409, "画面を更新してください", "stale-ui");
-        if (this.mustSeal(c) && !(grant.role === "owner" && (req.method === "GET" ? ["", "grants", "seal"] : ["keys", "passkey", "passkey/verify", "signout", "seal", "purge"]).includes(action))) throw new Fault(409, "オーナーがこの旅行を移すまで開けません", "unsealed");
+        // The new screen marks its requests (ui=2). An older one cannot draw ciphertext, nor seal a trip: it is asked to reload.
+        if (url.searchParams.get("ui") !== "2") throw new Fault(409, "画面を更新してください", "stale-ui");
+        if (this.mustSeal(c) && !(grant.role === "owner" && (req.method === "GET" ? ["", "grants", "seal"] : ["keys", "passkey", "passkey/verify", "signout", "seal", "purge"]).includes(action))) throw new Fault(409, "オーナーがこの旅行を暗号化するまで開けません", "unsealed");
         // An image, as the browser sealed it, for any seat of the trip: the answer is not the page's to cache for long, and not shared.
         const image = /^media\/([a-f0-9]{32})\/(thumb|display)$/.exec(action);
         if (image && req.method === "GET") {
@@ -893,40 +868,12 @@ export class CloudHost {
         }
         // Newest first. The record is not written to by reading it, as with GET grants.
         if (action === "history" && req.method === "GET") { owner(); return Response.json(c.audit.filter(a => HISTORY.includes(a.event)).reverse().map(({ event, at, role, label, by, device, grant, seat, member }) => ({ event, at, role, label, by, device, grant, seat, member }))); }
-        const exports = () => { plain(c); return kit.exports ?? fail(404, "この種類では使えません"); };
-        if (action === "export" && req.method === "GET") {
-          if (!editor) fail(403, "出力はオーナー・編集者のみです"); const out = exports();
-          return new Response(new Uint8Array(await out.zip(id, c.spec, c.document, c.updated)), { headers: { "Content-Type": "application/zip", "Content-Disposition": `attachment; filename="${out.name(c.spec)}"` } });
-        }
-        // The same text as the ZIP's README.md, for every role: it holds no more than the document GET "" gives each of them.
-        if (action === "export.md" && req.method === "GET") return Response.json({ text: exports().markdown(c.spec, c.document) });
-        // The ZIP's index.html as one file, for every role, as export.md is.
-        if (action === "export.html" && req.method === "GET") return Response.json({ text: exports().html(c.spec, c.document) });
-        // The trip goes to a chat assistant outside the host, so only those who may take it out as a ZIP hand it out. Nothing is written.
-        if (action === "revise" && req.method === "GET") { const keep = reviser(); plain(c); return Response.json({ text: this.revising(c).text(c.spec, c.document, keep) }); }
         // The step back of a plain trip, for the owner's browser to seal with the rest when it moves the trip (POST seal, spec「5.4 平文の旅行を移す」).
         // Apart from GET "", so that every read of the trip does not carry it.
         if (action === "seal" && req.method === "GET") { owner(); if (c.sealed) fail(409, "旅程はもう暗号化してあります"); if (!kit.sealed) fail(404, "この種類では使えません"); return Response.json({ previous: c.previous ?? null }); }
         if (action === "undo" && req.method === "GET") {
           // A sealed trip's step back is sealed: the browser opens it and makes the diff (docs/ephemeral-trip-capsule.md「5.3 暗号化した旅行で Host にできないこと」).
-          if (c.sealed) { reviser(); this.revising(c); if (!c.previous) fail(404, "戻せる旅程がありません"); return Response.json({ previous: c.previous, revision: c.document.revision }); }
-          const keep = reviser(); plain(c); const back = this.revising(c).undo(c, keep); return Response.json({ diff: back.diff, revision: c.document.revision });
-        }
-        if (action === "revise/check" && req.method === "POST") {
-          const keep = reviser(); plain(c); if (state === "frozen") fail(403, "共有終了後は変更できません");
-          const r = this.revision(c, z.object({ text: z.string() }).strict().parse(input).text, member.label, keep);
-          return Response.json(r.ok ? { ok: true, diff: r.diff, revision: c.document.revision } : r);
-        }
-        // Revising on the host with this seat's own key (#658): the trip goes to Anthropic under the key of the one who asked, and
-        // the answer comes back as text for the same revise/check as a pasted one. No other seat's or creator's key is ever opened.
-        if (action === "revise/assist" && req.method === "POST") {
-          const keep = reviser(); plain(c); if (state === "frozen") fail(403, "共有終了後は変更できません");
-          const v = z.object({ instruction: z.string().max(2000).default("") }).strict().parse(input);
-          if (!member.assistKey) fail(412, "Anthropic の API キーを登録してください");
-          const { system, text } = this.revising(c).ask(c.spec, c.document, keep, v.instruction, this.clock());
-          if (Buffer.byteLength(text) > REVISE_LIMIT) fail(413, "旅程が長すぎて、ここでは直せません。「チャットで直す」でコピーして使ってください");
-          const subject = `${id}:${member.id}`;
-          return Response.json({ id: await this.beginAssist(subject, { subject, text, system, kind: "revise", sealed: member.assistKey, capsule: id, seat: member.id }, `assist:${subject}`) }, { status: 202 });
+          reviser(); this.revising(c); if (!c.previous) fail(404, "戻せる旅程がありません"); return Response.json({ previous: c.previous, revision: c.document.revision });
         }
         const polled = /^revise\/assist\/([a-f0-9]{32})$/.exec(action);
         if (polled && req.method === "GET") {
@@ -963,7 +910,7 @@ export class CloudHost {
           response = Response.json({ ok: true }, { headers: { "Set-Cookie": this.setCookie(id, "", this.clock()) } });
         } else if (action === "grants" && req.method === "POST") {
           issuer(); this.verified(member); if (state === "frozen") fail(403, "共有終了後はリンクを発行できません");
-          const sealedInput = c.sealed ? sealedGrantInput.parse(input) : undefined, v = sealedInput ?? grantInput.parse(input), grantId = sealedInput?.id ?? uid();
+          const v = sealedGrantInput.parse(input), grantId = v.id;
           if (c.grants.some(g => g.id === grantId)) fail(400, "招待を確認してください");
           if (!canIssue[grant.role].includes(v.role)) fail(403, "この権限の招待は出せません");
           // Only the owner reads the codes, so only the owner asks for approval. A rotated invite keeps the one it replaces.
@@ -1139,7 +1086,7 @@ export class CloudHost {
         } else if (action === "footprints" && req.method === "PATCH") {
           // As a member's own entries: no If-Match and no new revision. Left during the trip by all but a viewer; taken out by the
           // seat that left it, or by an owner or editor, until sharing ends.
-          const op = c.sealed ? sealedFootprintOperations.parse(input) : footprintOperations.parse(input), list = c.footprints ?? [];
+          const op = sealedFootprintOperations.parse(input), list = c.footprints ?? [];
           if (op.type === "add") {
             if (grant.role === "viewer") fail(403, "閲覧者は足あとを残せません");
             const period = kit.period?.(c.spec) ?? fail(404, "この種類では使えません"), today = localDay(this.clock(), period.timezone);
@@ -1149,10 +1096,8 @@ export class CloudHost {
             const last = list.filter(p => p.seat === member.id).at(-1);
             if (last && this.clock() - +new Date(last.at) < FOOTPRINT_EVERY) fail(429, "足あとは1分に1回までです");
             const at = new Date(this.clock()).toISOString(), auto = op.auto && { auto: true as const };
-            if ("point" in op) {
-              if (list.some(p => p.id === op.id)) fail(400, "足あとを確認してください");
-              c.footprints = [...list, { id: op.id, seat: member.id, by: op.by, at, point: op.point, ...auto }];
-            } else c.footprints = [...list, { id: uid(), seat: member.id, by: member.label, at, lat: op.lat, lng: op.lng, accuracy: op.accuracy, ...auto }];
+            if (list.some(p => p.id === op.id)) fail(400, "足あとを確認してください");
+            c.footprints = [...list, { id: op.id, seat: member.id, by: op.by, at, point: op.point, ...auto }];
           } else {
             if (state === "frozen") fail(403, "共有終了後は変更できません");
             const point = list.find(p => p.id === op.id); if (!point) fail(404, "足あとが見つかりません");
@@ -1164,7 +1109,6 @@ export class CloudHost {
           // A photo is sealed by the browser, so it only goes into a trip that has a key: no If-Match and no new revision, as with a
           // footprint. Left by all but a viewer, before and after the trip, until sharing ends.
           if (!this.photosOn) fail(403, "写真は今は使えません");
-          if (!c.sealed) fail(409, "旅行を暗号化してから写真を上げてください");
           if (grant.role === "viewer") fail(403, "閲覧者は写真を上げられません");
           if (state === "frozen") fail(403, "共有終了後は変更できません");
           const v = photoInput.parse(input), list = c.media ?? [];
@@ -1202,7 +1146,7 @@ export class CloudHost {
           }
         } else if (action === "members" && req.method === "PATCH") {
           // A sealed trip's names arrive sealed against the seat (src/trip-keys.ts sealName).
-          owner(); const v = z.object({ id: z.string(), label: c.sealed ? cipher(CIPHER.short) : author }).strict().parse(input), m = c.sessions.find(s => s.id === v.id);
+          owner(); const v = z.object({ id: z.string(), label: cipher(CIPHER.short) }).strict().parse(input), m = c.sessions.find(s => s.id === v.id);
           if (!m) fail(404, "メンバーが見つかりません"); m.label = v.label;
         } else if (action === "freeze" && req.method === "POST") {
           owner(); this.verified(member); z.object({ confirm: z.literal(true) }).strict().parse(input); this.match(req, c); c.forced = "frozen";
@@ -1289,7 +1233,7 @@ export class CloudHost {
           let updated: Envelope; try { updated = kit.validate(v.spec, c.document, c.created, Boolean(c.sealed)).spec; } catch { fail(400, "設定と期限を確認してください"); }
           const refused = this.refusal(c, updated); if (refused) fail(400, refused);
           this.respec(c, updated); c.document.revision++;
-        } else if (action === "revise" && req.method === "POST" && c.sealed) {
+        } else if (action === "revise" && req.method === "POST") {
           // A sealed trip arrives revised by the browser, sealed (docs/ephemeral-trip-capsule.md「5.3 暗号化した旅行で Host にできないこと」): the host checks the plain parts
           // and that ciphertext which must stay the same did, and keeps the trip as it was to go back to.
           const keep = reviser(); if (state === "frozen") fail(403, "共有終了後は変更できません"); this.match(req, c);
@@ -1297,44 +1241,18 @@ export class CloudHost {
           c.previous = this.revising(c).step(c.spec, c.document, next.document);
           this.respec(c, next.spec); c.document = { ...next.document, revision: c.document.revision + 1 };
           response = Response.json({ revision: c.document.revision });
-        } else if (action === "revise" && req.method === "POST") {
-          const keep = reviser(); plain(c); if (state === "frozen") fail(403, "共有終了後は変更できません"); this.match(req, c);
-          const v = z.object({ text: z.string(), confirm: z.literal(true), title: z.string().optional() }).strict().parse(input), r = this.revision(c, v.text, member.label, keep);
-          if (!r.ok) fail(400, r.messages?.[0] ?? "貼った内容を確認してください");
-          if (r.diff.purgeAt) this.verified(member);  // only a revise that moves the deadline is an important action
-          if (r.diff.large && !sameTitle(v.title, c.spec.title)) fail(400, "確認用のタイトルが一致しません。今の題を入力してください");
-          c.previous = this.revising(c).step(c.spec, c.document, r.next.document);
-          this.respec(c, r.next.spec); c.document = r.next.document; c.document.revision++;
-          response = Response.json({ revision: c.document.revision });
-        } else if (action === "key" && req.method === "PUT" && c.sealed) {
+        } else if (action === "key" && req.method === "PUT") {
           // The browser checked the key with Anthropic and wrapped it: the host only keeps it on the seat, and is never sent the key itself.
           reviser(); if (state === "frozen") fail(403, "共有終了後は変更できません");
           member.assistWrapped = z.object({ wrapped: z.string().regex(/^v1\.[A-Za-z0-9_-]+$/).max(1000) }).strict().parse(input).wrapped;
           response = new Response(null, { status: 204 });
-        } else if (action === "key" && req.method === "PUT") {
-          reviser(); if (state === "frozen") fail(403, "共有終了後は変更できません");
-          const v = z.object({ key: z.string().min(20).max(256).regex(/^sk-ant-/) }).strict().parse(input);
-          await this.rate(`key:${id}:${member.id}`, 5);
-          let accepted: boolean;
-          try { accepted = await (this.env.VERIFY_KEY ?? anthropicAccepts)(v.key); } catch { fail(502, "Anthropic に接続できませんでした。時間をおいて再試行してください"); }
-          if (!accepted) fail(400, "この API キーは使えません。Anthropic Console で発行した鍵を貼ってください");
-          member.assistKey = seal(this.env.CAPSULE_HMAC_KEY, `${id}:${member.id}`, v.key);
-          response = new Response(null, { status: 204 });
         } else if (action === "key" && req.method === "DELETE") {
           delete member.assistKey; delete member.assistWrapped; response = new Response(null, { status: 204 });
-        } else if (action === "undo" && req.method === "POST" && c.sealed) {
+        } else if (action === "undo" && req.method === "POST") {
           // The browser opened the sealed step back and sends the trip it makes, sealed (docs/ephemeral-trip-capsule.md「5.3 暗号化した旅行で Host にできないこと」): its Spec is the step's own.
           const keep = reviser(); if (state === "frozen") fail(403, "共有終了後は変更できません"); this.match(req, c);
           const next = this.resealed(c, member, input, { undo: true, keepSpec: keep });
           this.respec(c, next.spec); c.document = { ...next.document, revision: c.document.revision + 1 }; delete c.previous;
-          response = Response.json({ revision: c.document.revision });
-        } else if (action === "undo" && req.method === "POST") {
-          const keep = reviser(); plain(c); if (state === "frozen") fail(403, "共有終了後は変更できません"); this.match(req, c);
-          const v = z.object({ confirm: z.literal(true), title: z.string().optional() }).strict().parse(input), back = this.revising(c).undo(c, keep);
-          if (back.diff.purgeAt) this.verified(member);
-          if (+new Date(back.next.spec.lifecycle.purgeAt) <= this.clock()) fail(400, "削除期限は今より後にしてください");
-          if (back.diff.large && !sameTitle(v.title, c.spec.title)) fail(400, "確認用のタイトルが一致しません。今の題を入力してください");
-          this.respec(c, back.next.spec); c.document = back.next.document; c.document.revision++; delete c.previous;
           response = Response.json({ revision: c.document.revision });
         } else if (action === "document" && req.method === "PATCH") {
           this.match(req, c); if (grant.role === "viewer" || state === "frozen") fail(403, "読み取り専用です");

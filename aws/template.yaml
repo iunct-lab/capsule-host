@@ -33,11 +33,6 @@ Parameters:
     Default: ''
     AllowedPattern: '([a-z][a-z.]*(,[a-z][a-z.]*)*)?'
     Description: Operations to stop, by name (sessions, grants, publish, creators, passkey, assist, account), answered with 503; empty lets all through
-  SealedFrom:
-    Type: String
-    Default: ''
-    AllowedPattern: '(20[0-9]{2}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z)?'
-    Description: When the new screen was out everywhere (aws/README.md, the SealedFrom section). A trip published at or after it cannot be used until its owner moves it to the sealed form; empty means not started
   Photos:
     Type: String
     Default: '0'
@@ -65,7 +60,6 @@ Conditions:
   # A Web Function refuses an environment variable whose value is empty (a Lambda accepts it); both of these may be empty on purpose, so the variable is left out then.
   HasClaimCountries: !Not [!Equals [!Ref ClaimCountries, '']]
   HasDisabledActions: !Not [!Equals [!Ref DisabledActions, '']]
-  HasSealedFrom: !Not [!Equals [!Ref SealedFrom, '']]
   HasReservedConcurrency: !Not [!Equals [!Ref ReservedConcurrency, -1]]
   # Both, or no budget: an alert with nobody to tell would fail the deploy (a template Rule is not evaluated with the SAM transform).
   HasBudget: !And [!Not [!Equals [!Ref BudgetLimitUsd, '0']], !Not [!Equals [!Ref BudgetEmail, '']]]
@@ -119,7 +113,6 @@ Resources:
           CAPSULE_HMAC_KEY: !Sub '{{resolve:secretsmanager:${HmacKey}:SecretString}}'
           CAPSULE_CLAIM_COUNTRIES: !Ref ClaimCountries
           CAPSULE_DISABLED_ACTIONS: !Ref DisabledActions
-          CAPSULE_SEALED_FROM: !Ref SealedFrom
           CAPSULE_PHOTOS: !Ref Photos
           CAPSULE_ASSIST_MODEL: !Ref AssistModel
           CAPSULE_KEY_PREFIX: !Sub '/capsule-host/${AWS::StackName}/creator-key'
@@ -224,7 +217,6 @@ Resources:
           CAPSULE_HMAC_KEY: !Sub '{{resolve:secretsmanager:${HmacKey}:SecretString}}'
           CAPSULE_CLAIM_COUNTRIES: !If [HasClaimCountries, !Ref ClaimCountries, !Ref AWS::NoValue]
           CAPSULE_DISABLED_ACTIONS: !If [HasDisabledActions, !Ref DisabledActions, !Ref AWS::NoValue]
-          CAPSULE_SEALED_FROM: !If [HasSealedFrom, !Ref SealedFrom, !Ref AWS::NoValue]
           CAPSULE_PHOTOS: !Ref Photos
           CAPSULE_ASSIST_MODEL: !Ref AssistModel
           CAPSULE_KEY_PREFIX: !Sub '/capsule-host/${AWS::StackName}/creator-key'

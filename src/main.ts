@@ -36,7 +36,7 @@ const clock = () => Date.now() + advanced;
 // The same CloudHost as on AWS; only the store differs. A loopback server may make a trip from its own page, and nothing more:
 // the identity is given to /v1/publish, /v1/recipe and /v1/check alone, so /recover and the creator registry (the IAM
 // publisher's on AWS) stay closed here.
-const host = new CloudHost({ DB: db, MEDIA: new LocalMediaStore(`${data}/media`), CAPSULE_HMAC_KEY: key, CAPSULE_ORIGIN: origin, CAPSULE_SEALED_FROM: process.env.CAPSULE_SEALED_FROM, CAPSULE_PHOTOS: process.env.CAPSULE_PHOTOS }, clock, async req => local && (["/v1/publish", "/v1/recipe", "/v1/check", "/v1/account/key"].includes(new URL(req.url).pathname) || /^\/v1\/assist(\/[a-f0-9]{32})?$/.test(new URL(req.url).pathname)) ? "local" : null);
+const host = new CloudHost({ DB: db, MEDIA: new LocalMediaStore(`${data}/media`), CAPSULE_HMAC_KEY: key, CAPSULE_ORIGIN: origin, CAPSULE_PHOTOS: process.env.CAPSULE_PHOTOS }, clock, async req => local && (["/v1/publish", "/v1/recipe", "/v1/check", "/v1/account/key"].includes(new URL(req.url).pathname) || /^\/v1\/assist(\/[a-f0-9]{32})?$/.test(new URL(req.url).pathname)) ? "local" : null);
 const preview = local ? emptyTrip(start) : undefined;
 // /dev/clock lets verify:ui move the host's clock instead of waiting out the passkey check's 5 minutes, the per-minute counts
 // and a footprint's minute in real time. Only a loopback host has it; elsewhere the path goes on to CloudHost and is a 404.

@@ -46,7 +46,6 @@ AssetsBucket出力で指定された非公開S3へ `dist/public/` の6ファイ�
 | `ClaimCountries` | `JP` | 招待の席を引き換えられる国（カンマ区切り）。空なら制限しない。引換の後のアクセスには国の制限をかけない |
 | `DisabledActions` | 空 | 止める操作の名前（`sessions`・`grants`・`publish`・`creators`・`passkey`・`assist`・`account` など、カンマ区切り）。名指しした操作は 503 と案内を返す。綴りは検査しないので、止めたら 503 が返ることを確かめる |
 | `Photos` | `'0'` | `'1'` でメンバーが写真を上げられる（下の「写真の置き場」） |
-| `SealedFrom` | 空 | 旅程の暗号化を始めた時刻（下の「旅程の暗号化を始めた後に発行した旅行」） |
 | `AssistModel` | `claude-haiku-5-5` | 作成者の API キーで生成するときのモデル（下の「作成者の API キーでの生成」） |
 | `BudgetLimitUsd` / `BudgetEmail` | `0` / 空 | アカウント全体の月額予算の通知（下の「保存・費用・残る検証」） |
 | `PermissionsBoundary` | 空 | スタックのロール（`HostRole`・`WebRole`）に付ける権限境界。使わなければ空のまま |
@@ -99,7 +98,7 @@ aws cloudformation deploy --template-file aws/edge-logs.yaml --stack-name $STACK
 bun aws/verify.ts https://DISTRIBUTION.cloudfront.net FUNCTION_NAME YOUR_PROFILE ap-northeast-1
 ```
 
-回す場面は、Host の設定にある線（下の「旅程の暗号化を始めた後に発行した旅行（`SealedFrom`）」）で変わる。線のある Host では、最初に発行する平文の旅行は owner が移すまで開けないので、その旅行の場面（招待・旅程の編集・個人のメモ・足あと・export・revise・失効・recover など）の代わりに線の扱い（`ui=2` の無い要求の 409「画面を更新してください」、招待・編集・足あとの 409「オーナーがこの旅行を移すまで開けません」、owner と運用者の一覧の `mustSeal`）を確かめ、暗号化した旅行と移す場面は線の後でも通る順で回す（分かれ目は `aws/verify.ts` の `afterLine`）。平文の場面は線の無いスタックの実行が確かめるので、実旅行のあるスタックに置くコミットは先に線の無い検証用のスタックで通す。出力の最初の `SealedFrom:` の行（`set (…after the line)` / `set, not reached yet (…before the line)` / `not set`）で、どちらで回ったかが分かる。
+旅行は、owner が席を取った直後に暗号化してから回す（#696。Host は暗号化していない旅行を、owner が暗号化するまで開かない。下の「暗号化していない旅行」）。暗号化の前には、`ui=2` の無い要求の 409「画面を更新してください」、招待・編集・足あとの 409「オーナーがこの旅行を暗号化するまで開けません」、owner と運用者の一覧の `mustSeal` を確かめ、暗号化の後は、メンバーが確認コードで鍵を受け取ってから読み書きする。出力の `AWS verification passed, on trips sealed by their owners right after claiming the seat` の行で、全部の場面が回ったことが分かる。
 
 暗号化した旅行の場面では、旅行の鍵を替えることも見る: 鍵を持つ参加者を失効させた後に owner の `GET` が `rekey: "auto"` を返し、owner のブラウザと同じ部品（`src/trip-keys.ts`）で `POST rekey` を送ると、残った参加者が新しい世代を開けて owner の署名と認め、失効した参加者の世代 1 の鍵では開けない。続けて `/recover` の後、新しい owner が参加者から鍵を受け取ると `rekey: "ask"` になり、`keep` で消える（成功行の `trip key replaced`。ローカルの Host は `/recover` に発行者の権限を渡さないので、ここで確かめる）。テーブルの中身を読む確かめ（保存された payload の暗号文が全部世代 2 で `departed`・`previous` が無いこと、個人のメモと旅程の題が平文で残っていないこと、写真の prefix の件数）は、実旅行を読まないように、`aws/verify.ts` が名前で見分ける検証用のスタックでだけ行い、ほかのスタックでは `scan: …飛ばした` と出す。
 
@@ -165,11 +164,11 @@ bun aws/capsules.ts list FUNCTION_NAME YOUR_PROFILE ap-northeast-1              
 bun aws/capsules.ts terminate CAPSULE_ID FUNCTION_NAME YOUR_PROFILE ap-northeast-1   # 1件を即時に終了。IDをもう一度入力して確かめる
 ```
 
-一覧の各項目は `id`・`kind`・`state`・`created`・`updated`・`purgeAt`・`grants`（有効な招待の数）・`members`（登録している端末の数）・`sealed`（旅程を暗号化したか）・`mustSeal`（下の `SealedFrom` より後に発行され、まだ移していないので owner が移すまで使えない旅行か）だけで、題名・行き先・旅程・コメント・メンバー名・秘密は含まない。`id` が `null` のカプセルは、IDを本文に持つ前の古い版の Host で発行されて、その後だれも書き込んでいないもの。IDは発行の控え（`aws/publish.ts` の `<入力>.owner.json`）か、旅行のリンク（`/c/<ID>`）から探す。作成者がブラウザで保存した旅行には控えのファイルが無いので、リンクを持つ人（owner・作成者）に聞く（誰かが書き込めば一覧にIDが出る）。強制終了はownerのpurgeと同じ保存の経路で、取り消せない。以後そのカプセルへのアクセスは410になる。
+一覧の各項目は `id`・`kind`・`state`・`created`・`updated`・`purgeAt`・`grants`（有効な招待の数）・`members`（登録している端末の数）・`sealed`（旅程を暗号化したか）・`mustSeal`（暗号化していないので、owner が暗号化するまで使えない旅行か。`sealed` の反対で、直前の `aws/capsules.ts` が読むので残している）だけで、題名・行き先・旅程・コメント・メンバー名・秘密は含まない。`id` が `null` のカプセルは、IDを本文に持つ前の古い版の Host で発行されて、その後だれも書き込んでいないもの。IDは発行の控え（`aws/publish.ts` の `<入力>.owner.json`）か、旅行のリンク（`/c/<ID>`）から探す。作成者がブラウザで保存した旅行には控えのファイルが無いので、リンクを持つ人（owner・作成者）に聞く（誰かが書き込めば一覧にIDが出る）。強制終了はownerのpurgeと同じ保存の経路で、取り消せない。以後そのカプセルへのアクセスは410になる。
 
-### 旅程の暗号化を始めた後に発行した旅行（`SealedFrom`）
+### 暗号化していない旅行
 
-パラメータ `SealedFrom`（既定は空）は、旅程を暗号化する新しい画面を配り終えた時刻（`YYYY-MM-DDTHH:MM:SSZ`）。`created` がこの時刻以後の平文の旅行は、owner が新しい画面で移す（暗号化して置き直す）まで、owner が移すための操作とログアウト・削除のほかは 409 を返す（一覧は `src/cloud-host.ts` の `mustSeal` の検査）。空なら扱いを始めていない（線の扱いは `src/cloud-host.test.ts` の "after the new screen is out" で確かめる）。初めから今の画面を配るスタックでは、配置した時刻を渡してよい。線のある Host では、`aws/verify.ts` は平文の旅行の場面の代わりに線の扱い（409 の 2 種・`mustSeal`）を確かめ、出力の `SealedFrom: set (trips published by this run are after the line)` の行で分かる（時刻がまだ来ていなければ `SealedFrom: set, not reached yet …` で、線の無い Host として回る）（上の「AWS検証」）。渡すときは、上の「パラメータ」のとおり `--use-previous-template`、ほかは `UsePreviousValue=true` で `ParameterKey=SealedFrom,ParameterValue=<時刻>` を渡す。一度渡した後のスタックでは、ほかのパラメータを変えるときも `ParameterKey=SealedFrom,UsePreviousValue=true` を足す（渡さないと既定の空に戻り、扱いが外れる）。パラメータの形の検査は月・日・時の範囲までで、暦にない日（2 月 30 日など）は通る。Host が時刻として読めない値なら起動のときに断って全部の要求が失敗するので、渡した後に `GET /v1/account` が 200 であること（失敗なら前の値に戻す）と、`bun aws/capsules.ts list` の `mustSeal` が意図どおりの旅行に付いたことを見る。暗号化と平文の旅行を移す扱いは、仕様書の「5.4 平文の旅行を移す」。
+Host は平文の旅行を使わない（`src/cloud-host.ts` の `mustSeal`）。発行したての旅行は平文で置かれ、owner が席を取ってパスキーで確かめ、ブラウザで暗号化する（`POST seal`）までは、owner が席を取る・パスキー・鍵を置く・暗号化する・削除するほかは 409「オーナーがこの旅行を暗号化するまで開けません」を返す。暗号化の形を持たない種類は発行しない（400）。前にあった「暗号化を始めた線」のパラメータは無くなった（#696）。それを置いていたスタックは、次の配置でそのパラメータを渡さなければ（前の値を引き継がせなければ）消える。
 
 ## 作成者の API キーでの生成
 

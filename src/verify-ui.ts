@@ -5,7 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { testTrip, tripDay } from "./test-fixture";
 import { localDay } from "./schema";
-import { revisable } from "./revise";
+import { revisable, reviseText } from "./revise";
+import { exportFiles, tripHtml, tripMarkdown } from "./export";
 import { openField } from "./trip-keys";
 
 // Drives the screen of an already-running local host in a headless Chrome over the DevTools protocol: reordering by grip and by
@@ -20,9 +21,10 @@ import { openField } from "./trip-keys";
 // The editor's header opens チャットで直す: scope note, pasted answer without a title diff, apply and undo;
 // the owner and participant have no such header entry. The editor's 共有・管理 hands out and revokes viewer invites only, and
 // the owner sees who handed each out; a participant has no 共有・管理.
-// Last, the trip sealed under the trip's key from the owner's page (#691): drawn from what the page opens, "＋", the grip, a promoted
-// suggestion, no 旅を保存 or チャットで直す, photos put up from the participant's page and shown to the viewer (#447), and a purge with another title not sent.
-// Then, on trips of their own, a plain trip moved by its owner (#694) and the trip key replaced by the owner's page after a member
+// Every group's trip is sealed by its owner's page as the seat is taken (the banner's 移す), and its members take the key by the codes.
+// Last, the sealed trip (#691): drawn from what the page opens, "＋", the grip, a promoted suggestion, 旅を保存 and チャットで直す made
+// by the page, photos put up from the participant's page and shown to the viewer (#447), and a purge with another title not sent.
+// Then, on trips of their own, the first seal (#694) and the trip key replaced by the owner's page after a member
 // left (#695): revoked, reached only through the revoked one, or past an invite's end; and the new owner after the owner invite was
 // handed over asked whether to replace it, the hand-over stopped while no other seat holds the key, and a seat made again kept.
 // A disposable fictional capsule, purged at the end; no link or cookie is printed. No dependency: Bun has WebSocket and fetch, and Chrome is found on this machine (or named in CHROME_PATH).
@@ -96,7 +98,7 @@ async function page(width: number, height: number, mobile: boolean, context?: st
   const requests = () => asked.get(sessionId) ?? [];
   const size = async (w: number, h: number, touch: boolean) => { await s("Emulation.setDeviceMetricsOverride", { width: w, height: h, deviceScaleFactor: 2, mobile: touch }); await s("Emulation.setTouchEmulationEnabled", { enabled: touch, maxTouchPoints: 1 }); };
   await size(width, height, mobile);
-  const evaluate = async (expression: string) => { const r = await s("Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true }); if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description ?? r.exceptionDetails.text); return r.result.value; };
+  const evaluate = async (expression: string) => { const r = await s("Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true }); if (r.exceptionDetails) throw new Error(`${r.exceptionDetails.exception?.description ?? r.exceptionDetails.text} | in: ${expression.slice(0, 160)}`); return r.result.value; };
   // A timed-out wait names the lines of this file that called it (Bun keeps the callers across awaits in the stack): which wait it was (#924).
   const until = async (expression: string, ms = 10000) => { const at = [...(new Error().stack ?? "").matchAll(/verify-ui\.ts:(\d+)/g)].slice(1).map(m => "src/verify-ui.ts:" + m[1]).join(" < "); const end = Date.now() + ms; while (Date.now() < end) { if (await evaluate(expression)) return; await sleep(100); } throw new Error("timed out waiting for: " + expression + " | dialog: " + await evaluate(`(document.querySelector("#dialog")?.open ? "open " : "closed ") + (document.querySelector("#dialog")?.innerText ?? "")`).catch(() => "?") + " | notice: " + await evaluate(`[...document.querySelectorAll(".notice,[role=status],[role=alert]")].map(x => x.textContent).join(" / ")`).catch(() => "?") + " | at: " + at); };
   const touch = (type: "touchStart" | "touchMove" | "touchEnd", x = 0, y = 0) => s("Input.dispatchTouchEvent", { type, touchPoints: type === "touchEnd" ? [] : [{ x, y }] });
@@ -109,8 +111,8 @@ async function page(width: number, height: number, mobile: boolean, context?: st
     if (thenY !== undefined) for (let i = 1; i <= 10; i++) { await touch("touchMove", a.x, toY + (thenY - toY) * i / 10); await sleep(30); }
     await touch("touchEnd");
   };
-  const join = async (url: string) => { await s("Page.navigate", { url }); await until(`!!document.querySelector('[data-action="join"]')`); await evaluate(`document.querySelector('[data-action="join"]').click()`); await until(`!!document.querySelector(".timeline, .timeline-list")`); const shown = await evaluate(`document.querySelector("#dialog").textContent`) as string; await evaluate(`document.querySelector('#dialog [data-action="close"]')?.click()`); await sleep(200); return shown; };
-  const reload = async () => { await s("Page.reload"); await sleep(300); await until(`!!document.querySelector(".timeline, .timeline-list")`); };
+  const join = async (url: string) => { await s("Page.navigate", { url }); await until(`!!document.querySelector('[data-action="join"]')`); await evaluate(`document.querySelector('[data-action="join"]').click()`); await until(drawn); const shown = await evaluate(`document.querySelector("#dialog").textContent`) as string; await evaluate(`document.querySelector('#dialog [data-action="close"]')?.click()`); await sleep(200); return shown; };
+  const reload = async () => { await s("Page.reload"); await sleep(300); await until(drawn); };
   // A real press (CDP input): the <geolocation> element only answers a trusted one.
   const press = async (selector: string) => {
     // The page settles (the map above loads) after the element is first in view: press where it is once it has stayed in one place.
@@ -125,6 +127,9 @@ async function page(width: number, height: number, mobile: boolean, context?: st
 // What the day's rows say, whichever way they are shown.
 const order = `[...document.querySelectorAll("[data-order-day] [data-item]")].map(r => r.dataset.item).join()`;
 const message = `document.querySelector("#message").textContent`;
+// A trip's page drawn: the plan; or, in a sealed trip without the key, the ask for it; or, for an owner whose trip is not sealed
+// yet, the banner to seal it (all the host lets that owner do).
+const drawn = `!!document.querySelector(".timeline, .timeline-list, [data-sealed='locked'], [data-seal='owner'] [data-action='seal-trip'], [data-seal='no-passkey']")`;
 const timeOf = (id: string) => `document.querySelector('[data-item="${id}"] .event-time, [data-item="${id}"] .row-time').firstChild.textContent`;
 const heading = `document.querySelector(".section-heading").scrollIntoView({ block: "start" })`;
 
@@ -132,7 +137,16 @@ let capsuleId = "", owner: Awaited<ReturnType<typeof page>> | undefined, checked
 // The page talks to the host with its own cookie; the script never sees it. An owner's important action sent this way past the
 // passkey check's five minutes is answered 428: like the screen, it checks the passkey (the authenticator answers) and sends the
 // action once more, so a slow run does not fail a scene that is not about the check (#759). The check's time is kept for (i).
-const sendFromPage = (action: string, body: object, method: string) => owner!.evaluate(`(async () => { const revision = (await (await vfetch("/v1/c/${capsuleId}")).json()).document.revision; const r = await vfetch("/v1/c/${capsuleId}/${action}", { method: "${method}", headers: { "Content-Type": "application/json", "If-Match": '"' + revision + '"' }, body: ${JSON.stringify(JSON.stringify(body))} }); return { status: r.status, body: await r.json() }; })()`) as Promise<{ status: number; body: any }>;
+// In a sealed trip the words go sealed, as the screen seals them (src/trip-keys.ts sealOperation, sealSpec): the page's seat key opens
+// the trip key. Sets `sent`, the body to send, from `v`, the host's answer the expression read just before.
+const sealing = async (action: string, body: object) => ["document", "spec"].includes(action) ? `const sent = await (async () => { ${await tripKeysCode()}
+    const k = globalThis.tripKeys, id = "${capsuleId}", body = ${JSON.stringify(body)};
+    if (!v.sealed) return JSON.stringify(body);
+    const kept = await new Promise((ok, no) => { const q = indexedDB.open("capsule", 1); q.onerror = () => no(q.error); q.onsuccess = () => { const r = q.result.transaction("private-keys").objectStore("private-keys").get("seat:" + id); r.onsuccess = () => { q.result.close(); ok(r.result); }; r.onerror = () => no(r.error); }; });
+    const s = v.seatKey, g = v.sealed.generation, trip = await k.unwrapTripKey(s.wrapped, s.ephemeral, kept.secret.x25519, id, s.generation);
+    return JSON.stringify("${action}" === "spec" ? { ...body, spec: await k.sealSpec(trip, id, g, body.spec) } : await k.sealOperation(trip, id, g, body, (await k.openTrip(trip, id, v)).document));
+  })();` : `const sent = ${JSON.stringify(JSON.stringify(body))};`;
+const sendFromPage = async (action: string, body: object, method: string) => owner!.evaluate(`(async () => { const v = await (await vfetch("/v1/c/${capsuleId}")).json(); ${await sealing(action, body)} const revision = v.document.revision; const r = await vfetch("/v1/c/${capsuleId}/${action}", { method: "${method}", headers: { "Content-Type": "application/json", "If-Match": '"' + revision + '"' }, body: sent }); return { status: r.status, body: await r.json() }; })()`) as Promise<{ status: number; body: any }>;
 const checkFromPage = () => owner!.evaluate(`(async () => {
   const b64 = b => btoa(String.fromCharCode(...new Uint8Array(b))).replace(/\\+/g, "-").replace(/\\//g, "_").replace(/=+$/, ""), unb64 = s => Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0));
   const post = (path, body) => vfetch("/v1/c/${capsuleId}/" + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
@@ -145,7 +159,7 @@ const checkFromPage = () => owner!.evaluate(`(async () => {
 const storedFor = (trip: string) => `(async () => ({ keys: await new Promise(ok => { const q = indexedDB.open("capsule", 1); q.onupgradeneeded = () => q.result.createObjectStore("private-keys"); q.onerror = () => ok(["?"]); q.onsuccess = () => { const r = q.result.transaction("private-keys").objectStore("private-keys").getAllKeys(); r.onsuccess = () => { q.result.close(); ok(r.result.filter(k => k === "${trip}" || k === "seat:${trip}")); }; r.onerror = () => { q.result.close(); ok(["?"]); }; }; }), listed: JSON.parse(localStorage.getItem("capsules") ?? "[]").some(t => t.id === "${trip}"), footprint: localStorage.getItem("auto-footprint:${trip}") }))()`;
 const nothing = { keys: [], listed: false, footprint: null };
 const fromPage = async (action: string, body: object, method = "POST") => {
-  const first = await sendFromPage(action, body, method); if (first.status !== 428) return first;
+  const first = await sendFromPage(action, body, method).catch(e => { throw new Error(`${method} ${action} ${JSON.stringify(body).slice(0, 200)}: ${(e as Error).message.split("\n")[0]}`); }); if (first.status !== 428) return first;
   assert.equal(await checkFromPage(), 200, `the passkey check before ${method} ${action}`); checkedAt = await hostNow();
   return sendFromPage(action, body, method);
 };
@@ -169,10 +183,12 @@ const footprintsTab = async (p: typeof owner) => { await p!.evaluate(`(document.
 const stepHere = async (p: typeof owner, count: number) => { await p!.evaluate(`document.querySelector('[data-action="footprint-here"]').click()`); await p!.until(`document.querySelectorAll("[data-footprint]").length === ${count}`); };
 const removable = `[...document.querySelectorAll("[data-footprint]")].map(r => !!r.querySelector('[data-action="remove-footprint"]'))`;
 const spots = `document.querySelectorAll(".trip-map .spot").length`;
+// The memo key this browser kept for its own entries forgotten, the seat's key pair (`seat:<trip>`, which opens the sealed trip) kept.
+const forgetMemoKey = `new Promise((ok, no) => { const q = indexedDB.open("capsule", 1); q.onerror = () => no(q.error); q.onsuccess = () => { const t = q.result.transaction("private-keys", "readwrite"), store = t.objectStore("private-keys"), keys = store.getAllKeys(); keys.onsuccess = () => { for (const k of keys.result) if (!String(k).startsWith("seat:")) store.delete(k); }; t.oncomplete = () => { q.result.close(); ok(true); }; t.onerror = () => no(t.error); }; })`;
 const typeCode = (b: NonNullable<typeof owner>, value: string) => b.evaluate(`(() => { const i = document.querySelector("[data-handoff-input]"); i.value = ${JSON.stringify(value)}; document.querySelector('#dialog [data-action="handoff-submit"]').click(); return true; })()`);
 const ownCode = (b: NonNullable<typeof owner>) => b.evaluate(`document.querySelector("#dialog [data-handoff-own]").textContent.trim()`) as Promise<string>;
 // The trip's Spec changed from the owner's page (a change of settings: inside the passkey check's five minutes).
-const setSpec = async (change: (spec: any) => void) => { const spec = await owner!.evaluate(`(async () => (await (await vfetch("/v1/c/${capsuleId}")).json()).spec)()`); change(spec); assert.equal((await fromPage("spec", { spec, confirm: true }, "PATCH")).status, 200); };
+const setSpec = async (change: (spec: any) => void) => { const spec = (await opened(owner!)).spec; change(spec); assert.equal((await fromPage("spec", { spec, confirm: true }, "PATCH")).status, 200); };
 const saveDialog = `[!!document.querySelector('#dialog [data-action="save-page"]'), !!document.querySelector('#dialog [data-action="copy-markdown"]'), !!document.querySelector('#dialog a[href$="/export"]'), [...document.querySelectorAll("#dialog li")].map(l => l.textContent), [...document.querySelectorAll("#dialog p")].some(p => p.textContent.includes("スマホでは「ファイル」アプリ（iPhone）やファイルマネージャ（Android）で ZIP をタップすると展開されます。"))]`;
 const edit = async (id: string) => { await owner!.evaluate(`document.querySelector('[data-action="edit-item"][data-id="${id}"]').click()`); await owner!.until(`!!document.querySelector('#dialog form[data-form="item"]')`); };
 const submit = `document.querySelector('#dialog form[data-form="item"]').requestSubmit()`;
@@ -215,10 +231,66 @@ const headingTargets = `(() => { const buttons = [...document.querySelectorAll('
 const entryCounts = `[document.querySelectorAll('[data-action="new-item"]').length, document.querySelectorAll('[data-action="new-private-item"]').length, document.querySelectorAll('[data-action="insert-item"]').length, document.querySelectorAll('[data-action="insert-private-item"]').length]`;
 const tabTo = async (p: typeof owner, name: string, ready: string) => { await p!.evaluate(`document.querySelector('[data-action="tab"][data-tab="${name}"]').click()`); await p!.until(`!!document.querySelector(${JSON.stringify(ready)})`); };
 const day2 = tripDay(day, 1);
-// A group's trip: published from the seed, opened by the owner's page (what the dialog after joining said is returned), and the
-// owner's passkey (Chrome's virtual authenticator, with PRF) registered by the first invite, which counts as the check before
+// The trip sealed by the owner's page as soon as the seat is taken, as every trip is (docs/design/trip-e2e.md §5, the third step
+// of handing out): the banner's 移す, with the passkey registered there as the check (the page's virtual authenticator answers).
+async function sealFromBanner(p: NonNullable<typeof owner>) {
+  await p.until(`!!document.querySelector('[data-seal="owner"] [data-action="seal-trip"]')`, 20000);
+  await p.evaluate(`(() => { document.querySelector("#message").textContent = ""; document.querySelector('[data-action="seal-trip"]').click(); return true; })()`);
+  await p.until(`${message} === "旅行を、メンバーにだけ読める形にしました。" || (${message} ?? "").includes("移せません")`, 30000);
+  assert.equal(await p.evaluate(message), "旅行を、メンバーにだけ読める形にしました。");
+  // What the page asked on the way (answerYes counts them), before the reload starts the counts again.
+  const asked = await p.evaluate(`({ asked: window.asked, checks: window.checks, made: window.made })`) as { asked: string[]; checks: number; made: number };
+  await p.reload(); await p.evaluate(answerYes);
+  return asked;
+}
+// src/trip-keys.ts built for a page, as globalThis.tripKeys: loaded again in each expression that uses it, so it is there whatever
+// the page did in between. Built once.
+let keysBuilt: string | undefined;
+async function tripKeysCode() {
+  if (keysBuilt) return keysBuilt;
+  const entryDir = mkdtempSync(join(tmpdir(), "capsule-verify-seal-")), entry = join(entryDir, "entry.ts");
+  writeFileSync(entry, `import * as k from ${JSON.stringify(join(import.meta.dir, "trip-keys.ts"))}; (globalThis as any).tripKeys = k;`);
+  const keysBuild = await Bun.build({ entrypoints: [entry], target: "browser", format: "iife" }); rmSync(entryDir, { recursive: true, force: true });
+  assert.ok(keysBuild.success, "src/trip-keys.ts did not build for the page");
+  return keysBuilt = await keysBuild.outputs[0]!.text();
+}
+// The host's answer for the trip as a page holding the trip key opens it: the seat's private key in IndexedDB opens the trip key,
+// which opens the plan and the footprints (what the screen draws from). A trip not sealed is as the host sent it.
+async function opened(p: NonNullable<typeof owner>, id = capsuleId) {
+  return await p.evaluate(`(async () => { ${await tripKeysCode()}
+    const k = globalThis.tripKeys, id = "${id}", v = await (await vfetch("/v1/c/" + id)).json(), s = v.seatKey;
+    if (!v.sealed) return v;
+    const kept = await new Promise((ok, no) => { const q = indexedDB.open("capsule", 1); q.onerror = () => no(q.error); q.onsuccess = () => { const r = q.result.transaction("private-keys").objectStore("private-keys").get("seat:" + id); r.onsuccess = () => { q.result.close(); ok(r.result); }; r.onerror = () => no(r.error); }; });
+    const trip = await k.unwrapTripKey(s.wrapped, s.ephemeral, kept.secret.x25519, id, s.generation), o = await k.openTrip(trip, id, v);
+    if (!o) throw new Error("the trip did not open: " + JSON.stringify(v.spec).slice(0, 300));
+    const footprints = await Promise.all(v.footprints.map(async ({ point, by, ...f }) => ({ ...f, ...await k.openPoint(trip, id, f.id, point), by: await k.openName(trip, id, "footprint", f.id, by) })));
+    return { ...v, spec: o.spec, document: o.document, footprints };
+  })()`) as { spec: any; document: any; footprints: Array<{ at: string }> };
+}
+// A name of the sealed trip (a member's, an invite's) as a page holding the trip key opens it; one the host gave stays as it is.
+async function openedName(p: NonNullable<typeof owner>, kind: "member" | "grant", of: string, label: string) {
+  return await p.evaluate(`(async () => { ${await tripKeysCode()}
+    const k = globalThis.tripKeys, id = "${capsuleId}", s = (await (await vfetch("/v1/c/" + id)).json()).seatKey;
+    const kept = await new Promise((ok, no) => { const q = indexedDB.open("capsule", 1); q.onerror = () => no(q.error); q.onsuccess = () => { const r = q.result.transaction("private-keys").objectStore("private-keys").get("seat:" + id); r.onsuccess = () => { q.result.close(); ok(r.result); }; r.onerror = () => no(r.error); }; });
+    return k.openName(await k.unwrapTripKey(s.wrapped, s.ephemeral, kept.secret.x25519, id, s.generation), id, "${kind}", "${of}", ${JSON.stringify(label)});
+  })()`) as string;
+}
+// The trip key handed from a page that holds it to a member's, the two comparing their codes (#703), as (v) (c) does.
+async function handOver(giver: NonNullable<typeof owner>, member: NonNullable<typeof owner>) {
+  await member.cdp("Page.reload"); await member.until(`document.querySelector('[data-sealed="locked"]')?.textContent === "オーナーかメンバーから鍵を受け取ってください"`, 20000);
+  await member.evaluate(`document.querySelector('[data-action="receive-key"]').click()`); await member.until(`document.querySelector("#dialog")?.textContent.includes("「渡す」を押してもらってください")`, 20000);
+  await giver.cdp("Page.reload"); await giver.until(`!!document.querySelector("[data-handoff-waiting]")`, 20000); await giver.evaluate(answerYes);
+  await giver.evaluate(`document.querySelector('footer [data-action="give-key"]').click()`);
+  for (const b of [giver, member]) await b.until(`!!document.querySelector("#dialog [data-handoff-own]")`, 20000);
+  const [giverCode, memberCode] = [await ownCode(giver), await ownCode(member)];
+  await typeCode(giver, memberCode); await typeCode(member, giverCode);
+  await member.until(`!!document.querySelector('[data-trip-key="held"]')`, 30000);
+  for (const b of [giver, member]) { await b.reload(); await b.evaluate(answerYes); }
+}
+// A group's trip: published from the seed, opened by the owner's page (what the dialog after joining said is returned), and
+// sealed there (sealFromBanner), the owner's passkey (Chrome's virtual authenticator, with PRF) registered as the check before
 // the owner's important actions.
-async function openTrip() {
+async function openTrip(seal = true) {
   // A fresh minute of the host's clock: the counts per minute (logins, an owner's requests) are not the group's before.
   await nextMinute();
   const created = await fetch(origin + "/v1/publish", { method: "POST", headers: { Origin: origin, "Content-Type": "application/json" }, body: JSON.stringify({ ...seed, confirm: true }) });
@@ -226,21 +298,24 @@ async function openTrip() {
   const p = await page(390, 844, true); owner = p;
   const joined = await p.join(c.url); await p.until(`!!document.querySelector('[data-trip-key="held"]')`);
   await p.cdp("WebAuthn.enable"); const { authenticatorId } = await p.cdp("WebAuthn.addVirtualAuthenticator", { options: { protocol: "ctap2", transport: "internal", hasResidentKey: true, hasUserVerification: true, isUserVerified: true, hasPrf: true } });
-  await p.evaluate(answerYes); await invite(); checkedAt = await hostNow();
-  return { owner: p, joined, authenticatorId: authenticatorId as string };
+  // Unsealed (`seal` false, for the scenes that seal it themselves), the footer's passkey is registered, which counts as the check.
+  const register = async () => { await p.evaluate(`document.querySelector('footer [data-action="passkey-register"]').click()`); await p.until(`(${message} ?? "").startsWith("パスキーを登録しました")`, 20000); };
+  await p.evaluate(answerYes); const sealing = seal ? await sealFromBanner(p) : (await register(), undefined); checkedAt = await hostNow();
+  return { owner: p, joined, authenticatorId: authenticatorId as string, sealing };
 }
 // A member of the group's trip: an invite of `role` from the owner's page, opened in a browser context of its own (what the
-// dialog after joining said is returned).
-async function joinAs(role: "participant" | "viewer" | "editor", width = 390, height = 844) {
+// dialog after joining said is returned), and given the trip key by the owner's page unless `key` is false.
+async function joinAs(role: "participant" | "viewer" | "editor", width = 390, height = 844, key = true) {
   const link = await invite(role), context = (await send("Target.createBrowserContext")).browserContextId as string, p = await page(width, height, true, context);
-  return { page: p, context, joined: await p.join(link) };
+  const joined = await p.join(link); if (key) await handOver(owner!, p);
+  return { page: p, context, joined };
 }
 // A group's trip removed: from the owner's screen (共有・管理, the title typed in) when the group says so, or else from the owner's
 // page (it holds the cookie) when the group has ended or failed. Gone for everyone is checked from here, where there is none.
 async function closeTrip(fromScreen: boolean) {
   if (!capsuleId) return;
   if (fromScreen) {
-    await owner!.evaluate(`document.querySelector('[data-action="manage"]').click()`); await owner!.until(`!!document.querySelector('#dialog [data-action="purge"]')`);
+    await owner!.until(`!!document.querySelector('[data-action="manage"]')`, 20000); await owner!.evaluate(`document.querySelector('[data-action="manage"]').click()`); await owner!.until(`!!document.querySelector('#dialog [data-action="purge"]')`);
     await owner!.evaluate(`document.querySelector('#dialog [data-action="purge"]').click()`); await owner!.until(`!!document.querySelector('#dialog form[data-form="purge"]')`);
     await owner!.evaluate(`(() => { document.querySelector('#dialog input[name="title"]').value = ${JSON.stringify(title)}; document.querySelector('#dialog form[data-form="purge"]').requestSubmit(); })()`);
     await owner!.until(`document.querySelector("main.empty h1")?.textContent === "カプセルを削除しました。"`);
@@ -256,7 +331,7 @@ async function closeTrip(fromScreen: boolean) {
 }
 async function plan() {
   // The group's owner page (the module's `owner`, which the shared parts above use).
-  const { owner, joined, authenticatorId } = await openTrip();
+  const { owner, joined, authenticatorId, sealing } = await openTrip();
   // The dialog after joining tells the owner, and only the owner, that the passkey is also the check before important actions.
   assert.equal(joined.includes("オーナーは、招待の発行や削除などの前の本人確認にも使います。"), true);
   // (a) #689: the owner's first opening makes the trip's key and the seat's key pair in this browser: the seat shows its public keys
@@ -266,12 +341,12 @@ async function plan() {
   assert.deepEqual(await owner.evaluate(`(async () => { const g = await (await vfetch("/v1/c/${capsuleId}/grants")).json(), self = g.flatMap(x => x.members).find(m => m.self); return [Object.keys(self.publicKey ?? {}).sort(), self.publicKey?.x25519?.length, JSON.stringify(g).includes("wrapped")]; })()`), [["ed25519", "x25519"], 43, false]);
   assert.equal(await owner.evaluate(`document.querySelectorAll('.diary, [data-action="new-private"]').length`), 0, "the itinerary still contains a diary entry point");
   assert.equal(await owner.evaluate(`!!document.querySelector('.topbar [data-action="revise"]')`), false);
-  // (i) an owner's important action: the first invite (openTrip's) asks to register a passkey on this phone, which counts as the check, and
-  // is then issued; a second within five minutes asks nothing. The confirm() is answered yes and remembered (after each reload).
+  // (i) an owner's important action: the first one, sealing the trip (openTrip's), asks to register a passkey on this phone, which
+  // counts as the check; invites within five minutes ask nothing. The confirm() is answered yes and remembered (after each reload).
   assert.equal(await owner.evaluate(`[...document.querySelectorAll('[data-action="insert-private-item"]')].every(b => b.textContent.includes("試験機能") && b.getAttribute("aria-label").includes("試験機能"))`), true, "personal insertion entrances must show trial status");
-  assert.deepEqual(await owner.evaluate(`window.asked`), ["この操作には、この端末でのパスキー（Face ID・指紋）の確認が要ります。パスキーを登録して続けますか？"]);
+  assert.deepEqual(sealing, { asked: ["この操作には、この端末でのパスキー（Face ID・指紋）の確認が要ります。パスキーを登録して続けますか？"], checks: 1, made: 1 });  // the one check is the new passkey's PRF output, asked once more to wrap the seat's keys (#689)
   assert.equal(await owner.evaluate(`(async () => (await (await vfetch("/v1/c/${capsuleId}")).json()).passkey)()`), true);
-  await invite(); await invite("viewer"); await invite("editor"); assert.deepEqual(await owner.evaluate(`[window.asked.length, window.checks]`), [1, 1]);  // the one check is the new passkey's PRF output, asked once more to wrap the seat's keys (#689)
+  await invite(); await invite("viewer"); await invite("editor"); assert.deepEqual(await owner.evaluate(`[window.asked.length, window.checks]`), [0, 0]);
   // (k) each theme's text against its own background (WCAG contrast, from the computed colours; a transparent background is
   // the parent's): a preview's banner, the day tabs and the notice from a file taken in on the top page, and the owner's
   // invite dialog's warning with the trip set to the theme (a change of settings, inside the passkey check's five minutes).
@@ -311,60 +386,48 @@ async function plan() {
   await assistHome.close();
   for (const [name, r] of Object.entries(ratios.night!)) assert.ok(r >= 4.5, `night: ${name} has a contrast of ${r}, under 4.5`);
   // (l) 旅を保存, at 375px: the header's button opens a dialog with 「旅程のページを保存」, 「Markdown をコピー」 and, for the owner, 「ZIP を保存」 with a
-  // line for each file of this trip's exports, nothing off the side. With the clipboard allowed, the copy is the host's
-  // export.md; without, the same text is shown selected. 共有・管理 leads to the same dialog. A trip whose exports are only
+  // line for each file of this trip's exports, nothing off the side. The trip is sealed, so the page makes them from what it opened
+  // and asks the host for none (the same as the host's of the plain trip: the sealed group's (a')). With the clipboard allowed, the
+  // Markdown is copied; without, the same text is shown selected. 共有・管理 leads to the same dialog. A trip whose exports are only
   // Markdown lists no index.html (set inside the passkey check's five minutes, as the themes are). 「旅程のページを保存」 downloads
-  // trip-<初日>.html holding the host's export.html where the browser cannot share a file (headless Chrome has no navigator.share),
-  // and hands that file, as text/html, to the share sheet where it can (navigator.share stubbed here).
+  // trip-<初日>.html where the browser cannot share a file (headless Chrome has no navigator.share), and hands that file, as
+  // text/html, to the share sheet where it can (navigator.share stubbed here).
   const files = ["README.md — メモや Markdown のアプリで読める旅行記です。", "trip.json — データの控えです（読むためのものではありません）。", "calendar.ics — 開くと、決定した予定をカレンダーに取り込めます。", "index.html — ブラウザで開くと、旅程のページとして読めます。"];
-  const markdown = `(async () => (await (await vfetch("/v1/c/${capsuleId}/export.md")).json()).text)()`;
+  const sealedSave = `[!!document.querySelector('#dialog [data-action="save-page"]'), !!document.querySelector('#dialog [data-action="copy-markdown"]'), !!document.querySelector('#dialog [data-action="save-zip"]'), !!document.querySelector('#dialog a[href$="/export"]'), [...document.querySelectorAll("#dialog li")].map(l => l.textContent)]`;
+  const exportsAsked = () => owner.requests().filter(u => /\/export(\.md|\.html)?$/.test(new URL(u).pathname)).length, asked = exportsAsked();
   await owner.size(375, 812, true); await owner.reload(); await openSave(owner);
-  assert.deepEqual(await owner.evaluate(saveDialog), [true, true, true, files, true]);
+  assert.deepEqual(await owner.evaluate(sealedSave), [true, true, true, false, files]);
   assert.equal(await owner.evaluate(`document.documentElement.scrollWidth <= 375`), true, "the 旅を保存 dialog runs off the side of a 375px screen");
-  const text = await owner.evaluate(markdown) as string; assert.match(text, new RegExp(`^---\ntitle: "${title}"`));
   await send("Browser.grantPermissions", { origin, permissions: ["clipboardReadWrite", "clipboardSanitizedWrite"] }); await owner.cdp("Emulation.setFocusEmulationEnabled", { enabled: true });
   await owner.evaluate(`document.querySelector('#dialog [data-action="copy-markdown"]').click()`); await owner.until(`${message} === "旅程を Markdown でコピーしました。メモアプリなどに貼って残してください。"`);
-  assert.equal(await owner.evaluate(`navigator.clipboard.readText()`), text);
+  const text = await owner.evaluate(`navigator.clipboard.readText()`) as string; assert.match(text, new RegExp(`^---\ntitle: "${title}"`));
   await send("Browser.resetPermissions"); await owner.evaluate(`document.querySelector('#dialog [data-action="copy-markdown"]').click()`); await owner.until(`!!document.querySelector("#markdown-text")`);
   assert.deepEqual(await owner.evaluate(`(() => { const t = document.querySelector("#markdown-text"); return [t.value, t.selectionStart, t.selectionEnd === t.value.length, document.activeElement === t]; })()`), [text, 0, true, true]);
   await owner.evaluate(`document.querySelector('#dialog [data-action="close"]').click()`);
   await owner.evaluate(`document.querySelector('[data-action="manage"]').click()`); await owner.until(`!!document.querySelector('#dialog [data-action="save"]')`);
-  await openSave(owner, "#dialog "); assert.deepEqual(await owner.evaluate(saveDialog), [true, true, true, files, true]);
+  await openSave(owner, "#dialog "); assert.deepEqual(await owner.evaluate(sealedSave), [true, true, true, false, files]);
   await owner.evaluate(`document.querySelector('#dialog [data-action="close"]').click()`);
   const setExports = (exports: string[]) => setSpec(spec => { spec.exports = exports; });
-  await setExports(["markdown"]); await owner.reload(); await openSave(owner); assert.deepEqual(await owner.evaluate(saveDialog), [true, true, true, files.slice(0, 1), true]);
+  await setExports(["markdown"]); await owner.reload(); await openSave(owner); assert.deepEqual(await owner.evaluate(sealedSave), [true, true, true, false, files.slice(0, 1)]);
   await owner.evaluate(`document.querySelector('#dialog [data-action="close"]').click()`); await setExports(["markdown", "json", "ics", "html"]); await owner.reload();
   const pageName = `trip-${seed.spec.trip.startsOn}.html`, pageDownloads = join(profile, "page-downloads"), pageFile = join(pageDownloads, pageName);
-  const tripPage = await owner.evaluate(`(async () => (await (await vfetch("/v1/c/${capsuleId}/export.html")).json()).text)()`) as string;
-  assert.ok(tripPage.startsWith("<!doctype html>") && tripPage.includes(`<h1>${title}</h1>`), "export.html is not the trip page");
   await send("Browser.setDownloadBehavior", { behavior: "allow", downloadPath: pageDownloads });
   await openSave(owner); await owner.evaluate(`document.querySelector('#dialog [data-action="save-page"]').click()`);
   for (let i = 0; i < 100 && !existsSync(pageFile); i++) await sleep(100);
-  assert.equal(readFileSync(pageFile, "utf8"), tripPage, "the downloaded trip page is not the host's export.html");
+  const tripPage = readFileSync(pageFile, "utf8");
+  assert.ok(tripPage.startsWith("<!doctype html>") && tripPage.includes(`<h1>${title}</h1>`), "the downloaded trip page is not the trip's page");
   await owner.until(`${message} === "旅程のページを保存しました。ブラウザで開くと旅のしおりとして読めます。"`);
   await owner.evaluate(`(() => { window.shared = []; navigator.canShare = () => true; navigator.share = async d => { window.shared.push(d); }; return true; })()`);
   await owner.evaluate(`document.querySelector('#dialog [data-action="save-page"]').click()`); await owner.until(`window.shared.length === 1`);
   assert.deepEqual(await owner.evaluate(`(async () => { const d = window.shared[0]; return [d.files.length, d.files[0].type, d.files[0].name, await d.files[0].text()]; })()`), [1, "text/html", pageName, tripPage]);
-  // A trip page that could not be fetched when the dialog opened is fetched again by the tap, and the failure is not left unhandled.
-  await owner.evaluate(`document.querySelector('#dialog [data-action="close"]').click()`);
-  await owner.evaluate(`(() => { window.unhandled = 0; addEventListener("unhandledrejection", () => window.unhandled++); window.realFetch = window.fetch; window.fetch = (u, ...r) => String(u).split("?")[0].endsWith("/export.html") ? Promise.reject(new TypeError("offline")) : window.realFetch(u, ...r); window.shared = []; return true; })()`);
-  await openSave(owner); await sleep(300); await owner.evaluate(`(() => { window.fetch = window.realFetch; return true; })()`);
-  await owner.evaluate(`document.querySelector('#dialog [data-action="save-page"]').click()`); await owner.until(`window.shared.length === 1`);
-  assert.deepEqual(await owner.evaluate(`(async () => [await window.shared[0].files[0].text(), window.unhandled])()`), [tripPage, 0]);
-  // A tap that had to wait for the trip page may lose the browser's permission to open the share sheet (NotAllowedError, stubbed
-  // here): the page then asks for one more tap instead of downloading, and that tap, with the page at hand, shares it.
-  await owner.evaluate(`document.querySelector('#dialog [data-action="close"]').click()`);
-  await owner.evaluate(`(() => { window.fetch = (u, ...r) => String(u).split("?")[0].endsWith("/export.html") ? new Promise(ok => setTimeout(ok, 1500)).then(() => window.realFetch(u, ...r)) : window.realFetch(u, ...r); window.shared = []; window.refused = 0; navigator.share = async d => { if (!window.refused++) throw new DOMException("no activation", "NotAllowedError"); window.shared.push(d); }; return true; })()`);
-  await openSave(owner); await owner.evaluate(`document.querySelector('#dialog [data-action="save-page"]').click()`);
-  await owner.until(`${message} === "旅程のページの用意ができました。もう一度押すと共有できます。"`); assert.deepEqual(await owner.evaluate(`[window.refused, window.shared.length]`), [1, 0]);
-  await owner.evaluate(`(() => { window.fetch = window.realFetch; document.querySelector('#dialog [data-action="save-page"]').click(); return true; })()`); await owner.until(`window.shared.length === 1`);
-  assert.equal(await owner.evaluate(`window.shared[0].files[0].text()`), tripPage);
   await owner.evaluate(`document.querySelector('#dialog [data-action="close"]').click()`); await owner.reload();
+  assert.equal(exportsAsked(), asked, "the sealed trip's page asked the host for an export");
   // The themes, 旅を保存 and the reloads above spend much of the owner's 120 requests a minute (see (j)): (p) starts in a fresh one.
   await nextMinute();
   // (p) 招待とオーナーの履歴, still at 375px and inside the passkey check's five minutes: the owner issues a participant invite
   // named 履歴確認用 and revokes it; 共有・管理 opened again lists the two first, newest first, each with the date and time, the
-  // role, the link's name and this phone's member name and device, nothing off the side.
+  // role, the link's name and this phone's member name and device, nothing off the side. The trip is sealed: its history names
+  // the invite by id, and the host keeps nothing of a revoked one, so both its lines read （失効した招待） (as the sealed group's (u)).
   const historyInvite = `[...document.querySelectorAll("#dialog .grant")].find(g => g.querySelector("strong")?.textContent === "履歴確認用")`;
   await manageOpen();
   await owner.evaluate(`(() => { const f = document.querySelector('#dialog form[data-form="grant"]'); f.elements.namedItem("role").value = "participant"; f.elements.namedItem("label").value = "履歴確認用"; f.requestSubmit(); return true; })()`);
@@ -374,7 +437,7 @@ async function plan() {
   const self = await owner.evaluate(`[...document.querySelectorAll("#dialog .member")].find(m => m.textContent.includes("（この端末）")).textContent.split("（この端末）")[0]`) as string;
   const historyLines = await owner.evaluate(`(() => { document.querySelector("#dialog details.history").open = true; return [...document.querySelectorAll("#dialog details.history li")].slice(0, 2).map(l => l.textContent); })()`) as string[];
   for (const [line, what] of [[historyLines[0], "招待を失効"], [historyLines[1], "招待を発行"]] as const) {
-    for (const part of [what, "参加者", "履歴確認用", self]) assert.ok(line?.includes(` · ${part}`), `the history line ${JSON.stringify(line)} does not name ${part}`);
+    for (const part of [what, "参加者", "（失効した招待）", self]) assert.ok(line?.includes(` · ${part}`), `the history line ${JSON.stringify(line)} does not name ${part}`);
     // It starts with the date and time, and ends with this phone's device after the member name.
     assert.match(line!, new RegExp(`^\\d{4}/\\d{1,2}/\\d{1,2} \\d{2}:\\d{2} · .* · ${self.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}（[^（）]+）$`), `the history line ${JSON.stringify(line)} has no time or device`);
   }
@@ -440,7 +503,7 @@ async function plan() {
   assert.equal(await overlaps("three"), true);
   await owner.evaluate(`document.querySelector('[data-action="timeline-view"][data-view="detail"]').click()`); await owner.until(`!!document.querySelector(".timeline")`);
   // A cancelled item is not waited for: nothing is marked after it.
-  const itemOf = (id: string) => owner!.evaluate(`(async () => (await (await vfetch("/v1/c/${capsuleId}")).json()).document.items.find(i => i.id === "${id}"))()`), two = await itemOf("two");
+  const itemOf = async (id: string) => (await opened(owner!)).document.items.find((i: { id: string }) => i.id === id), two = await itemOf("two");
   assert.equal((await fromPage("document", { type: "item", item: { ...two, status: "cancelled" } }, "PATCH")).status, 200); await owner.reload();
   assert.equal(await overlaps("three"), false);
   assert.equal((await fromPage("document", { type: "item", item: { ...two, status: "confirmed" } }, "PATCH")).status, 200); await owner.reload();
@@ -647,7 +710,7 @@ async function members() {
   // when it was pressed, and the owner's (東京タワー, about 3 km on) is a place no plan covers, before the first plan that starts
   // later; before 09:00 both are. The plans without a point read their time and title. At 375px nothing runs off the side.
   // The day's plans as the scenes above left them (moved, added, retimed), in the itinerary's order, and the two points.
-  const now = await owner.evaluate(`(async () => { const v = await (await vfetch("/v1/c/${capsuleId}")).json(); return { items: v.document.items.filter(i => i.day === "${day}" && i.status !== "cancelled"), at: v.footprints.map(f => f.at) }; })()`) as { items: typeof seed.document.items; at: string[] };
+  const v = await opened(owner), now = { items: (v.document.items as typeof seed.document.items).filter(i => i.day === day && i.status !== "cancelled"), at: v.footprints.map(f => f.at) };
   const pressed = now.at.map(t => +new Date(t));
   const hm = (t: number | string) => new Intl.DateTimeFormat("ja", { timeZone: "Asia/Tokyo", hour: "2-digit", minute: "2-digit" }).format(new Date(t));
   // Each point is the record of the plan going on (the last started), unless none has started, that plan has ended or it has one
@@ -711,8 +774,8 @@ async function members() {
   // The filter narrows the rows under the map too (review on #586).
   assert.deepEqual(await owner.evaluate(footprintRows), ["オーナー"]);
   await owner.evaluate(`document.querySelector('.trip-map .spot').dispatchEvent(new MouseEvent("click", { bubbles: true }))`); await owner.until(`!!document.querySelector("#dialog [data-spot]")`);
-  const goingOn = await owner.evaluate(`(async () => { const v = await (await vfetch("/v1/c/${capsuleId}")).json(), t = +new Date(v.footprints.find(f => f.by === "オーナー").at);
-    const i = v.document.items.filter(i => i.day === "${day}" && i.status !== "cancelled" && i.startsAt && +new Date(i.startsAt) <= t).sort((a, b) => +new Date(a.startsAt) - +new Date(b.startsAt)).at(-1); return i ? "予定: " + i.title : null; })()`);
+  const seen = await opened(owner), at = +new Date((seen.footprints as Array<{ at: string; by: string }>).find(f => f.by === "オーナー")!.at);
+  const going = (seen.document.items as typeof seed.document.items).filter(i => i.day === day && i.status !== "cancelled" && i.startsAt && +new Date(i.startsAt) <= at).sort((a, b) => +new Date(a.startsAt!) - +new Date(b.startsAt!)).at(-1), goingOn = going ? "予定: " + going.title : null;
   assert.deepEqual(await owner.evaluate(`(() => { const r = document.querySelector("#dialog [data-spot]"), small = [...r.querySelectorAll("small")].map(s => s.textContent); return [r.querySelector("strong").textContent, /\\d{2}:\\d{2}$/.test(small[0]), small[1] ?? null, r.querySelector("a").textContent, r.querySelector("a").target]; })()`), ["オーナー", true, goingOn, "地図 ↗", "_blank"]);
   await owner.evaluate(`document.querySelector('#dialog [data-action="close"]').click()`);
   await owner.size(375, 812, true); assert.equal(await owner.evaluate(`document.documentElement.scrollWidth <= 375`), true, "the footprint map runs off the side of a 375px screen");
@@ -756,7 +819,7 @@ async function members() {
   await owner.evaluate(`document.querySelector('[data-action="tab"][data-tab="days"]').click()`); await owner.until(`!!document.querySelector('[data-action="day"][data-day="${day}"]')`);
   await owner.evaluate(`document.querySelector('[data-action="day"][data-day="${day}"]').click()`); await owner.until(`!!document.querySelector('[data-action="timeline-view"][data-view="detail"]')`);
   await owner.evaluate(`document.querySelector('[data-action="timeline-view"][data-view="detail"]').click()`); await owner.until(`!!document.querySelector('[data-action="edit-item"][data-id="pl1"]')`);
-  const placeOf = (id: string) => owner!.evaluate(`(async () => (await (await vfetch("/v1/c/${capsuleId}")).json()).document.items.find(i => i.id === "${id}").place)()`);
+  const placeOf = async (id: string) => (await opened(owner!)).document.items.find((i: { id: string }) => i.id === id).place;
   const kept = await placeOf("pl1") as { label: string; lat: number; lng: number };
   await edit("pl1"); await owner.evaluate(`(() => { document.querySelector('#dialog textarea[name="description"]').value = "メモだけ直した"; ${submit}; })()`);
   await owner.until(`!document.querySelector("#dialog[open]")`);
@@ -896,8 +959,15 @@ async function members() {
   // A point of another day: the host stamps every point with its own clock, so the page's answer is given one more, 1 km north a
   // day earlier, for this page only (the next reload drops it). The day buttons then narrow to it (one dot) and to today (three).
   const yesterday = new Date(Date.parse(`${day}T12:00:00+09:00`) - 86400000).toISOString().slice(0, 10);
+  // The trip is sealed: the point and its name are sealed for the new id with the trip key, as a member's browser seals one.
+  await owner.evaluate(`(async () => { ${await tripKeysCode()}
+    const k = globalThis.tripKeys, id = "${capsuleId}", v = await (await vfetch("/v1/c/" + id)).json(), s = v.seatKey, p = v.footprints[0];
+    const kept = await new Promise((ok, no) => { const q = indexedDB.open("capsule", 1); q.onerror = () => no(q.error); q.onsuccess = () => { const r = q.result.transaction("private-keys").objectStore("private-keys").get("seat:" + id); r.onsuccess = () => { q.result.close(); ok(r.result); }; r.onerror = () => no(r.error); }; });
+    const trip = await k.unwrapTripKey(s.wrapped, s.ephemeral, kept.secret.x25519, id, s.generation), at = await k.openPoint(trip, id, p.id, p.point), g = v.sealed.generation;
+    window.yesterday = { point: await k.sealPoint(trip, id, g, "yesterday", { ...at, lat: at.lat + 0.01 }), by: await k.sealName(trip, id, g, "footprint", "yesterday", await k.openName(trip, id, "footprint", p.id, p.by)) };
+    return true; })()`);
   await owner.evaluate(`(() => { const real = window.realFetch = window.fetch; window.fetch = async (url, init) => { const r = await real(url, init); if (String(url).split("?")[0] !== "/v1/c/${capsuleId}" || (init?.method ?? "GET") !== "GET") return r;
-    const v = await r.json(), p = v.footprints[0]; v.footprints.unshift({ ...p, id: "yesterday", at: new Date(Date.parse(p.at) - 86400000).toISOString(), lat: p.lat + 0.01, mine: false });
+    const v = await r.json(), p = v.footprints[0]; v.footprints.unshift({ ...p, id: "yesterday", at: new Date(Date.parse(p.at) - 86400000).toISOString(), ...window.yesterday, mine: false });
     return new Response(JSON.stringify(v), { status: 200, headers: { "Content-Type": "application/json" } }); }; return true; })()`);
   await owner.evaluate(`document.querySelector('[data-action="reload"]').click()`); await owner.until(`!!document.querySelector('[data-action="map-day"][data-value="${yesterday}"]')`);
   await owner.evaluate(`document.querySelector('[data-action="map-day"][data-value=""]').click()`); await owner.until(`${spots} === 4`);
@@ -940,11 +1010,12 @@ async function members() {
   assert.equal(await editor.evaluate(`!!document.querySelector('#dialog [data-action="undo"]')`), false);
   // 自分の API キーで、ここで直す (#658): without a key of the editor's own, the dialog asks for one and does not offer to revise;
   // a key of the wrong shape changes nothing (a well-formed one would ask Anthropic, and the passkey check's five minutes are short).
+  // The trip is sealed, so the browser checks the key's shape itself and says so in the dialog.
   assert.equal(await editor.evaluate(`!!document.querySelector('#dialog form[data-form="revise-key"]') && !document.querySelector('#dialog [data-action="revise-assist"]')`), true);
   await editor.evaluate(`(() => { const f = document.querySelector('#dialog form[data-form="revise-key"]'); f.elements.key.value = "sk-ant-x"; f.requestSubmit(); return true; })()`);
-  await editor.until(`${message}.includes("確認")`);
+  await editor.until(`document.querySelector("#dialog").textContent.includes("この API キーは使えません")`);
   assert.equal(await editor.evaluate(`!!document.querySelector('#dialog [data-action="revise-assist"]')`), false);
-  const current = await editor.evaluate(`(async () => await (await vfetch("/v1/c/${capsuleId}")).json())()`);
+  const current = await opened(editor);
   const answer = revisable(current.spec, current.document), first = answer.document.items.find(i => i.id === "one")!;
   const originalStart = first.startsAt!;
   first.startsAt = new Date(Date.parse(originalStart) + 30 * 60000).toISOString();
@@ -956,8 +1027,8 @@ async function members() {
   assert.equal(await editor.evaluate(`document.querySelector(".revise-diff").textContent.includes("一番目の予定")`), true);
   await editor.evaluate(`(() => { const f = document.querySelector('.revise-diff form[data-form="revise"]'); f.querySelector('input[type="checkbox"]').checked = true; f.requestSubmit(); })()`);
   await editor.until(`${message} === "反映しました。「チャットで直す」から 1 つ前に戻せます。"`);
-  const editorState = `(async () => { const v = await (await vfetch("/v1/c/${capsuleId}")).json(); return [v.spec.title, v.document.items.find(i => i.id === "one").startsAt]; })()`;
-  assert.deepEqual(await editor.evaluate(editorState), [title, first.startsAt]);
+  const editorState = async () => { const v = await opened(editor); return [v.spec.title, v.document.items.find((i: { id: string }) => i.id === "one").startsAt]; };
+  assert.deepEqual(await editorState(), [title, first.startsAt]);
   await editor.evaluate(`document.querySelector('.topbar [data-action="revise"]').click()`);
   await editor.until(`!!document.querySelector('#dialog [data-action="undo"]')`);
   assert.equal(await editor.evaluate(`document.querySelector('#dialog [data-action="undo"]').textContent`), "1 つ前に戻す");
@@ -965,7 +1036,7 @@ async function members() {
   await editor.until(`!!document.querySelector('#dialog form[data-form="undo"]')`);
   await editor.evaluate(`(() => { const f = document.querySelector('#dialog form[data-form="undo"]'); f.querySelector('input[type="checkbox"]').checked = true; f.requestSubmit(); })()`);
   await editor.until(`${message} === "1 つ前に戻しました。"`);
-  assert.deepEqual(await editor.evaluate(editorState), [title, originalStart]);
+  assert.deepEqual(await editorState(), [title, originalStart]);
   // (m, continued) 共有・管理 for the editor (#200): its own invites, 閲覧者 the only role, none of the owner's actions or history.
   // Its first invite registers the editor's passkey (its own authenticator answers, yes to the confirm); the owner's dialog then
   // says who handed that invite out, and the editor revokes it.
@@ -978,7 +1049,8 @@ async function members() {
   await editor.evaluate(`(() => { const f = document.querySelector('#dialog form[data-form="grant"]'); f.elements.namedItem("label").value = "編集者の招待確認"; f.requestSubmit(); return true; })()`);
   await editor.until(`!!document.querySelector("#issued-link")`); await editor.evaluate(`document.querySelector('#dialog [data-action="close"]').click()`);
   await editorManage(); assert.deepEqual(await editor.evaluate(`[...document.querySelectorAll("#dialog .grant strong")].map(s => s.textContent)`), ["編集者の招待確認"]);
-  const editorName = await editor.evaluate(`(async () => (await (await vfetch("/v1/c/${capsuleId}/grants")).json())[0].issuedBy.label)()`) as string;
+  const issuer = await editor.evaluate(`(async () => (await (await vfetch("/v1/c/${capsuleId}/grants")).json())[0].issuedBy)()`) as { id: string; label: string };
+  const editorName = await openedName(editor, "member", issuer.id, issuer.label);
   await owner.evaluate(`document.querySelector('[data-action="manage"]').click()`); await owner.until(`!!document.querySelector("#dialog details.history")`);
   assert.equal(await owner.evaluate(`${editorInvite}.textContent.includes(${JSON.stringify(`発行: ${editorName}`)})`), true);
   await owner.evaluate(`document.querySelector('#dialog [data-action="close"]').click()`);
@@ -1011,29 +1083,9 @@ async function members() {
 }
 async function seat() {
   const { owner } = await openTrip();
-  const { page: member, context: memberContext } = await joinAs("participant");
-  // (n) reads the day's lines in リスト, the participant's choice (kept by the page) as (d) makes it in members.
-  await member.evaluate(`document.querySelector('[data-action="timeline-view"][data-view="list"]').click()`); await member.until(`!!document.querySelector(".timeline-list")`);
-  // (m) ログアウト: the participant adds a passkey from the footer (their own virtual authenticator answers), signs out from the
-  // footer after a confirm() saying the passkey brings them back, and lands on the top page with the trip gone from its list.
-  // Opening the trip again says why it cannot be opened, and 「パスキーで戻る」 returns this browser to the same seat.
-  await member.cdp("WebAuthn.enable"); const { authenticatorId: memberAuthenticator } = await member.cdp("WebAuthn.addVirtualAuthenticator", { options: { protocol: "ctap2", transport: "internal", hasResidentKey: true, hasUserVerification: true, isUserVerified: true, hasPrf: true } });
-  // The confirm() is answered yes and kept in sessionStorage: signing out leaves the page before it could be read here.
-  const answerAndKeep = `(() => { window.confirm = m => { sessionStorage.setItem("asked", m); return true; }; return true; })()`;
-  await member.evaluate(answerAndKeep); await member.evaluate(`document.querySelector('footer [data-action="passkey-register"]').click()`);
-  await member.until(`(${message} ?? "").startsWith("パスキーを登録しました")`);
-  // The check before important actions is the owner's only, so the participant's notice does not mention it.
-  assert.equal((await member.evaluate(message) as string).includes("本人確認"), false);
-  await member.evaluate(answerAndKeep); await member.evaluate(`document.querySelector('footer [data-action="signout"]').click()`);
-  await member.until(`location.pathname === "/" && !!document.querySelector("main .content h1")`);
-  assert.equal(await member.evaluate(`sessionStorage.getItem("asked")`), "この端末からログアウトしますか？登録したパスキーで、この旅行の「パスキーで戻る」から戻れます。");
-  assert.equal(await member.evaluate(`!!document.querySelector('a[href="/c/${capsuleId}"]')`), false, "the trip is still listed on the top page after signing out");
-  await member.cdp("Page.navigate", { url: `${origin}/c/${capsuleId}` }); await member.until(`document.querySelector("main.empty h1")?.textContent === "しおりを開けませんでした。"`);
-  assert.equal(await member.evaluate(`document.querySelector("main.empty").textContent.includes("30 日使わなかったか、ログアウトしたか、失効しました。パスキーを登録していれば「パスキーで戻る」、なければオーナーに新しい招待を頼んでください。")`), true);
-  await member.evaluate(`document.querySelector('[data-action="passkey-login"]').click()`); await member.until(`!!document.querySelector(".timeline, .timeline-list")`);
-  assert.equal(await member.evaluate(`(async () => (await vfetch("/v1/c/${capsuleId}")).status)()`), 200);
-  // (d) #689: a seat that is not the owner's holds no key yet: the page says it waits, and the plan reads as it did.
-  assert.deepEqual(await member.evaluate(`[document.querySelector('[data-trip-key]')?.dataset.tripKey, document.querySelector('[data-trip-key]')?.textContent, !!document.querySelector(".timeline, .timeline-list")]`), ["waiting", "鍵を待っています。鍵を持つメンバーと確認コードを伝え合うと受け取れます", true]);
+  const { page: member, context: memberContext } = await joinAs("participant", 390, 844, false);  // its key is handed over below
+  // (d) #689: a seat that is not the owner's holds no key yet: the page says it waits, and the sealed plan does not open without it.
+  assert.deepEqual(await member.evaluate(`[document.querySelector('[data-trip-key]')?.dataset.tripKey, document.querySelector('[data-trip-key]')?.textContent, !!document.querySelector(".timeline, .timeline-list")]`), ["waiting", "鍵を待っています。鍵を持つメンバーと確認コードを伝え合うと受け取れます", false]);
   // (d2) #690: the confirmation-code handoff between two browsers (docs/ephemeral-trip-capsule.md「5.1 旅行の鍵と受け渡し」). The participant presses
   // 鍵を受け取る, the owner sees the seat waiting and presses 渡す. A wrong code puts nothing on the seat and says so; trying
   // again changes the commitment; then each types the other's code and the participant opens the plan with the key.
@@ -1079,6 +1131,27 @@ async function seat() {
   const gave = await seatJson(owner);
   assert.equal(gave.seatKey.edges.some((x: any) => x.seat === waitingId), true);
   assert.equal(await member.evaluate(`!!document.querySelector(".timeline, .timeline-list")`), true);
+  // The plan opened with the key: (n) and (m), on it.
+  // (n) reads the day's lines in リスト, the participant's choice (kept by the page) as (d) makes it in members.
+  await member.evaluate(`document.querySelector('[data-action="timeline-view"][data-view="list"]').click()`); await member.until(`!!document.querySelector(".timeline-list")`);
+  // (m) ログアウト: the participant adds a passkey from the footer (their own virtual authenticator answers), signs out from the
+  // footer after a confirm() saying the passkey brings them back, and lands on the top page with the trip gone from its list.
+  // Opening the trip again says why it cannot be opened, and 「パスキーで戻る」 returns this browser to the same seat.
+  await member.cdp("WebAuthn.enable"); const { authenticatorId: memberAuthenticator } = await member.cdp("WebAuthn.addVirtualAuthenticator", { options: { protocol: "ctap2", transport: "internal", hasResidentKey: true, hasUserVerification: true, isUserVerified: true, hasPrf: true } });
+  // The confirm() is answered yes and kept in sessionStorage: signing out leaves the page before it could be read here.
+  const answerAndKeep = `(() => { window.confirm = m => { sessionStorage.setItem("asked", m); return true; }; return true; })()`;
+  await member.evaluate(answerAndKeep); await member.evaluate(`document.querySelector('footer [data-action="passkey-register"]').click()`);
+  await member.until(`(${message} ?? "").startsWith("パスキーを登録しました")`);
+  // The check before important actions is the owner's only, so the participant's notice does not mention it.
+  assert.equal((await member.evaluate(message) as string).includes("本人確認"), false);
+  await member.evaluate(answerAndKeep); await member.evaluate(`document.querySelector('footer [data-action="signout"]').click()`);
+  await member.until(`location.pathname === "/" && !!document.querySelector("main .content h1")`);
+  assert.equal(await member.evaluate(`sessionStorage.getItem("asked")`), "この端末からログアウトしますか？登録したパスキーで、この旅行の「パスキーで戻る」から戻れます。");
+  assert.equal(await member.evaluate(`!!document.querySelector('a[href="/c/${capsuleId}"]')`), false, "the trip is still listed on the top page after signing out");
+  await member.cdp("Page.navigate", { url: `${origin}/c/${capsuleId}` }); await member.until(`document.querySelector("main.empty h1")?.textContent === "しおりを開けませんでした。"`);
+  assert.equal(await member.evaluate(`document.querySelector("main.empty").textContent.includes("30 日使わなかったか、ログアウトしたか、失効しました。パスキーを登録していれば「パスキーで戻る」、なければオーナーに新しい招待を頼んでください。")`), true);
+  await member.evaluate(`document.querySelector('[data-action="passkey-login"]').click()`); await member.until(`!!document.querySelector(".timeline, .timeline-list")`);
+  assert.equal(await member.evaluate(`(async () => (await vfetch("/v1/c/${capsuleId}")).status)()`), 200);
   // (n) the participant's own plan and diary, sealed in this browser (#343). the personal plan heading asks the seat's passkey
   // (the authenticator answers, with PRF) for a memo key once and saves a plan that goes among the day's items by its time,
   // marked 自分だけ, in the list and on the cards; nothing the page sends holds the words, and a reload reads them again. A diary
@@ -1134,7 +1207,7 @@ async function seat() {
   const positioned = await member.evaluate(`document.querySelector('#dialog form').dataset.id`);
   const offered = await member.evaluate(`document.querySelector('#dialog [name=time]').value`);
   await savePrivate({ title: "位置からの個人予定" });
-  assert.equal(await member.evaluate(`(async () => (await (await fetch('/v1/c/${capsuleId}')).json()).private.find(p => p.id === '${positioned}').startsAt)()`), `${day}T${offered}:00+09:00`);
+  assert.equal(await member.evaluate(`(async () => (await (await vfetch('/v1/c/${capsuleId}')).json()).private.find(p => p.id === '${positioned}').startsAt)()`), `${day}T${offered}:00+09:00`);
   await openPrivate("edit-private", positioned);
   await member.evaluate(`(() => { window.confirm = () => true; document.querySelector('#dialog [data-action="remove-private"]').click(); })()`);
   await member.until(`!document.querySelector('#app [data-id="${positioned}"]')`);
@@ -1190,10 +1263,10 @@ async function seat() {
   await owner.evaluate(`document.querySelector('[data-action=tab][data-tab=days]').click()`);
 
   // Disable shared reflection on the Host through navigation. Also exercise a valid response with no reflection module.
-  const originalMemoriesSpec = await owner.evaluate(`(async () => (await (await fetch('/v1/c/${capsuleId}')).json()).spec)()`);
+  const originalMemoriesSpec = (await opened(owner)).spec;
   for (const missingModule of [false, true]) {
     await setSpec(spec => { spec.navigation = spec.navigation.filter((n: string) => !spec.modules.some((m: any) => m.id === n && m.kind === 'reflection')); });
-    const disabledSpec = await owner.evaluate(`(async () => JSON.stringify((await (await fetch('/v1/c/${capsuleId}')).json()).spec))()`);
+    const disabledSpec = await owner.evaluate(`(async () => JSON.stringify((await (await vfetch('/v1/c/${capsuleId}')).json()).spec))()`);
     assert.equal((await fromPage("document", { type: "reflect", author: "検証", body: "投稿できない思い出" }, "PATCH")).status, 403);
     await member.reload();
     if (missingModule) {
@@ -1209,7 +1282,7 @@ async function seat() {
     await member.evaluate(`document.querySelector('.diary [data-action=edit-private][data-id=old-diary-one]').click()`);
     await member.until(`document.querySelector('.diary form')?.dataset.id === 'old-diary-one'`);
     await savePrivate({ body: "旧日記本文 old-diary-one" }, "diary");
-    assert.equal(await owner.evaluate(`(async () => JSON.stringify((await (await fetch('/v1/c/${capsuleId}')).json()).spec))()`), disabledSpec, "diary editing changed the stored Spec");
+    assert.equal(await owner.evaluate(`(async () => JSON.stringify((await (await vfetch('/v1/c/${capsuleId}')).json()).spec))()`), disabledSpec, "diary editing changed the stored Spec");
     await owner.reload(); await owner.evaluate(`[...document.querySelectorAll('.navigation [data-action=tab]')].at(-2).click()`);
     assert.equal(await owner.evaluate(`document.querySelectorAll('.shared-memories form, [data-action=include]').length`), 0, "the owner has disabled shared write controls");
     if (missingModule) await member.evaluate(`window.fetch = window.beforeMemoriesFetch`);
@@ -1312,8 +1385,9 @@ async function seat() {
   const extra = await member.evaluate(`(async () => (await (await vfetch("/v1/c/${capsuleId}")).json()).private.filter(p => p.id !== ${JSON.stringify(copiedOwn.entries[0]!.id)}).map(p => p.id))()`) as string[];
   assert.equal(extra.length, 5); for (const x of extra) assert.equal(await member.evaluate(`(async () => (await vfetch("/v1/c/${capsuleId}/private", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ type: "remove", id: ${JSON.stringify(x)} }) })).status)()`), 200);
   await member.reload();
-  // A viewer opens it too: the first time registers the seat's passkey (yes to the confirm) and makes its memo key.
-  const { page: viewer, context: viewerContext } = await joinAs("viewer", 375, 812);
+  // A viewer opens it too: the first time registers the seat's passkey (yes to the confirm) and makes its memo key. The key's
+  // hand-over reads both pages again, which the counts per minute above leave no room for: it starts in a fresh minute.
+  await nextMinute(); const { page: viewer, context: viewerContext } = await joinAs("viewer", 375, 812);
   const viewerCounts = await viewer.evaluate(entryCounts); assert.equal(viewerCounts[0], 0); assert.equal(viewerCounts[1], 1); assert.equal(viewerCounts[2], 0); assert.ok(viewerCounts[3] > 0);
   assert.equal(await viewer.evaluate(headingTargets), true);
   await viewer.evaluate(`document.querySelector('[data-action="tab"][data-tab="days"]').click()`);
@@ -1366,9 +1440,11 @@ async function seat() {
   await member.evaluate(`(() => { window.confirm = () => true; document.querySelector('footer [data-action="signout"]').click(); return true; })()`);
   await member.until(`location.pathname === "/"`); await member.cdp("Page.navigate", { url: `${origin}/c/${capsuleId}` });
   await member.until(`!!document.querySelector('[data-action="passkey-login"]')`); await member.evaluate(`document.querySelector('[data-action="passkey-login"]').click()`);
+  // The key back, the page is read again to draw the plan (as in passkey): it is still drawn as waiting for the key until then.
+  await member.until(`!!document.querySelector('[data-trip-key="held"]')`, 20000); await member.reload();
   await member.until(`[...document.querySelectorAll(".event.private h3")].map(h => h.textContent).join() === "自分だけの予定の目印"`, 20000);
   // After sharing ends an unreadable entry opens to 「パスキーで読む」 alone: the host would refuse removing it.
-  await member.evaluate(`new Promise(ok => { const q = indexedDB.deleteDatabase("capsule"); q.onsuccess = q.onerror = q.onblocked = () => ok(true); })`); await member.reload();
+  await member.evaluate(forgetMemoKey); await member.reload();
   await member.evaluate(`(() => { const real = window.fetch; window.fetch = async (...a) => { const r = await real(...a); if (!String(a[0]).split("?")[0].endsWith("/v1/c/${capsuleId}")) return r; const v = await r.json(); return Response.json({ ...v, state: "frozen" }); }; document.querySelector('[data-action="reload"]').click(); return true; })()`);
   await member.until(`document.querySelector(".lifecycle").textContent.includes("共有終了")`);
   await member.evaluate(`document.querySelector('.event.private.locked [data-action="edit-private"]').click()`); await member.until(`!!document.querySelector('#dialog [data-action="read-private"]')`);
@@ -1376,7 +1452,7 @@ async function seat() {
   await member.evaluate(`document.querySelector('#dialog [data-action="close"]').click()`); await member.reload();
   // This browser loses the memo key and the device its passkey: the plan stays where it was, marked, its words gone, and the day
   // says how many cannot be read. Opened, it offers 「パスキーで読む」 and 「削除」 only; removing it leaves none.
-  await member.evaluate(`new Promise(ok => { const q = indexedDB.deleteDatabase("capsule"); q.onsuccess = q.onerror = q.onblocked = () => ok(true); })`);
+  await member.evaluate(forgetMemoKey);
   for (const { credentialId } of (await member.cdp("WebAuthn.getCredentials", { authenticatorId: memberAuthenticator })).credentials) await member.cdp("WebAuthn.removeCredential", { authenticatorId: memberAuthenticator, credentialId });
   await member.reload();
   assert.deepEqual(await member.evaluate(`[[...document.querySelectorAll(".event.private.locked h3")].map(h => h.textContent), document.querySelector(".private-locked")?.textContent, document.body.textContent.includes("自分だけの予定の目印")]`), [["この端末では読めません"], "自分だけの予定のうち 1 件は、この端末では読めません。", false]);
@@ -1453,46 +1529,26 @@ async function passkey() {
   await owner.until(`location.pathname === "/"`); await owner.cdp("Page.navigate", { url: `${origin}/c/${capsuleId}` });
   await owner.until(`!!document.querySelector('[data-action="passkey-login"]')`); await owner.evaluate(`document.querySelector('[data-action="passkey-login"]').click()`);
   await owner.until(`!!document.querySelector('[data-trip-key="held"]')`, 20000);
+  // The key back, the page is read again to draw the plan: it is still drawn as waiting for the key until then.
+  await owner.reload();
   await closeTrip(true);
   console.log("Passkey verification passed: a replacement of the owner's passkey past the check's five minutes (the current passkey checked, a new one made), a passkey without PRF leaving no wrapped private key on the seat, the owner coming back with 「パスキーで戻る」 after IndexedDB and the cookie were cleared and holding the key again, the trip then removed from the owner's screen.");
 }
 async function sealed() {
   const { owner } = await openTrip();
-  // (s) #691: the trip sealed under the trip's key. The screen has no way to start it, so this page does what the owner's
-  // browser will: src/trip-keys.ts is loaded into the page, the seat's private key in IndexedDB opens the trip key, the plan read
-  // from the host is sealed and opened back before it is sent, and POST seal goes after the passkey check (as an owner's action).
-  // Then the screen draws the plan as before from what it opens, adds with "＋" at the time it offered, moves by the grip,
-  // promotes a suggestion to the end of its day, shows no 旅を保存 / チャットで直す, and does not send a purge with another title.
-  const entryDir = mkdtempSync(join(tmpdir(), "capsule-verify-seal-")), entry = join(entryDir, "entry.ts");
-  writeFileSync(entry, `import * as k from ${JSON.stringify(join(import.meta.dir, "trip-keys.ts"))}; (globalThis as any).tripKeys = k;`);
-  const keysBuild = await Bun.build({ entrypoints: [entry], target: "browser", format: "iife" }); rmSync(entryDir, { recursive: true, force: true });
-  assert.ok(keysBuild.success, "src/trip-keys.ts did not build for the page");
-  // Loaded again in each expression that uses it, so it is there whatever the page did in between.
-  const keysCode = await keysBuild.outputs[0]!.text();
-  await owner.evaluate(`document.querySelector('[data-action="day"][data-day="${day}"]').click()`); await owner.until(`!!document.querySelector('[data-order-day] [data-item]')`);
-  const shownBefore = await owner.evaluate(order) as string;
-  assert.equal(await owner.evaluate(`(async () => { ${keysCode}
-    const k = globalThis.tripKeys, id = "${capsuleId}";
-    const kept = await new Promise((ok, no) => { const q = indexedDB.open("capsule", 1); q.onerror = () => no(q.error); q.onsuccess = () => { const r = q.result.transaction("private-keys").objectStore("private-keys").get("seat:" + id); r.onsuccess = () => { q.result.close(); ok(r.result); }; r.onerror = () => no(r.error); }; });
-    const v = await (await vfetch("/v1/c/" + id)).json(), s = v.seatKey;
-    const trip = await k.unwrapTripKey(s.wrapped, s.ephemeral, kept.secret.x25519, id, s.generation);
-    const { previous } = await (await vfetch("/v1/c/" + id + "/seal")).json(), grants = await (await vfetch("/v1/c/" + id + "/grants")).json();
-    const sealed = await k.sealMove(trip, id, s.generation, { spec: v.spec, document: v.document, previous, footprints: v.footprints, grants }), back = await k.openTrip(trip, id, sealed);
-    if (!back || back.unreadable.length || back.spec.title !== v.spec.title || back.document.items.map(i => i.id + i.title).join() !== v.document.items.map(i => i.id + i.title).join()) return "did not open back";
-    window.plainWords = [v.spec.title, ...v.document.items.map(i => i.title)];
-    window.sealBody = JSON.stringify(sealed);
-    return "ok";
-  })()`), "ok");
-  // The host's exports of the trip while it is still plain, for the sealed trip's screen to give the same (#785).
-  const plainExports = await owner.evaluate(`(async () => { const id = "${capsuleId}", text = async p => (await (await vfetch("/v1/c/" + id + "/" + p)).json()).text;
-    const z = new Uint8Array(await (await vfetch("/v1/c/" + id + "/export")).arrayBuffer()); let b = ""; for (const c of z) b += String.fromCharCode(c);
-    return { html: await text("export.html"), md: await text("export.md"), zip: btoa(b), revision: (await (await vfetch("/v1/c/" + id)).json()).document.revision }; })()`) as { html: string; md: string; zip: string; revision: number };
-  // The host's チャットで直す of the same trip while it is plain (#786): the text it gives to copy, and the diff the screen shows
-  // for an answer that renames the trip, an item and a suggestion and drops a talk (checked, not applied).
-  const plainTrip = await owner.evaluate(`(async () => await (await vfetch("/v1/c/${capsuleId}")).json())()`) as { spec: Parameters<typeof revisable>[0]; document: Parameters<typeof revisable>[1] };
-  const plainRevise = await owner.evaluate(`(async () => (await (await vfetch("/v1/c/${capsuleId}/revise")).json()).text)()`) as string;
+  // (s) #691: the trip sealed by its owner's page as the seat is taken (openTrip: the banner's 移す), the host holding no plain word
+  // of it. The screen draws the plan from what it opens, adds with "＋" at the time it offered, moves by the grip, promotes a
+  // suggestion to the end of its day, makes 旅を保存 and チャットで直す itself, and does not send a purge with another title.
+  const keysCode = await tripKeysCode();
+  const plainWords = [title, ...seed.document.items.map(i => i.title)];
+  assert.deepEqual(await owner.evaluate(`(async () => { const t = await (await vfetch("/v1/c/${capsuleId}")).text(); return [JSON.parse(t).sealed?.generation, ${JSON.stringify(plainWords)}.filter(w => t.includes(w))]; })()`), [1, []], "the host holds a plain word of the sealed trip");
+  // What the host holds of the trip, read from the owner's page: the generation and which of the words are there in plain
+  // (`window.plainWords`, replaced by the words to look for).
+  const stored = `(async () => { const t = await (await vfetch("/v1/c/${capsuleId}")).text(); return [JSON.parse(t).sealed?.generation, window.plainWords.filter(w => t.includes(w))]; })()`;
+  // The trip as the page opens it: what the page makes 旅を保存 (a') and チャットで直す (r) from.
+  const openedTrip = await opened(owner);
   // Each answer is a copy: revisable() hands back the trip's own lists, and an answer's edits must not change the next one's.
-  const sealedAnswer = structuredClone(revisable(plainTrip.spec, plainTrip.document)), renamed = { trip: `${title}（直した題）`, item: "暗号化した旅行で直した予定", idea: "暗号化した旅行で直した候補" };
+  const sealedAnswer = structuredClone(revisable(openedTrip.spec, openedTrip.document)), renamed = { trip: `${title}（直した題）`, item: "暗号化した旅行で直した予定", idea: "暗号化した旅行で直した候補" };
   assert.ok(sealedAnswer.document.items.length > 1 && sealedAnswer.document.suggestions.length > 0 && sealedAnswer.document.comments.length > 0, "the trip needs items, a suggestion and a talk to revise");
   sealedAnswer.spec.title = renamed.trip; sealedAnswer.document.items[0]!.title = renamed.item; sealedAnswer.document.suggestions[0]!.body = renamed.idea; sealedAnswer.document.comments.shift();
   const sealedReply = "```json\n" + JSON.stringify(sealedAnswer) + "\n```";
@@ -1507,24 +1563,14 @@ async function sealed() {
     await p.until(`!document.querySelector(".revise-diff").hidden || ${message} === "貼った内容を確認してください。"`);
     return await p.evaluate(`document.querySelector(".revise-diff").hidden ? "" : document.querySelector(".revise-diff").innerText`) as string;
   };
-  await reviseFrom(owner); const plainDiff = await pasteAnswer(owner, sealedReply);
-  assert.ok(plainDiff.includes(renamed.item) && plainDiff.includes("大きな変更です"), "the plain trip's diff of the answer");
-  await owner.evaluate(`document.querySelector('#dialog [data-action="close"]').click()`);
-  const sealIt = () => owner!.evaluate(`(async () => { const revision = (await (await vfetch("/v1/c/${capsuleId}")).json()).document.revision; return (await vfetch("/v1/c/${capsuleId}/seal", { method: "POST", headers: { "Content-Type": "application/json", "If-Match": '"' + revision + '"' }, body: window.sealBody })).status; })()`) as Promise<number>;
-  let sealedStatus = await sealIt(); if (sealedStatus === 428) { assert.equal(await checkFromPage(), 200); checkedAt = await hostNow(); sealedStatus = await sealIt(); }
-  assert.equal(sealedStatus, 200, "POST seal");
-  const stored = `(async () => { const t = await (await vfetch("/v1/c/${capsuleId}")).text(); return [JSON.parse(t).sealed?.generation, window.plainWords.filter(w => t.includes(w))]; })()`;
-  assert.deepEqual(await owner.evaluate(stored.replace("window.plainWords", JSON.stringify(await owner.evaluate("window.plainWords")))), [1, []], "the host holds a plain word of the sealed trip");
-  // (a) Drawn from what the page opened: the same title and the same day.
-  await owner.reload(); await owner.evaluate(answerYes);
+  // (a) Drawn from what the page opened: the title, and the day's items in their order.
   await owner.evaluate(`document.querySelector('[data-action="day"][data-day="${day}"]').click()`); await owner.until(`!!document.querySelector('[data-order-day] [data-item]')`);
-  assert.equal(await owner.evaluate(`document.querySelector(".hero h1").textContent`), title); assert.equal(await owner.evaluate(order), shownBefore);
-  // (a') 旅を保存 of the sealed trip, made by the page from what it opened (#785): the trip page, the Markdown and the ZIP are the
-  // host's exports of the same trip while it was plain, but for the revision the seal moved on by one; the page asks the host
-  // for none of export, export.md or export.html. The ZIP has the same files, and its README.md and index.html are the two.
-  const bump = (t: string) => t.replace(`· revision ${plainExports.revision}</p>`, `· revision ${plainExports.revision + 1}</p>`).replace(`\nrevision: ${plainExports.revision}\n`, `\nrevision: ${plainExports.revision + 1}\n`);
-  const sealedHtml = bump(plainExports.html), sealedMd = bump(plainExports.md);
-  assert.ok(sealedHtml !== plainExports.html && sealedMd !== plainExports.md, "the plain exports do not name the revision");
+  assert.equal(await owner.evaluate(`document.querySelector(".hero h1").textContent`), title);
+  assert.equal(await owner.evaluate(order), (openedTrip.document.items as typeof seed.document.items).filter(i => i.day === day).map(i => i.id).join());
+  // (a') 旅を保存 of the sealed trip, made by the page from what it opened (#785): the trip page, the Markdown and the ZIP's files
+  // are those src/export.ts makes of the opened trip; the page asks the host for none of export, export.md or export.html. The
+  // ZIP's README.md and index.html are the two.
+  const sealedHtml = tripHtml(openedTrip.spec, openedTrip.document), sealedMd = tripMarkdown(openedTrip.spec, openedTrip.document);
   const exportsAsked = (p: typeof owner) => p!.requests().filter(u => /\/export(\.md|\.html)?$/.test(new URL(u).pathname)).length, ownerAsked = exportsAsked(owner);
   const sealedDownloads = join(profile, "sealed-downloads"), sealedName = `trip-${seed.spec.trip.startsOn}`;
   await send("Browser.setDownloadBehavior", { behavior: "allow", downloadPath: sealedDownloads });
@@ -1532,16 +1578,16 @@ async function sealed() {
   assert.deepEqual(await owner.evaluate(`[!!document.querySelector('#dialog [data-action="save-zip"]'), !!document.querySelector('#dialog a[href$="/export"]'), !!document.querySelector("#dialog [data-unreadable-save]")]`), [true, false, false]);
   await send("Browser.grantPermissions", { origin, permissions: ["clipboardReadWrite", "clipboardSanitizedWrite"] });
   await owner.evaluate(`document.querySelector('#dialog [data-action="copy-markdown"]').click()`); await owner.until(`${message} === "旅程を Markdown でコピーしました。メモアプリなどに貼って残してください。"`);
-  assert.equal(await owner.evaluate(`navigator.clipboard.readText()`), sealedMd, "the sealed trip's Markdown is not the host's export.md of the same trip");
+  assert.equal(await owner.evaluate(`navigator.clipboard.readText()`), sealedMd, "the sealed trip's Markdown is not the export's of the opened trip");
   await send("Browser.resetPermissions");
   await owner.evaluate(`document.querySelector('#dialog [data-action="save-page"]').click()`);
   for (let i = 0; i < 100 && !existsSync(join(sealedDownloads, `${sealedName}.html`)); i++) await sleep(100);
-  assert.equal(readFileSync(join(sealedDownloads, `${sealedName}.html`), "utf8"), sealedHtml, "the sealed trip's page is not the host's export.html of the same trip");
+  assert.equal(readFileSync(join(sealedDownloads, `${sealedName}.html`), "utf8"), sealedHtml, "the sealed trip's page is not the export's of the opened trip");
   await owner.evaluate(`document.querySelector('#dialog [data-action="save-zip"]').click()`);
-  const sealedZip = join(sealedDownloads, `${sealedName}.zip`), plainZip = join(profile, "plain-export.zip"); writeFileSync(plainZip, Buffer.from(plainExports.zip, "base64"));
+  const sealedZip = join(sealedDownloads, `${sealedName}.zip`), files = Object.keys(await exportFiles(capsuleId, openedTrip.spec, openedTrip.document, new Date().toISOString()));
   for (let i = 0; i < 100 && !existsSync(sealedZip); i++) await sleep(100); await sleep(300);
   const unzip = (...args: string[]) => { const r = Bun.spawnSync(["unzip", ...args]); assert.equal(r.exitCode, 0, `unzip ${args.join(" ")}`); return r.stdout.toString(); };
-  assert.equal(unzip("-Z1", sealedZip), unzip("-Z1", plainZip), "the sealed trip's ZIP does not hold the host's files");
+  assert.deepEqual(unzip("-Z1", sealedZip).split("\n").filter(Boolean), files, "the sealed trip's ZIP does not hold the export's files");
   assert.ok(unzip("-Z1", sealedZip).split("\n").includes("manifest.json"));
   assert.equal(unzip("-p", sealedZip, "README.md"), sealedMd); assert.equal(unzip("-p", sealedZip, "index.html"), sealedHtml);
   await owner.evaluate(`document.querySelector('#dialog [data-action="close"]').click()`);
@@ -1766,9 +1812,11 @@ async function sealed() {
   await reviseFrom(owner);
   await send("Browser.grantPermissions", { origin, permissions: ["clipboardReadWrite", "clipboardSanitizedWrite"] });
   await owner.evaluate(`document.querySelector('#dialog [data-action="copy-revise"]').click()`); await owner.until(`${message} === "今の旅程と直し方をコピーしました。チャットに貼って、直してほしいことを書いてください。"`);
-  assert.equal(await owner.evaluate(`navigator.clipboard.readText()`), plainRevise, "the sealed trip's text to copy is not the host's of the same trip");
+  const now = await opened(owner);
+  assert.equal(await owner.evaluate(`navigator.clipboard.readText()`), reviseText(now.spec, now.document, false), "the sealed trip's text to copy is not the one the trip makes");
   await send("Browser.resetPermissions");
-  assert.equal(await pasteAnswer(owner, sealedReply), plainDiff, "the sealed trip's diff is not the plain trip's for the same answer");
+  const shownDiff = await pasteAnswer(owner, sealedReply);
+  assert.ok(shownDiff.includes(renamed.item) && shownDiff.includes("大きな変更です"), "the sealed trip's diff of the answer");
   await owner.evaluate(keepSent);
   const reviseForm = `document.querySelector('.revise-diff form[data-form="revise"]')`;
   await owner.evaluate(`(() => { ${reviseForm}.elements.title.value = "違う題"; ${reviseForm}.requestSubmit(); return true; })()`);
@@ -1793,7 +1841,7 @@ async function sealed() {
   await owner.reload(); await owner.evaluate(answerYes);
   assert.equal(await owner.evaluate(`document.querySelector(".hero h1").textContent`), title);
   assert.equal(await owner.evaluate(`document.body.textContent.includes(${JSON.stringify(renamed.item)})`), false, "the undo did not bring the item's title back");
-  const editorAnswer = structuredClone(revisable(plainTrip.spec, plainTrip.document)); editorAnswer.spec.title = "編集者が変えた題"; editorAnswer.document.items[1]!.title = "編集者が直した予定";
+  const editorAnswer = structuredClone(revisable(openedTrip.spec, openedTrip.document)); editorAnswer.spec.title = "編集者が変えた題"; editorAnswer.document.items[1]!.title = "編集者が直した予定";
   await sealedEditor.reload(); await sealedEditor.evaluate(keepSent); await reviseFrom(sealedEditor);
   const editorDiff = await pasteAnswer(sealedEditor, "```json\n" + JSON.stringify(editorAnswer) + "\n```");
   assert.ok(editorDiff.includes("編集者が直した予定") && !editorDiff.includes("編集者が変えた題"), "an editor's diff shows the change of the trip's title");
@@ -1803,7 +1851,7 @@ async function sealed() {
   await owner.reload(); await owner.evaluate(answerYes);
   assert.equal(await owner.evaluate(`document.querySelector(".hero h1").textContent`), title);
   assert.equal(await owner.evaluate(`document.body.textContent.includes("編集者が直した予定")`), true);
-  const unsafe = structuredClone(revisable(plainTrip.spec, plainTrip.document)); unsafe.document.items[0]!.place = { label: "場所", publicUrl: "http://example.com/plain" };
+  const unsafe = structuredClone(revisable(openedTrip.spec, openedTrip.document)); unsafe.document.items[0]!.place = { label: "場所", publicUrl: "http://example.com/plain" };
   await reviseFrom(owner);
   assert.equal(await pasteAnswer(owner, "```json\n" + JSON.stringify(unsafe) + "\n```"), "", "an answer with an http link was taken");
   assert.equal(await pasteAnswer(owner, "あ".repeat(70_000)), "", "an answer past 200,000 bytes was taken");
@@ -1819,7 +1867,7 @@ async function sealed() {
   // Anthropic with the key. (3) The answer goes to the same diff and is applied. (4) Nothing the page sends the host holds the
   // title, the request or the key, and the host's revise/assist is not asked. (5) No other outside origin is asked.
   const fakeKey = `sk-ant-verify-${"x".repeat(40)}`, assistRequest = "一番目の予定の題をここで直して", assisted = "ここで直した予定";
-  const assistAnswer = structuredClone(revisable(plainTrip.spec, plainTrip.document)); assistAnswer.document.items[1]!.title = "編集者が直した予定"; assistAnswer.document.items[0]!.title = assisted;
+  const assistAnswer = structuredClone(revisable(openedTrip.spec, openedTrip.document)); assistAnswer.document.items[1]!.title = "編集者が直した予定"; assistAnswer.document.items[0]!.title = assisted;
   const toAnthropic: Array<{ method: string; url: string; headers: Record<string, string>; body: string }> = [];
   const cors = [{ name: "Access-Control-Allow-Origin", value: origin }, { name: "Access-Control-Allow-Headers", value: "*" }, { name: "Access-Control-Allow-Methods", value: "GET, POST, OPTIONS" }, { name: "Content-Type", value: "application/json" }];
   const answerAnthropic = ({ requestId, request }: { requestId: string; request: { method: string; url: string; headers: Record<string, string>; postData?: string } }) => {
@@ -2023,12 +2071,12 @@ async function sealed() {
   // (w, continued) The owner's own browser keeps nothing of the trip it deleted.
   assert.deepEqual(await owner.evaluate(storedFor(deleted)), nothing, "the owner's browser kept the deleted trip's keys or row"); assert.deepEqual(await owner.evaluate(`[window.asked, window.checks]`), [[], 0]);  // the purge is inside the five minutes of the owner's last check above, so it asks for none
   console.log("Kept by the browser: what a browser keeps for a trip (#842: a 401 not saying the seat is gone taking the trip off the list and keeping the keys, the cookie back opening it with the key; a revoked participant's browser saying why it cannot open the trip and keeping no key, row or 開いたときに足あとを残す of it; the top page forgetting a trip past its deletion with its keys after another trip's page wrote the list back, the live trip kept; the owner's browser keeping nothing of the trip it deleted, and a member's opening a deleted trip to 410 keeping nothing either).");
-  // (v) #694: a plain trip moved by its owner (docs/ephemeral-trip-capsule.md「5.4 平文の旅行を移す」), on trips and browsers of their own. (a) The owner and a
-  // participant each leave a point, and the participant reads 「オーナーが開くと…」. (b) The owner presses 移す: the passkey is
-  // registered as the check (the virtual authenticator answers); reloaded, the title, the items and both points are drawn as before,
-  // the host's answer holding none of them plain. (c) The participant's page asks for the key, the owner's lists the seat waiting,
-  // and the codes hand it over: the plan opens. (d) Without WebAuthn the owner of another plain trip is told to use another
-  // browser, the plan still drawn plain.
+  // (v) The first seal (docs/ephemeral-trip-capsule.md「5.4 平文の旅行を移す」), on trips and browsers of their own. (a) A trip not sealed draws the
+  // banner alone on its owner's page; 移す registers the passkey as the check and seals it: reloaded, the title and the items are
+  // drawn, the host's answer holding none of them plain. (b) A member takes the key by the codes and reads the trip. (x) #842:
+  // deleting the trip clears it from the owner's browser, and the member's browser that still had a seat opens it to 410 and
+  // keeps nothing of it either. (d) Without WebAuthn, the owner of another trip is told the trip opens once sealed in a browser
+  // with passkeys, nothing else drawn.
   {
     const publish = async () => { const r = await fetch(origin + "/v1/publish", { method: "POST", headers: { Origin: origin, "Content-Type": "application/json" }, body: JSON.stringify({ ...seed, confirm: true }) }); assert.equal(r.status, 201); return await r.json() as { id: string; url: string }; };
     const browser = async () => { const context = (await send("Target.createBrowserContext")).browserContextId as string; return Object.assign(await page(390, 844, true, context), { context }); };
@@ -2041,60 +2089,25 @@ async function sealed() {
     };
     // The passkey ceremonies below share the login limit of 15 a minute with the ones just before: they start in a fresh minute.
     await nextMinute();
-    // The page's fetch with the host's answers replaced: the move's POST seal answered from `answers` in turn (then the host), and
-    // GET "" marked mustSeal, as the host marks a trip published after the line (src/cloud-host.ts mustSeal).
-    const stubSeal = (answers: Array<[number, string]>) => `(() => { window.realFetch ??= window.fetch; window.sealPosts = 0; const answers = ${JSON.stringify(answers)};
-      window.fetch = (u, o) => { if (String(u).split("?")[0].endsWith("/seal") && o?.method === "POST") { const a = answers[window.sealPosts++]; if (a) return Promise.resolve(new Response(JSON.stringify({ error: a[1] }), { status: a[0], headers: { "Content-Type": "application/json" } })); } return window.realFetch(u, o); }; return true; })()`;
-    const stubMustSeal = (tripId: string) => `(() => { window.realFetch ??= window.fetch; window.fetch = async (u, o) => { const r = await window.realFetch(u, o); if (String(u).split("?")[0] !== "/v1/c/${tripId}" || (o?.method ?? "GET") !== "GET") return r; const v = await r.json(); return new Response(JSON.stringify({ ...v, mustSeal: true }), { status: r.status, headers: r.headers }); }; document.querySelector('[data-action="reload"]').click(); return true; })()`;
-    const unstub = `(() => { window.fetch = window.realFetch; return true; })()`;
     const moving = await publish(), other = await publish(), mover = await browser(), member = await browser();
     let movedDone = false, otherDone = false, otherOwner = mover;
     try {
       await mover.cdp("WebAuthn.enable"); await mover.cdp("WebAuthn.addVirtualAuthenticator", { options: { protocol: "ctap2", transport: "internal", hasResidentKey: true, hasUserVerification: true, isUserVerified: true, hasPrf: true } });
       await mover.join(moving.url); await mover.until(`!!document.querySelector('[data-trip-key="held"]')`); await mover.evaluate(answerYes);
-      assert.equal(await mover.evaluate(`document.querySelector('[data-move="owner"]')?.innerText.includes("この旅行を、メンバーにだけ読める形に移します") ?? false`), true, "the owner's page offers to move the plain trip");
+      // (a)
+      assert.equal(await mover.evaluate(`document.querySelector('[data-seal="owner"]')?.innerText.includes("この旅行を、メンバーにだけ読める形にします") ?? false`), true, "the owner's page offers to seal the trip");
+      assert.equal(await mover.evaluate(`!!document.querySelector(".hero, .timeline, .timeline-list, [data-action='manage']")`), false, "a trip not sealed draws more than the banner");
+      await sealFromBanner(mover);
+      assert.equal(await mover.evaluate(`document.querySelector(".hero h1").textContent`), title);
+      assert.equal(await mover.evaluate(`!!document.querySelector('[data-seal]')`), false, "a sealed trip offers to seal it again");
+      const plainWords = [title, ...seed.document.items.map(i => i.title)];
+      assert.deepEqual(await mover.evaluate(`(async () => { const t = await (await vfetch("/v1/c/${moving.id}")).text(); return [JSON.parse(t).sealed?.generation, ${JSON.stringify(plainWords)}.filter(w => t.includes(w))]; })()`), [1, []], "the host holds a plain word of the sealed trip");
+      // (b)
       await mover.evaluate(`document.querySelector('[data-action="manage"]').click()`); await mover.until(`!!document.querySelector('#dialog form[data-form="grant"]')`);
       await mover.evaluate(`(() => { const f = document.querySelector('#dialog form[data-form="grant"]'); f.elements.namedItem("role").value = "participant"; f.requestSubmit(); return true; })()`); await mover.until(`!!document.querySelector("#issued-link")`, 20000);
       const link = await mover.evaluate(`document.querySelector("#issued-link").value`) as string; await mover.evaluate(`document.querySelector('#dialog [data-action="close"]').click()`);
-      // (a)
-      await member.join(link);
-      assert.equal(await member.evaluate(`document.querySelector('[data-move="member"]')?.textContent`), "オーナーが開くと、この旅行は運用者にも読めない形になります");
-      await locate(mover, "granted", mover.context, 35.6586, 139.7454); await footprintsTab(mover); await stepHere(mover, 1);
-      await member.reload(); await locate(member, "granted", member.context, 35.6812, 139.7671); await footprintsTab(member); await stepHere(member, 2);
-      const rowsBefore = await member.evaluate(footprintRows) as string[];
-      // (b) A trip the host marks mustSeal draws the banner alone. Then the move as the host may answer it: 413 twice (sent again
-      // without the step back, then left plain with the notice), and 409 once (read again and sent again).
-      await mover.reload(); await mover.evaluate(answerYes);
-      await mover.evaluate(stubMustSeal(moving.id)); await mover.until(`!document.querySelector(".hero") && !!document.querySelector('[data-move="owner"] [data-action="move-trip"]')`);
-      assert.equal(await mover.evaluate(`!!document.querySelector(".timeline, .timeline-list, [data-action='manage']")`), false, "a mustSeal trip draws more than the banner");
-      await mover.evaluate(unstub); await mover.reload(); await mover.evaluate(answerYes);
-      await mover.evaluate(stubSeal([[413, "本文が大きすぎます"], [413, "カプセルの容量上限です"]]));
-      await mover.evaluate(`document.querySelector('[data-action="move-trip"]').click()`);
-      await mover.until(`${message} === "旅程が大きすぎて移せません。予定や投稿を減らしてください"`, 30000);
-      assert.deepEqual(await mover.evaluate(`(async () => [window.sealPosts, (await (await vfetch("/v1/c/${moving.id}")).json()).sealed])()`), [2, null]);
-      await mover.evaluate(stubSeal([[409, "足あとが増えました。もう一度移してください"]]));
-      // The notice the step above left is cleared first: it would otherwise end the wait below before this move is done.
-      await mover.evaluate(`(() => { document.querySelector("#message").textContent = ""; document.querySelector('[data-action="move-trip"]').click(); return true; })()`);
-      await mover.until(`${message} === "旅行を、メンバーにだけ読める形に移しました。" || (${message} ?? "").includes("移せません")`, 30000);
-      assert.equal(await mover.evaluate(message), "旅行を、メンバーにだけ読める形に移しました。");
-      assert.ok(await mover.evaluate(`window.sealPosts`) as number >= 2, "the move was not sent again after the 409"); await mover.evaluate(unstub);
-      await mover.reload();
-      assert.equal(await mover.evaluate(`document.querySelector(".hero h1").textContent`), title);
-      assert.equal(await mover.evaluate(`!!document.querySelector('[data-move]')`), false, "a moved trip offers to move it again");
-      await footprintsTab(mover); await mover.until(`document.querySelectorAll("[data-footprint]").length === 2`);
-      assert.deepEqual(await mover.evaluate(footprintRows), rowsBefore);
-      const plainWords = [title, ...seed.document.items.map(i => i.title), "35.6586", "139.7454", "35.6812", "139.7671", ...rowsBefore];
-      assert.deepEqual(await mover.evaluate(`(async () => { const t = await (await vfetch("/v1/c/${moving.id}")).text(); return [JSON.parse(t).sealed?.generation, ${JSON.stringify(plainWords)}.filter(w => t.includes(w))]; })()`), [1, []], "the host holds a plain word, point or name of the moved trip");
-      // (c)
-      await member.cdp("Page.reload"); await member.until(`document.querySelector('[data-sealed="locked"]')?.textContent === "オーナーかメンバーから鍵を受け取ってください"`, 20000);
-      await member.evaluate(`document.querySelector('[data-action="receive-key"]').click()`); await member.until(`document.querySelector("#dialog")?.textContent.includes("「渡す」を押してもらってください")`, 20000);
-      await mover.cdp("Page.reload"); await mover.until(`!!document.querySelector("[data-handoff-waiting]")`, 20000);
-      await mover.evaluate(`document.querySelector('footer [data-action="give-key"]').click()`);
-      for (const b of [mover, member]) await b.until(`!!document.querySelector("#dialog [data-handoff-own]")`, 20000);
-      const [moverCode, memberCode] = [await ownCode(mover), await ownCode(member)];
-      await typeCode(mover, memberCode); await typeCode(member, moverCode);
-      await member.until(`!!document.querySelector('[data-trip-key="held"]')`, 30000);
-      await member.reload(); assert.equal(await member.evaluate(`document.querySelector(".hero h1").textContent`), title);
+      await member.join(link); await handOver(mover, member);
+      assert.equal(await member.evaluate(`document.querySelector(".hero h1").textContent`), title);
       // (x) #842: deleting the trip clears it from the owner's browser, and the member's browser that still had a seat opens it
       // to 410 and keeps nothing of it either.
       await member.evaluate(`localStorage.setItem("auto-footprint:${moving.id}", "1")`);
@@ -2107,17 +2120,15 @@ async function sealed() {
       assert.deepEqual(await member.evaluate(storedFor(moving.id)), nothing, "the member's browser kept the deleted trip's keys or row");
       await member.close();
       // (d) A page that has no WebAuthn, in a context of its own whose other page has an authenticator: the cookie is shared, so
-      // that page deletes the trip afterwards (a fresh authenticator registers the passkey the purge checks, as in (c) above).
+      // that page seals the trip and then deletes it (a fresh authenticator registers the passkey the seal checks, as in (a)).
       otherOwner = await browser();
       await otherOwner.cdp("WebAuthn.enable"); await otherOwner.cdp("WebAuthn.addVirtualAuthenticator", { options: { protocol: "ctap2", transport: "internal", hasResidentKey: true, hasUserVerification: true, isUserVerified: true, hasPrf: true } });
       const bare = Object.assign(await page(390, 844, true, otherOwner.context), { context: otherOwner.context });
       await bare.cdp("Page.addScriptToEvaluateOnNewDocument", { source: `delete window.PublicKeyCredential;` });
       await bare.join(other.url);
-      assert.equal(await bare.evaluate(`document.querySelector('[data-move="no-passkey"]')?.textContent`), "このブラウザでは旅行を移せません。パスキーの使える別のブラウザ（Safari・Chrome など）で開いてください");
-      assert.equal(await bare.evaluate(`document.querySelector(".hero h1").textContent`), title);
-      assert.equal(await bare.evaluate(`(async () => (await (await vfetch("/v1/c/${other.id}")).json()).sealed)()`), null);
-      await bare.evaluate(stubMustSeal(other.id)); await bare.until(`document.querySelector('[data-move="no-passkey"]')?.textContent === "この旅行は、パスキーの使えるブラウザでオーナーが移すまで開けません" && !document.querySelector(".hero")`); await bare.close();
-      await otherOwner.cdp("Page.navigate", { url: `${origin}/c/${other.id}` }); await otherOwner.until(`!!document.querySelector(".timeline, .timeline-list")`); await purgeFrom(otherOwner); otherDone = true;
+      assert.equal(await bare.evaluate(`document.querySelector('[data-seal="no-passkey"]')?.textContent`), "この旅行は、パスキーの使えるブラウザ（Safari・Chrome など）で開いてください");
+      assert.equal(await bare.evaluate(`!!document.querySelector(".hero")`), false, "a trip not sealed is drawn without WebAuthn"); await bare.close();
+      await otherOwner.cdp("Page.navigate", { url: `${origin}/c/${other.id}` }); await otherOwner.until(drawn); await otherOwner.evaluate(answerYes); await sealFromBanner(otherOwner); await purgeFrom(otherOwner); otherDone = true;
     } finally {
       for (const [done, trip, by] of [[movedDone, moving, mover], [otherDone, other, otherOwner]] as const) if (!done) try { await by.cdp("Page.navigate", { url: `${origin}/c/${trip.id}` }); await by.until(`!!document.querySelector('[data-action="manage"]')`, 20000); await purgeFrom(by); if (trip === moving) movedDone = true; else otherDone = true; } catch { /* reported below */ }
       for (const p of new Set([mover, member, otherOwner])) { await p.close(); await dispose(p.context); }
@@ -2173,8 +2184,8 @@ async function sealed() {
     try {
       await keeper.cdp("WebAuthn.enable"); await keeper.cdp("WebAuthn.addVirtualAuthenticator", { options: { protocol: "ctap2", transport: "internal", hasResidentKey: true, hasUserVerification: true, isUserVerified: true, hasPrf: true } });
       await keeper.join(keeperTrip.url); await keeper.until(`!!document.querySelector('[data-trip-key="held"]')`); await keeper.evaluate(answerYes);
-      await keeper.evaluate(`document.querySelector('[data-action="move-trip"]').click()`);
-      await keeper.until(`${message} === "旅行を、メンバーにだけ読める形に移しました。"`, 30000); await keeper.reload(); await keeper.evaluate(answerYes);
+      await keeper.evaluate(`document.querySelector('[data-action="seal-trip"]').click()`);
+      await keeper.until(`${message} === "旅行を、メンバーにだけ読める形にしました。"`, 30000); await keeper.reload(); await keeper.evaluate(answerYes);
       assert.deepEqual(await held(), [1, [1]]);
       // (1)
       const a = await enter(await issue()), b = await enter(await issue());
@@ -2275,8 +2286,8 @@ async function sealed() {
     try {
       const first = await withPasskey(await browser()); last = first;
       await first.join(askTrip.url); await first.until(`!!document.querySelector('[data-trip-key="held"]')`); await first.evaluate(answerYes);
-      await first.evaluate(`document.querySelector('[data-action="move-trip"]').click()`);
-      await first.until(`${message} === "旅行を、メンバーにだけ読める形に移しました。"`, 30000); await first.reload(); await first.evaluate(answerYes);
+      await first.evaluate(`document.querySelector('[data-action="seal-trip"]').click()`);
+      await first.until(`${message} === "旅行を、メンバーにだけ読める形にしました。"`, 30000); await first.reload(); await first.evaluate(answerYes);
       // (1)
       const ownerGrant = async (b: B) => (await b.evaluate(`(async () => (await (await vfetch("/v1/c/${tripId}/grants")).json()).filter(g => g.role === "owner").map(g => g.id + ":" + (g.revoked ?? "")))()`)) as string[];
       const before = await ownerGrant(first);

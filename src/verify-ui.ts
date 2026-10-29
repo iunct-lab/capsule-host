@@ -27,11 +27,13 @@ import { openField } from "./trip-keys";
 // Then, on trips of their own, the first seal (#694) and the trip key replaced by the owner's page after a member
 // left (#695): revoked, reached only through the revoked one, or past an invite's end; and the new owner after the owner invite was
 // handed over asked whether to replace it, the hand-over stopped while no other seat holds the key, and a seat made again kept.
+// Apart from any trip's own screens, the creator's (#995): enrolled from a link the loopback host hands out, another device, the
+// right to create handed to an owner by a delegation link (redeemed in the owner's trip tab) and revoked.
 // A disposable fictional capsule, purged at the end; no link or cookie is printed. No dependency: Bun has WebSocket and fetch, and Chrome is found on this machine (or named in CHROME_PATH).
 // The scenes come in groups, each on a disposable trip of its own that it opens with what it needs (`openTrip()` and, in the
 // group, the invites, passkeys, handoffs and the seal) and removes when it ends or fails (`closeTrip()`): `bun run verify:ui
 // <group>` runs one, and with no name every group runs in this order. A group prints its seconds when it passes.
-const groups: Record<string, () => Promise<void>> = { plan, members, seat, passkey, sealed };
+const groups: Record<string, () => Promise<void>> = { plan, members, seat, passkey, sealed, creator };
 const chosen = process.argv.slice(2);
 if (chosen.some(name => !Object.hasOwn(groups, name))) { console.error(`知らない群です: ${chosen.filter(name => !Object.hasOwn(groups, name)).join(", ")}。使える群: ${Object.keys(groups).join(", ")}`); process.exit(1); }
 const origin = process.env.CAPSULE_ORIGIN ?? "http://localhost:47840";
@@ -2343,6 +2345,102 @@ async function sealed() {
     }
   }
   console.log("Owner hand-over verification: owner の交換を止める (交換 of the owner invite stopped with no other seat holding the key, the invite unchanged), owner の交換 (the new owner taking the key from a member by the codes and asked 鍵を替えますか: replaced, the member reading the next generation; handed over again, kept with the generation unchanged and not asked again), 作り直し (a participant registering a passkey after taking the key: its pair made again with since, wrapped when the owner next replaced the key, and reading the trip).");
+}
+
+// The creator's screens (#995): a creator made from an enrollment link the loopback bun run dev hands out (src/local-identity.ts,
+// the IAM publisher's on AWS) with a passkey of this page's virtual authenticator, another device added, the right to create handed
+// to the group's owner by a delegation link (on the clipboard only), and that delegate revoked. No trip is published for it: who
+// may create is read from GET /v1/account (canCreate, creator). Creators cannot be removed, so they stay in the dev data's registry.
+async function creator() {
+  const label = "画面確認の作成者", delegate = `${label} の委任`, pages: Array<NonNullable<typeof owner> & { context: string }> = [];
+  // A browser of its own (its cookies and passkeys), with a virtual authenticator, the clipboard allowed and the passkeys it makes counted.
+  const browser = async () => {
+    const context = (await send("Target.createBrowserContext")).browserContextId as string, p = Object.assign(await page(390, 844, true, context), { context });
+    pages.push(p); await opening(p); await send("Browser.grantPermissions", { origin, browserContextId: context, permissions: ["clipboardReadWrite", "clipboardSanitizedWrite"] });
+    return p;
+  };
+  const opening = async (p: NonNullable<typeof owner>) => {
+    await p.cdp("WebAuthn.enable"); await p.cdp("WebAuthn.addVirtualAuthenticator", { options: { protocol: "ctap2", transport: "internal", hasResidentKey: true, hasUserVerification: true, isUserVerified: true } });
+    await p.cdp("Emulation.setFocusEmulationEnabled", { enabled: true });
+    await p.cdp("Page.addScriptToEvaluateOnNewDocument", { source: `window.made = 0; { const create = navigator.credentials.create.bind(navigator.credentials); navigator.credentials.create = o => { window.made++; return create(o); }; }` });
+  };
+  const account = (p: NonNullable<typeof owner>) => p.evaluate(`(async () => await (await fetch("/v1/account")).json())()`) as Promise<{ canCreate: boolean; creator: { label: string; delegated: boolean; delegates: Array<{ label: string }> } | null }>;
+  const heading = `document.querySelector("main h1")?.textContent`, text = `document.body.innerText`;
+  const go = async (p: NonNullable<typeof owner>, url: string) => { await p.cdp("Page.bringToFront"); await p.cdp("Page.navigate", { url }); };
+  // The link a page copied (never printed), read from the same page's clipboard after the screen said it was copied.
+  const copied = async (p: NonNullable<typeof owner>, said: string) => {
+    await p.until(`(${message} ?? "").startsWith(${JSON.stringify(said)})`, 20000);
+    // Compared in the page, so that no expression here (named in an error) holds the link.
+    assert.equal(await p.evaluate(`(async () => { const u = await navigator.clipboard.readText(); return ${text}.includes(u) || ${text}.includes(new URL(u).hash.slice(1)); })()`), false, "a copied link is on the screen");
+    return await p.evaluate(`navigator.clipboard.readText()`) as string;
+  };
+  // The enrollment screen's passkey made, and the top page after it.
+  const register = async (p: NonNullable<typeof owner>, title: string) => {
+    await p.until(`${heading} === ${JSON.stringify(title)} && !!document.querySelector('[data-action="creator-register"]')`, 20000);
+    await p.evaluate(`document.querySelector('[data-action="creator-register"]').click()`);
+  };
+  const card = (name: string) => `[...document.querySelectorAll(".card p")].some(p => p.textContent === "作成者: " + ${JSON.stringify(name)})`;
+  try {
+    // (a) the enrollment link from the loopback host (the script's request, with no cookie), opened in A's browser: a passkey made
+    // there, the top page then shows A's creator card, and the host answers A as a creator that may hand the right on.
+    const enrolled = await fetch(origin + "/v1/creators/enroll", { method: "POST", headers: { Origin: origin, "Content-Type": "application/json" }, body: JSON.stringify({ label, confirm: true }) });
+    if (enrolled.status !== 201) throw new Error(`verify:ui creator はループバックの bun run dev に向けてください（POST /v1/creators/enroll が ${enrolled.status}）`);
+    const a = await browser(); await go(a, (await enrolled.json() as { url: string }).url);
+    await register(a, "作成者として登録する"); await a.until(card(label), 20000);
+    assert.equal(await a.evaluate(`location.hash`), ""); assert.deepEqual(await a.evaluate(`window.made`), 1);
+    assert.deepEqual(((await account(a)).creator), { label, delegated: false, delegates: [] });
+    // (b) 別の端末を追加: the link on A's clipboard, opened in A2's browser, which becomes the same creator with a passkey of its own.
+    await a.evaluate(`document.querySelector('[data-action="creator-add-device"]').click()`);
+    const device = await copied(a, "登録リンクをコピーしました（画面には表示しません）。");
+    const a2 = await browser(); await go(a2, device); await register(a2, "作成者として登録する"); await a2.until(card(label), 20000);
+    assert.equal((await account(a2)).creator?.label, label);
+    // (c) the group's trip, its owner B; A hands B the right to create. Something that is no trip's URL is refused on the screen;
+    // the trip's URL puts a delegation link for it on A's clipboard, and not on the screen.
+    await openTrip(); const tripUrl = `${origin}/c/${capsuleId}`;
+    await nextMinute(); await a.cdp("Page.bringToFront");
+    await a.evaluate(`(() => { document.querySelector("[data-delegate-trip]").value = "週末の旅行"; document.querySelector('[data-action="creator-delegate"]').click(); return true; })()`);
+    await a.until(`${message} === "旅行の URL を貼ってください"`);
+    await a.evaluate(`(() => { document.querySelector("[data-delegate-trip]").value = ${JSON.stringify(tripUrl)}; document.querySelector('[data-action="creator-delegate"]').click(); return true; })()`);
+    const delegation = await copied(a, "委任リンクをコピーしました（画面には表示しません）。");
+    assert.ok(delegation.startsWith(`${tripUrl}#delegate=`), "the delegation link is not for the group's trip");
+    // (d) a browser without the trip's owner seat is stopped before its OS makes a passkey.
+    const c = await browser(); await go(c, delegation);
+    await c.until(`${heading} === "作成権限を受け取る" && !!document.querySelector(".warning")`, 20000);
+    assert.deepEqual(await c.evaluate(`[!!document.querySelector('[data-action="creator-register"]'), window.made]`), [false, 0]);
+    // (e) B's own trip tab (another tab of the owner's browser, with a passkey of its own) given the link as a new fragment: the page
+    // is read afresh as the delegation screen, and stays so through the page's reading every 20 seconds after the trip changed
+    // (from the owner's other tab). Before #203's review (c392ef1) the trip was drawn back over it here.
+    const b = Object.assign(await page(390, 844, true), { context: "" }); pages.push(b); await opening(b); await go(b, tripUrl); await b.until(drawn, 20000);
+    await b.cdp("Page.navigate", { url: tripUrl + new URL(delegation).hash });  // the fragment only: the same page, its hashchange
+    await b.until(`${heading} === "作成権限を受け取る" && !!document.querySelector('[data-action="creator-register"]')`, 20000);
+    const preset = (await opened(owner!)).spec.theme.preset as string;
+    await setSpec(spec => { spec.theme.preset = preset === "night" ? "minimal" : "night"; }); await b.cdp("Page.bringToFront"); await sleep(21000);
+    assert.equal(await b.evaluate(heading), "作成権限を受け取る", "the delegation screen was drawn over after the trip changed");
+    await register(b, "作成権限を受け取る");
+    // Taken, the page goes to the top afresh: the delegate's card, no 作成権限を分ける (a delegate cannot hand it on), the link gone
+    // from the address bar; and it stays the top page through the next readings, the trip changed again.
+    await b.until(`location.pathname === "/" && ${card(delegate)}`, 20000);
+    assert.deepEqual(await b.evaluate(`[location.hash, !!document.querySelector("[data-delegate-trip]")]`), ["", false]);
+    assert.equal((await account(b)).creator?.delegated, true);
+    await setSpec(spec => { spec.theme.preset = preset; }); await b.cdp("Page.bringToFront"); await sleep(21000);
+    assert.deepEqual(await b.evaluate(`[location.pathname, ${card(delegate)}, !!document.querySelector(".timeline, .timeline-list")]`), ["/", true, false], "the trip was drawn over the top page after taking the right");
+    // The same link again is refused as used, before any passkey.
+    await go(b, delegation); await b.until(`(document.querySelector(".warning")?.textContent ?? "").includes("使用済み")`, 20000);
+    assert.equal(await b.evaluate(`!!document.querySelector('[data-action="creator-register"]')`), false);
+    // (f) A revokes the delegate from 分けた作成者 (the confirm() answered yes): gone from the list, and B may no longer create.
+    await nextMinute(); await a.cdp("Page.bringToFront"); await a.cdp("Page.reload"); await a.until(`!!document.querySelector('[data-action="creator-revoke-delegate"]')`, 20000);
+    assert.deepEqual(await a.evaluate(`[...document.querySelectorAll('[data-action="creator-revoke-delegate"]')].map(x => x.dataset.title)`), [delegate]);
+    await a.evaluate(answerYes); await a.evaluate(`document.querySelector('[data-action="creator-revoke-delegate"]').click()`);
+    await a.until(`${message} === "作成権限を失効しました。"`, 20000);
+    assert.deepEqual(await a.evaluate(`[window.asked.length, document.querySelectorAll('[data-action="creator-revoke-delegate"]').length]`), [1, 0]);
+    assert.deepEqual([(await account(a)).creator?.delegates, (await account(b)).canCreate], [[], false]);
+    // A signs out (the creator itself stays in the registry): the cookie gone, the loopback host answers for the page again.
+    await a.evaluate(`document.querySelector('[data-action="creator-signout"]').click()`); await a.until(`${message} === "サインアウトしました。"`, 20000);
+    assert.deepEqual([(await account(a)).creator ?? null, await a.evaluate(card(label))], [null, false]);
+  } finally {
+    for (const p of pages) { await p.close(); if (p.context) await dispose(p.context); }
+  }
+  console.log("Creator verification: an enrollment link from the loopback host made a creator with a passkey (the creator card), 別の端末を追加 (the link on the clipboard only, a second browser the same creator), 作成権限を分ける (a non-URL refused, the delegation link on the clipboard only), a browser without the owner seat stopped before making a passkey, the link opened in the owner's trip tab read afresh and kept through the trip changing, taken there to a top page that stays (the delegate's card, no 作成権限を分ける), the used link refused, the delegate revoked from 分けた作成者 (no longer able to create), and the creator signed out.");
 }
 
 try {

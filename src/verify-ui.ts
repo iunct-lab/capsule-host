@@ -8,6 +8,7 @@ import { localDay } from "./schema";
 import { revisable, reviseText } from "./revise";
 import { exportFiles, tripHtml, tripMarkdown } from "./export";
 import { openField } from "./trip-keys";
+import { photosPageShown } from "./moments";
 
 // Drives the screen of an already-running local host in a headless Chrome over the DevTools protocol: reordering by grip and by
 // arrow key, the time the host gives (a placeholder, "ごろ"), an item without a time given one by a drag and by the edit form, the
@@ -129,6 +130,7 @@ async function page(width: number, height: number, mobile: boolean, context?: st
 // What the day's rows say, whichever way they are shown.
 const order = `[...document.querySelectorAll("[data-order-day] [data-item]")].map(r => r.dataset.item).join()`;
 const message = `document.querySelector("#message").textContent`;
+const shownTab = `document.querySelector('.navigation [aria-current="page"]').dataset.tab`;
 // A trip's page drawn: the plan; or, in a sealed trip without the key, the ask for it; or, for an owner whose trip is not sealed
 // yet, the banner to seal it (all the host lets that owner do).
 const drawn = `!!document.querySelector(".timeline, .timeline-list, [data-sealed='locked'], [data-seal='owner'] [data-action='seal-trip'], [data-seal='no-passkey']")`;
@@ -267,7 +269,7 @@ async function opened(p: NonNullable<typeof owner>, id = capsuleId) {
     if (!o) throw new Error("the trip did not open: " + JSON.stringify(v.spec).slice(0, 300));
     const footprints = await Promise.all(v.footprints.map(async ({ point, by, ...f }) => ({ ...f, ...await k.openPoint(trip, id, f.id, point), by: await k.openName(trip, id, "footprint", f.id, by) })));
     return { ...v, spec: o.spec, document: o.document, footprints };
-  })()`) as { spec: any; document: any; footprints: Array<{ at: string }> };
+  })()`) as { spec: any; document: any; footprints: Array<{ at: string }>; photos?: boolean; media?: unknown[] };
 }
 // A name of the sealed trip (a member's, an invite's) as a page holding the trip key opens it; one the host gave stays as it is.
 async function openedName(p: NonNullable<typeof owner>, kind: "member" | "grant", of: string, label: string) {
@@ -317,7 +319,7 @@ async function joinAs(role: "participant" | "viewer" | "editor", width = 390, he
 async function closeTrip(fromScreen: boolean) {
   if (!capsuleId) return;
   if (fromScreen) {
-    await owner!.until(`!!document.querySelector('[data-action="manage"]')`, 20000); await owner!.evaluate(`document.querySelector('[data-action="manage"]').click()`); await owner!.until(`!!document.querySelector('#dialog [data-action="purge"]')`);
+    await owner!.until(`!!document.querySelector('[data-action="manage"]')`, 20000); await owner!.evaluate(`document.querySelector('[data-action="manage"]').click()`); await owner!.until(`document.querySelector("#dialog").open && !!document.querySelector('#dialog [data-action="purge"]')`);
     await owner!.evaluate(`document.querySelector('#dialog [data-action="purge"]').click()`); await owner!.until(`!!document.querySelector('#dialog form[data-form="purge"]')`);
     await owner!.evaluate(`(() => { document.querySelector('#dialog input[name="title"]').value = ${JSON.stringify(title)}; document.querySelector('#dialog form[data-form="purge"]').requestSubmit(); })()`);
     await owner!.until(`document.querySelector("main.empty h1")?.textContent === "カプセルを削除しました。"`);
@@ -730,7 +732,6 @@ async function members() {
   await owner.size(375, 812, true); assert.equal(await owner.evaluate(`document.documentElement.scrollWidth <= 375`), true, "the story runs off the side of a 375px screen"); await owner.size(390, 844, true);
   // Opened after the trip (the host's answer saying reflection, as the clock cannot be moved), the trip opens on its story; during
   // it, on the itinerary. Chosen once: after a press of the 旅程 tab, a reload keeps the 旅程.
-  const shownTab = `document.querySelector('.navigation [aria-current="page"]').dataset.tab`;
   const ended = await owner.cdp("Page.addScriptToEvaluateOnNewDocument", { source: `const real = window.fetch; window.fetch = async (...a) => { const r = await real(...a); if (!String(a[0]).split("?")[0].endsWith("/v1/c/${capsuleId}")) return r; const v = await r.json(); return Response.json({ ...v, state: "reflection" }); };` });
   await owner.reload(); assert.equal(await owner.evaluate(shownTab), "story");
   await tabTo(owner, "days", ".timeline, .timeline-list"); await owner.evaluate(`document.querySelector('[data-action="reload"]').click()`); await owner.until(`${message} === "最新の内容を読み込みました。"`); assert.equal(await owner.evaluate(shownTab), "days");
@@ -1265,7 +1266,8 @@ async function seat() {
   await owner.evaluate(`document.querySelector('[data-action=tab][data-tab=days]').click()`);
 
   // Disable shared reflection on the Host through navigation. Also exercise a valid response with no reflection module.
-  const originalMemoriesSpec = (await opened(owner)).spec;
+  const memoriesView = await opened(owner), originalMemoriesSpec = memoriesView.spec;
+  const memoriesTabs = seed.spec.navigation.filter((n: string) => photosPageShown(memoriesView) || seed.spec.modules.find((m: any) => m.id === n)?.kind !== "moments").length;
   for (const missingModule of [false, true]) {
     await setSpec(spec => { spec.navigation = spec.navigation.filter((n: string) => !spec.modules.some((m: any) => m.id === n && m.kind === 'reflection')); });
     const disabledSpec = await owner.evaluate(`(async () => JSON.stringify((await (await vfetch('/v1/c/${capsuleId}')).json()).spec))()`);
@@ -1276,7 +1278,8 @@ async function seat() {
       await sleep(300);
     }
     // The memories tab comes back after the Spec's pages, last; the trip has a trip-map page, so no 足あと tab follows it (#583).
-    assert.equal(await member.evaluate(`document.querySelectorAll('.navigation [data-action=tab]').length`), seed.spec.navigation.length, "a missing memories tab was not supplemented");
+    // With photos off and none put up, the photos page is not shown either (#957, `pageModules` in src/client.ts).
+    assert.equal(await member.evaluate(`document.querySelectorAll('.navigation [data-action=tab]').length`), memoriesTabs, "a missing memories tab was not supplemented");
     await member.evaluate(`[...document.querySelectorAll('.navigation [data-action=tab]')].at(-1).click()`);
     await member.until(`!!document.querySelector('.diary')`);
     assert.equal(await member.evaluate(`document.querySelectorAll('.shared-memories form, [data-action=include]').length`), 0, "disabled shared reflection still exposes write controls");
@@ -1430,6 +1433,25 @@ async function seat() {
   // IndexedDB failing inside its own callback does not leave the page waiting: the entries show, unreadable, from nothing kept.
   await member.evaluate(`(() => { IDBDatabase.prototype.transaction = () => { throw new Error("broken store"); }; document.querySelector('[data-action="reload"]').click(); return true; })()`);
   await member.until(`!!document.querySelector(".private-locked")`); await member.reload();
+  // A browser that lost its storage with the cookie kept: the page offers 「パスキーで鍵を取り戻す」. Cancelled, the page stays as it was
+  // and the seat's key is unchanged; pressed again, one check brings the key back and draws the plan with the member's own entry,
+  // without signing out or reading the page again, its footprint too. Its ceremonies share the login limit of 15 a minute: they start in a fresh one.
+  await nextMinute();
+  await locate(member, "granted", memberContext); await footprintsTab(member); await stepHere(member, 1);
+  await member.evaluate(`new Promise(ok => { const q = indexedDB.deleteDatabase("capsule"); q.onsuccess = q.onerror = q.onblocked = () => ok(true); })`);
+  await member.reload();
+  assert.deepEqual(await member.evaluate(`[document.querySelector('[data-sealed="locked"]')?.textContent, !!document.querySelector('footer [data-action="restore-key"]')]`), ["この端末には旅行の鍵がありません。登録したパスキーで取り戻せます", true]);
+  const seatKeyNow = `(async () => (await (await vfetch("/v1/c/${capsuleId}")).json()).seatKey)()`, seatKeyBefore = await member.evaluate(seatKeyNow);
+  await member.evaluate(`(() => { navigator.credentials.get = () => Promise.reject(new DOMException("", "NotAllowedError")); document.querySelector('footer [data-action="restore-key"]').click(); return true; })()`);
+  await member.until(`(${message} ?? "") === "パスキーの操作を中止しました。"`, 20000);
+  assert.equal(await member.evaluate(`!!document.querySelector('[data-sealed="locked"]')`), true);
+  assert.deepEqual(await member.evaluate(seatKeyNow), seatKeyBefore);
+  await member.reload(); await member.evaluate(`document.querySelector('footer [data-action="restore-key"]').click()`);
+  await member.until(`!!document.querySelector('[data-trip-key="held"]')`, 20000);
+  await member.until(`[...document.querySelectorAll(".event.private h3")].map(h => h.textContent).join() === "自分だけの予定の目印"`, 20000);
+  assert.equal(await member.evaluate(`!!document.querySelector('[data-sealed="locked"]')`), false);
+  await footprintsTab(member); await member.until(`document.querySelectorAll("[data-footprint]").length === 1`);
+  await member.evaluate(`(() => { window.confirm = () => true; document.querySelector('[data-action="remove-footprint"]').click(); return true; })()`); await member.until(`document.querySelectorAll("[data-footprint]").length === 0`);
   // Replacing the passkey of a seat whose entries are sealed rewraps the memo key for the new one: with the old passkey gone from
   // the device and this browser's copy of the key too, 「パスキーで戻る」 with the new passkey reads the entries at once.
   // Its ceremonies (three for the replacement, two to come back) share the login limit of 15 a minute: they start in a fresh one.
@@ -1438,13 +1460,19 @@ async function seat() {
   await member.evaluate(`(() => { window.confirm = () => true; document.querySelector('footer [data-action="passkey-register"]').click(); return true; })()`);
   await member.until(`(${message} ?? "").startsWith("この端末のパスキーに登録し直しました")`, 20000);
   for (const credentialId of before) await member.cdp("WebAuthn.removeCredential", { authenticatorId: memberAuthenticator, credentialId });
+  await locate(member, "granted", memberContext); await footprintsTab(member); await stepHere(member, 1);
   await member.evaluate(`new Promise(ok => { const q = indexedDB.deleteDatabase("capsule"); q.onsuccess = q.onerror = q.onblocked = () => ok(true); })`);
   await member.evaluate(`(() => { window.confirm = () => true; document.querySelector('footer [data-action="signout"]').click(); return true; })()`);
   await member.until(`location.pathname === "/"`); await member.cdp("Page.navigate", { url: `${origin}/c/${capsuleId}` });
   await member.until(`!!document.querySelector('[data-action="passkey-login"]')`); await member.evaluate(`document.querySelector('[data-action="passkey-login"]').click()`);
-  // The key back, the page is read again to draw the plan (as in passkey): it is still drawn as waiting for the key until then.
-  await member.until(`!!document.querySelector('[data-trip-key="held"]')`, 20000); await member.reload();
+  // The key back, the plan and the member's own entry are drawn without reading the page again (#1030), on the page a reload opens,
+  // and the footprint left before the storage was lost too (#1047).
+  await member.until(`!!document.querySelector('[data-trip-key="held"]')`, 20000);
   await member.until(`[...document.querySelectorAll(".event.private h3")].map(h => h.textContent).join() === "自分だけの予定の目印"`, 20000);
+  const memberTab = await member.evaluate(shownTab);
+  await footprintsTab(member); await member.until(`document.querySelectorAll("[data-footprint]").length === 1`);
+  await member.evaluate(`(() => { window.confirm = () => true; document.querySelector('[data-action="remove-footprint"]').click(); return true; })()`); await member.until(`document.querySelectorAll("[data-footprint]").length === 0`);
+  await member.reload(); assert.equal(await member.evaluate(shownTab), memberTab);
   // After sharing ends an unreadable entry opens to 「パスキーで読む」 alone: the host would refuse removing it.
   await member.evaluate(forgetMemoKey); await member.reload();
   await member.evaluate(`(() => { const real = window.fetch; window.fetch = async (...a) => { const r = await real(...a); if (!String(a[0]).split("?")[0].endsWith("/v1/c/${capsuleId}")) return r; const v = await r.json(); return Response.json({ ...v, state: "frozen" }); }; document.querySelector('[data-action="reload"]').click(); return true; })()`);
@@ -1471,7 +1499,7 @@ async function seat() {
   await owner.evaluate(`document.querySelector('[data-action=tab][data-tab=days]').click()`);
   assert.equal(await owner.evaluate(`document.body.textContent.includes("自分だけの予定の目印")`), false);
   await member.close(); await dispose(memberContext);
-  console.log("Seat verification passed: a participant's page saying 鍵を待っています, then 鍵を受け取る and the owner's 渡す (the codes typed into each other's screen, a wrong one putting nothing on the seat and a new commitment on trying again, then the key held with an edge on both seats), a participant signing out from the footer (the confirm names the way back, the top page no longer lists the trip, the trip says why it cannot be opened) and coming back with 「パスキーで戻る」, a participant's own plan among the day's items (marked 自分だけ, no grip) and diary written, changed and removed, revised with a chat (the note that the chat reads the copy, the unreadable count, the diff before anything is sent, one sealed apply changing a plan and a diary entry and adding a plan, a viewer opening it with a first passkey), sealed by the page (a memo key from the passkey's PRF, no words sent, read again after a reload), unreadable ones (key and passkey gone) marked and removable, none of it shown to the owner.");
+  console.log("Seat verification passed: a participant's page saying 鍵を待っています, then 鍵を受け取る and the owner's 渡す (the codes typed into each other's screen, a wrong one putting nothing on the seat and a new commitment on trying again, then the key held with an edge on both seats), a participant signing out from the footer (the confirm names the way back, the top page no longer lists the trip, the trip says why it cannot be opened) and coming back with 「パスキーで戻る」 (with the storage lost too: the plan, the own entry and a footprint drawn without a reload), a participant's browser that lost its storage taking the key back with 「パスキーで鍵を取り戻す」 (cancelled: the page and the seat's key unchanged; then the plan, the own entry and a footprint drawn without a reload), a participant's own plan among the day's items (marked 自分だけ, no grip) and diary written, changed and removed, revised with a chat (the note that the chat reads the copy, the unreadable count, the diff before anything is sent, one sealed apply changing a plan and a diary entry and adding a plan, a viewer opening it with a first passkey), sealed by the page (a memo key from the passkey's PRF, no words sent, read again after a reload), unreadable ones (key and passkey gone) marked and removable, none of it shown to the owner.");
 }
 async function passkey() {
   const { owner, authenticatorId } = await openTrip();
@@ -1492,6 +1520,10 @@ async function passkey() {
       await solo.until(`(${message} ?? "").startsWith("パスキーを登録しました")`, 20000);
       assert.deepEqual(await solo.evaluate(read), [true, false, true], "a passkey without PRF must leave no wrapped private key on the seat");
       await solo.reload(); await solo.until(`!!document.querySelector('[data-trip-key="held"]')`);
+      // Its storage lost, nothing on the seat for a passkey to open: no 「パスキーで鍵を取り戻す」, the footer as before.
+      await solo.evaluate(`new Promise(ok => { const q = indexedDB.deleteDatabase("capsule"); q.onsuccess = q.onerror = q.onblocked = () => ok(true); })`);
+      await solo.reload(); await solo.until(`!!document.querySelector('[data-trip-key="missing"]')`);
+      assert.equal(await solo.evaluate(`!!document.querySelector('[data-action="restore-key"]')`), false);
     } finally {
       // A passkey check is due before a purge (428): a run that failed before the passkey was registered registers it here.
       const purge = async () => !bare ? 200 : await solo.evaluate(`(async () => { const v = await (await vfetch("/v1/c/${bare!.id}")).json(); return (await vfetch("/v1/c/${bare!.id}/purge", { method: "POST", headers: { "Content-Type": "application/json", "If-Match": '"' + v.document.revision + '"' }, body: JSON.stringify({ title: ${JSON.stringify(title)} }) })).status; })()`).catch(() => 0);
@@ -1531,10 +1563,11 @@ async function passkey() {
   await owner.until(`location.pathname === "/"`); await owner.cdp("Page.navigate", { url: `${origin}/c/${capsuleId}` });
   await owner.until(`!!document.querySelector('[data-action="passkey-login"]')`); await owner.evaluate(`document.querySelector('[data-action="passkey-login"]').click()`);
   await owner.until(`!!document.querySelector('[data-trip-key="held"]')`, 20000);
-  // The key back, the page is read again to draw the plan: it is still drawn as waiting for the key until then.
-  await owner.reload();
+  // The key back, the plan is drawn without reading the page again (#1030), on the page a reload opens.
+  await owner.until(`!!document.querySelector(".timeline, .timeline-list")`, 20000); assert.equal(await owner.evaluate(`!!document.querySelector('[data-sealed="locked"]')`), false);
+  const ownerTab = await owner.evaluate(shownTab); await owner.reload(); assert.equal(await owner.evaluate(shownTab), ownerTab);
   await closeTrip(true);
-  console.log("Passkey verification passed: a replacement of the owner's passkey past the check's five minutes (the current passkey checked, a new one made), a passkey without PRF leaving no wrapped private key on the seat, the owner coming back with 「パスキーで戻る」 after IndexedDB and the cookie were cleared and holding the key again, the trip then removed from the owner's screen.");
+  console.log("Passkey verification passed: a replacement of the owner's passkey past the check's five minutes (the current passkey checked, a new one made), a passkey without PRF leaving no wrapped private key on the seat (and no 「パスキーで鍵を取り戻す」 once the storage is lost), the owner coming back with 「パスキーで戻る」 after IndexedDB and the cookie were cleared and holding the key again, the trip then removed from the owner's screen.");
 }
 async function sealed() {
   const { owner } = await openTrip();
@@ -1868,10 +1901,14 @@ async function sealed() {
   // on the seat wrapped (no sk-ant- in what the page sends; assistWrapped is v1.). (2) The trip's title and the request go to
   // Anthropic with the key. (3) The answer goes to the same diff and is applied. (4) Nothing the page sends the host holds the
   // title, the request or the key, and the host's revise/assist is not asked. (5) No other outside origin is asked.
-  const fakeKey = `sk-ant-verify-${"x".repeat(40)}`, assistRequest = "一番目の予定の題をここで直して", assisted = "ここで直した予定";
+  // The SDK sends the key as Authorization: Bearer (1.x; 0.x sent it as x-api-key, #1039).
+  const fakeKey = `sk-ant-verify-${"x".repeat(40)}`, withKey = `Bearer ${fakeKey}`, assistRequest = "一番目の予定の題をここで直して", assisted = "ここで直した予定";
   const assistAnswer = structuredClone(revisable(openedTrip.spec, openedTrip.document)); assistAnswer.document.items[1]!.title = "編集者が直した予定"; assistAnswer.document.items[0]!.title = assisted;
   const toAnthropic: Array<{ method: string; url: string; headers: Record<string, string>; body: string }> = [];
-  const cors = [{ name: "Access-Control-Allow-Origin", value: origin }, { name: "Access-Control-Allow-Headers", value: "*" }, { name: "Access-Control-Allow-Methods", value: "GET, POST, OPTIONS" }, { name: "Content-Type", value: "application/json" }];
+  // The headers named one by one, as the SDK 1.1.0 page asks for them in the preflight (#1053): "*" does not take in
+  // Authorization by the Fetch spec (Chrome lets it through, a browser that keeps the spec does not), and Chrome stops the
+  // request when one header asked for is not named.
+  const cors = [{ name: "Access-Control-Allow-Origin", value: origin }, { name: "Access-Control-Allow-Headers", value: "anthropic-dangerous-direct-browser-access, anthropic-version, authorization, content-type, x-stainless-arch, x-stainless-lang, x-stainless-os, x-stainless-package-version, x-stainless-retry-count, x-stainless-runtime, x-stainless-runtime-version, x-stainless-timeout" }, { name: "Access-Control-Allow-Methods", value: "GET, POST, OPTIONS" }, { name: "Content-Type", value: "application/json" }];
   const answerAnthropic = ({ requestId, request }: { requestId: string; request: { method: string; url: string; headers: Record<string, string>; postData?: string } }) => {
     toAnthropic.push({ method: request.method, url: request.url, headers: Object.fromEntries(Object.entries(request.headers).map(([k, v]) => [k.toLowerCase(), v])), body: request.postData ?? "" });
     const answer = request.method === "OPTIONS" ? "" : new URL(request.url).pathname === "/v1/models" ? JSON.stringify({ data: [], has_more: false, first_id: null, last_id: null })
@@ -1884,13 +1921,13 @@ async function sealed() {
   await owner.evaluate(keepSent); await reviseFrom(owner);
   await owner.evaluate(`(() => { const f = document.querySelector('#dialog form[data-form="revise-key"]'); f.elements.key.value = ${JSON.stringify(fakeKey)}; f.requestSubmit(); return true; })()`);
   await owner.until(`${message} === "API キーを登録しました。"`, 20000);
-  assert.ok(toAnthropic.some(r => r.method === "GET" && r.url.startsWith("https://api.anthropic.com/v1/models") && r.headers["x-api-key"] === fakeKey), "the key was not checked with Anthropic");
+  assert.ok(toAnthropic.some(r => r.method === "GET" && r.url.startsWith("https://api.anthropic.com/v1/models") && r.headers.authorization === withKey), "the key was not checked with Anthropic");
   assert.match(await owner.evaluate(`(async () => (await (await vfetch("/v1/c/${capsuleId}")).json()).assistWrapped)()`) as string, /^v1\./);
   await owner.until(`!!document.querySelector('#dialog [data-action="revise-assist"]')`);
   await owner.evaluate(`(() => { document.querySelector("#dialog [data-revise-request]").value = ${JSON.stringify(assistRequest)}; document.querySelector('#dialog [data-action="revise-assist"]').click(); return true; })()`);
   await owner.until(`!!document.querySelector('.revise-diff form[data-form="revise"]')`, 30000);
   const sentOut = toAnthropic.find(r => r.method === "POST" && r.url.startsWith("https://api.anthropic.com/v1/messages"));
-  assert.ok(sentOut && sentOut.body.includes(title) && sentOut.body.includes(assistRequest) && sentOut.headers["x-api-key"] === fakeKey, "the trip and the request did not go to Anthropic with the key");
+  assert.ok(sentOut && sentOut.body.includes(title) && sentOut.body.includes(assistRequest) && sentOut.headers.authorization === withKey, "the trip and the request did not go to Anthropic with the key");
   // Today's date first, as the host's revise/assist sends it (#658). The sealed trip's page builds it with the browser's clock
   // (src/client.ts sealedAssist), which this script does not move.
   assert.ok(sentOut.body.includes(JSON.stringify(`今日は ${localDay(Date.now(), "Asia/Tokyo")} です。`).slice(1, -1)), "today's date did not go first, as the host sends it");
@@ -1910,7 +1947,7 @@ async function sealed() {
   await reviseFrom(owner); await owner.until(`!!document.querySelector('#dialog [data-action="revise-assist"]')`);
   await owner.evaluate(`(() => { document.querySelector("#dialog [data-revise-request]").value = ${JSON.stringify(assistRequest)}; document.querySelector('#dialog [data-action="revise-assist"]').click(); return true; })()`);
   await owner.until(`!document.querySelector(".revise-diff").hidden`, 30000);
-  assert.deepEqual(toAnthropic.slice(assistsBefore).filter(r => r.method === "POST").map(r => r.headers["x-api-key"]), [fakeKey], "after a reload the key was not opened again and sent");
+  assert.deepEqual(toAnthropic.slice(assistsBefore).filter(r => r.method === "POST").map(r => r.headers.authorization), [withKey], "after a reload the key was not opened again and sent");
   await owner.evaluate(`document.querySelector('#dialog [data-action="close"]').click()`); await owner.cdp("Fetch.disable"); paused.delete(owner.session);
   await owner.reload(); await owner.evaluate(answerYes);
   // The revises and 「ここで直す」 above spend much of the owner's requests a minute (see (j)): what follows starts in a fresh one.
@@ -1975,7 +2012,7 @@ async function sealed() {
   assert.deepEqual(await owner.evaluate(`[!!document.querySelector('.topbar [data-action="save"]'), !!document.querySelector('.topbar [data-action="revise"]')]`), [true, false]);
   await openSave(owner); assert.equal(await owner.evaluate(`document.querySelector("#dialog [data-unreadable-save]")?.textContent`), "この端末で開けない記録 1 件は、保存する内容に入りません");
   await owner.evaluate(`document.querySelector('#dialog [data-action="close"]').click()`);
-  await owner.evaluate(`document.querySelector('[data-action="manage"]').click()`); await owner.until(`!!document.querySelector('#dialog [data-action="purge"]')`);
+  await owner.evaluate(`document.querySelector('[data-action="manage"]').click()`); await owner.until(`document.querySelector("#dialog").open && !!document.querySelector('#dialog [data-action="purge"]')`);
   assert.deepEqual(await owner.evaluate(`[!!document.querySelector('#dialog [data-action="save"]'), !!document.querySelector('#dialog [data-action="revise"], #dialog [data-action="undo"]'), !!document.querySelector('#dialog [data-sealed="manage"]')]`), [true, false, true]);
   // (e) A purge with another title is not sent: the screen compares it, the host cannot.
   await owner.evaluate(`document.querySelector('#dialog [data-action="purge"]').click()`); await owner.until(`!!document.querySelector('#dialog form[data-form="purge"]')`);
@@ -2084,7 +2121,7 @@ async function sealed() {
     const browser = async () => { const context = (await send("Target.createBrowserContext")).browserContextId as string; return Object.assign(await page(390, 844, true, context), { context }); };
     const purgeFrom = async (p: Awaited<ReturnType<typeof browser>>) => {
       // The passkey ceremony needs the page in front: a page opened after it (the one without WebAuthn) took the focus.
-      await p.cdp("Page.bringToFront"); await p.evaluate(answerYes); await p.evaluate(`document.querySelector('[data-action="manage"]').click()`); await p.until(`!!document.querySelector('#dialog [data-action="purge"]')`);
+      await p.cdp("Page.bringToFront"); await p.evaluate(answerYes); await p.evaluate(`document.querySelector('[data-action="manage"]').click()`); await p.until(`document.querySelector("#dialog").open && !!document.querySelector('#dialog [data-action="purge"]')`);
       await p.evaluate(`document.querySelector('#dialog [data-action="purge"]').click()`); await p.until(`!!document.querySelector('#dialog form[data-form="purge"]')`);
       await p.evaluate(`(() => { document.querySelector('#dialog input[name="title"]').value = ${JSON.stringify(title)}; document.querySelector('#dialog form[data-form="purge"]').requestSubmit(); return true; })()`);
       await p.until(`document.querySelector("main.empty h1")?.textContent === "カプセルを削除しました。"`, 30000);
@@ -2226,7 +2263,7 @@ async function sealed() {
       assert.deepEqual(await held(), [4, [4]], "the key replaced after an invite ended before the trip's deletion");
       assert.deepEqual(await reads(c), [title, true]);
       // Done: the owner purges it.
-      await keeper.evaluate(answerYes); await keeper.evaluate(`document.querySelector('[data-action="manage"]').click()`); await keeper.until(`!!document.querySelector('#dialog [data-action="purge"]')`);
+      await keeper.evaluate(answerYes); await keeper.evaluate(`document.querySelector('[data-action="manage"]').click()`); await keeper.until(`document.querySelector("#dialog").open && !!document.querySelector('#dialog [data-action="purge"]')`);
       await keeper.evaluate(`document.querySelector('#dialog [data-action="purge"]').click()`); await keeper.until(`!!document.querySelector('#dialog form[data-form="purge"]')`);
       await keeper.evaluate(`(() => { document.querySelector('#dialog input[name="title"]').value = ${JSON.stringify(title)}; document.querySelector('#dialog form[data-form="purge"]').requestSubmit(); return true; })()`);
       await keeper.until(`document.querySelector("main.empty h1")?.textContent === "カプセルを削除しました。"`, 30000); purged = true;
@@ -2333,8 +2370,9 @@ async function sealed() {
       await third.until(`${message} === "旅行の鍵を替えました。"`, 30000);
       const pv = await view(p); assert.equal(pv.seatKey.generation, pv.sealed.generation, "the seat made again was not wrapped");
       await p.reload(); assert.equal(await p.evaluate(`document.querySelector(".hero h1")?.textContent`), title);
-      await third.evaluate(`document.querySelector('#dialog [data-action="close"]')?.click()`);
-      await third.evaluate(answerYes); await third.evaluate(`document.querySelector('[data-action="manage"]').click()`); await third.until(`!!document.querySelector('#dialog [data-action="purge"]')`);
+      // Closed first, and the 「完全に削除」 waited for in the dialog the press opened: a closed one keeps what it showed (#1027).
+      await third.evaluate(`document.querySelector('#dialog [data-action="close"]')?.click()`); await third.until(`!document.querySelector("#dialog").open`);
+      await third.evaluate(answerYes); await third.evaluate(`document.querySelector('[data-action="manage"]').click()`); await third.until(`document.querySelector("#dialog").open && !!document.querySelector('#dialog [data-action="purge"]')`);
       await third.evaluate(`document.querySelector('#dialog [data-action="purge"]').click()`); await third.until(`!!document.querySelector('#dialog form[data-form="purge"]')`);
       await third.evaluate(`(() => { document.querySelector('#dialog input[name="title"]').value = ${JSON.stringify(title)}; document.querySelector('#dialog form[data-form="purge"]').requestSubmit(); return true; })()`);
       await third.until(`document.querySelector("main.empty h1")?.textContent === "カプセルを削除しました。"`, 30000); purged = true;

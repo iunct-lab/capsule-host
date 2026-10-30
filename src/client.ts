@@ -346,6 +346,15 @@ async function readWithPasskey() {
   if (!view.privateKey) return;
   try { if (!prf) throw new Error(); await unlock(prf); } catch { throw new Error(passkeyCannotRead); }
 }
+// 「パスキーで鍵を取り戻す」: the seat's keys (and the memo key, if any) back in a browser that lost its storage, with one check and the page not loaded again.
+async function restoreKeyWithPasskey() {
+  const prf = await prfAssertion();
+  if (!prf || !await restoreSeat(prf).then(() => true, () => false) || !tripKey) throw new Error(passkeyCannotRead);
+  if (view.privateKey) await unlock(prf).catch(() => undefined);
+  // Read again, not only drawn: the locked page dropped the sealed footprints it could not open.
+  await reload();
+  notice("この端末で旅行の鍵を取り戻しました。");
+}
 // The memo key before a first entry is sealed: this browser's copy, or the seat's opened with its passkey, or a new one made now,
 // wrapped and handed to the host. A seat without a passkey registers one first; without PRF nothing is written (spec「5.6 自分だけの予定・日記の鍵」).
 async function ensureMemoKey(): Promise<CryptoKey | undefined> {
@@ -442,7 +451,9 @@ async function passkeyLogin() {
   const prf = prfOf(credential);
   if (prf) {
     const seat = await restoreSeat(prf).then(() => Boolean(tripKey), () => false), memo = Boolean(view.privateKey) && await unlock(prf).then(() => true, () => false);
-    if (seat || memo) { await openAll(); render(); await rekeyIfDue(); }
+    // A page read without the key dropped the sealed footprints it could not open: with the seat's key back it is read again.
+    // Otherwise the plan is opened only if it was waiting for the key: one already opened is plain words now, not ciphertext.
+    if (seat && locked) await reload(); else if (seat || memo) await drawView(Boolean(locked));
   }
 }
 // Cancelling the OS dialog is not an error worth a red banner.
@@ -573,7 +584,11 @@ async function reload() { await load(); if (id) remember(list => [...list.filter
 async function load() {
   loads++;
   view = id ? await api() : { ...await api("/v1/preview"), role: "owner", state: "draft" }; stale = false;
-  await openAll(); await openSealed();
+  await drawView();
+}
+// The trip as read, opened and drawn: after a read, and again when 「パスキーで戻る」 opens the memo key, or the seat's key this browser still held, for the trip just read.
+async function drawView(open = true) {
+  await openAll(); if (open) await openSealed();
   if (!opened && !locked) { opened = true; tab = firstPage(pageModules(), view.state); }
   render();
   await rekeyIfDue();
@@ -625,7 +640,7 @@ let locked = "", sealedNow: { spec: SealedSpec; document: SealedDocument } | und
 async function openSealed() {
   locked = ""; view.unreadable = []; sealedNow = undefined;
   if (!view.sealed) return;
-  if (!tripKey) { view.footprints = []; locked = keyRefused ? unverifiedKey : "オーナーかメンバーから鍵を受け取ってください"; return; }
+  if (!tripKey) { view.footprints = []; locked = keyRefused ? unverifiedKey : restorable() ? restoreHint : "オーナーかメンバーから鍵を受け取ってください"; return; }
   const t = await openTrip(tripKey, id!, view as unknown as { spec: SealedSpec; document: SealedDocument });
   if (!t) { view.footprints = []; locked = "旅程を開けません（旅行の鍵が合いません）"; return; }
   // The ciphertext as the host sent it, kept for a revise or an undo: a record left as it was is sent back as it came (resealTrip).
@@ -718,11 +733,14 @@ async function creationHome() {
 }
 const unverifiedKey = "新しい鍵を確かめられません。オーナーかメンバーから鍵を受け取り直してください";
 const lastKey = "鍵を持つメンバーが他にいないため、交換すると旅程をだれも読めなくなります。先に別の端末かメンバーに鍵を渡してください";
+// A seat whose private keys the passkey wrapped, of the trip's generation, whose browser lost them: 「パスキーで鍵を取り戻す」 brings them back.
+const restorable = () => passkeys && !tripKey && !keyRefused && Boolean(view.seatKey?.secret) && !(view.sealed && view.seatKey!.generation !== view.sealed.generation);
+const restoreHint = "この端末には旅行の鍵がありません。登録したパスキーで取り戻せます";
 // Whether this browser holds the trip's key (#689). The plan is still plain; a seat that has none waits for another seat's hand-over.
 const keyStatus = () => !id || view.state === "draft" ? ""
   : tripKey ? `<span data-trip-key="held">この端末に鍵がある</span>`
   : keyRefused ? `<span data-trip-key="unverified">${unverifiedKey}</span>${button("鍵を受け取る", "receive-key", "quiet")}`
-  : view.seatKey && !(view.sealed && view.seatKey.generation !== view.sealed.generation) ? `<span data-trip-key="missing">この端末には旅行の鍵がありません</span>`
+  : view.seatKey && !(view.sealed && view.seatKey.generation !== view.sealed.generation) ? `<span data-trip-key="missing">この端末には旅行の鍵がありません</span>${restorable() ? button("パスキーで鍵を取り戻す", "restore-key", "quiet") : ""}`
   : view.role !== "owner" || view.keyed ? `<span data-trip-key="waiting">鍵を待っています。鍵を持つメンバーと確認コードを伝え合うと受け取れます</span>${button("鍵を受け取る", "receive-key", "quiet")}` : "";
 // Seats that wait for the key, shown to a seat that holds it (any role): each with 「渡す」.
 const handoffWaiting = () => tripKey && view.waiting?.length ? view.waiting.map(w => `<span data-handoff-waiting="${e(w.id)}">${e(w.label)}が鍵を待っています</span>${button("渡す", "give-key", "quiet", `data-id="${e(w.id)}" data-label="${e(w.label)}"`)}`).join("") : "";
@@ -1255,7 +1273,9 @@ async function mountPlaceElement() {
 }
 // The 候補・相談 post a card's 「直す」「消す」 stands for.
 const post = (b: HTMLElement) => (b.dataset.list === "comments" ? view.document.comments : view.document.suggestions).find(x => x.id === b.dataset.id);
-function modal(title: string, html: string) { dialog.innerHTML = `<div class="modal-heading"><h2>${e(title)}</h2>${button("閉じる", "close", "quiet")}</div>${html}`; if (!dialog.open) dialog.showModal(); }
+// Advanced by every dialog drawn: a 招待とメンバー read before another dialog was drawn is no longer the one shown (manage).
+let manageRun = 0;
+function modal(title: string, html: string) { manageRun++; dialog.innerHTML = `<div class="modal-heading"><h2>${e(title)}</h2>${button("閉じる", "close", "quiet")}</div>${html}`; if (!dialog.open) dialog.showModal(); }
 // One line of the checklist or budget form. Lines are added and removed on the page; the whole list is sent when saved.
 function listRow(kind: "checklist" | "budget", row: { id: string; title: string; amount?: number; description?: string }) {
   const title = `<input name="title" aria-label="${kind === "budget" ? "題" : "項目"}" maxlength="160" value="${e(row.title)}">`, remove = button("削除", "remove-row", "quiet", `type="button" aria-label="${e(row.title || "この行")}を削除"`);
@@ -1387,7 +1407,7 @@ function saveModal() {
 }
 // An editor gets the same dialog for the viewer invites it hands out (the host lists only those); the rest is the owner's.
 async function manage() {
-  const owner = view.role === "owner";
+  const owner = view.role === "owner", run = manageRun, shown = dialog.open;
   const [grants, history] = await Promise.all([api("grants"), owner ? api("history") : []]) as [Array<{ id: string; role: Role; label: string; expires: number; revoked: number | null; seats: number; claimed: number; claimBy: number; issuedBy: { id: string; label: string } | null; members: Array<{ id: string; label: string; device: string; created: number; self: boolean; pending?: boolean; code?: string }> }>, Array<{ event: string; at: number; role?: Role; label?: string; by?: string; device?: string; grant?: string; seat?: string; member?: string }>];
   if (view.sealed) {
     if (owner) await sealNames();
@@ -1407,6 +1427,9 @@ async function manage() {
   }
   const day = (t: number) => new Date(t).toLocaleDateString("ja");
   const undo = owner && revisable() && view.state !== "frozen" && await api("undo").then(() => true, () => false);
+  // While the lists were read, another dialog was drawn (完全に削除 pressed) or the one this was asked from was closed: drawing now
+  // would replace that one or open it again. Not the close event's count: it comes after close() returns, so after a 共有・管理 pressed at once.
+  if (run !== manageRun || shown && !dialog.open) return;
   modal(owner ? "招待とメンバー、旅の終わり" : "閲覧者の招待", `${owner ? "" : "<p>あなたが出した閲覧者の招待です。失効できるのは自分が出した招待だけです。</p>"}<p>招待リンクは人数分の席を持ち、開いたブラウザを1席ずつ登録します。定員に達するか受付期限を過ぎたリンクは使えなくなり、登録済みのブラウザだけが入れます。登録したブラウザの鍵（Cookie）が他人に渡ると、その人も入れます。</p><p>招待の発行・失効${owner ? "、共有終了、削除、期限の変更" : ""}の前に、この端末のパスキーで本人確認します（5 分間有効）。</p>${location.protocol === "http:" ? '<p class="warning">現在はこのPC内のローカル版です。別の端末から使うには、HTTPSの公開ホストへ配置してください。</p>' : ""}<form data-form="grant"><div class="form-grid"><label>権限<select name="role">${owner ? '<option value="participant">参加者：候補・チェック・思い出</option><option value="viewer">閲覧者：見るだけ</option><option value="editor">編集者：旅程も編集</option>' : '<option value="viewer">閲覧者：見るだけ</option>'}</select></label><label>リンク名（任意）<input name="label" maxlength="80" placeholder="空欄なら自動で付けます"></label><label>人数（席）<input name="seats" type="number" required min="1" max="50" value="1"></label><label>受付期限（日）<input name="claimDays" type="number" required min="1" max="30" value="3"></label>${owner ? '<label>参加の承認<select name="approval"><option value="auto">自動で参加（既定）</option><option value="owner">オーナーが確認コードで承認</option></select></label>' : ""}</div>${owner ? '<p class="muted">機密度の高い旅行向け。参加者の画面に出る 6 桁のコードを LINE などで聞いて照合します。</p>' : ""}<button class="primary" ${view.state === "frozen" ? "disabled" : ""}>招待リンクを発行</button></form><div class="grant-list">${grants.map(g => `<div class="grant"><div><strong>${e(g.label)}</strong><small>${roleNames[g.role]} · ${g.revoked ? "失効済み" : `登録 ${g.claimed}/${g.seats}席 · ${g.claimed >= g.seats ? "定員に達し受付終了" : g.claimBy <= Date.now() ? "受付期限切れ" : "受付 " + day(g.claimBy) + "まで"}`}</small>${owner ? `<small>発行: ${e(g.issuedBy?.label ?? "オーナー（発行時）")}</small>` : ""}${g.revoked ? "" : g.members.map(m => `<small class="member">${e(m.label)}${m.self ? "（この端末）" : ""} · ${e(m.device)} · ${day(m.created)}登録 ${m.pending ? `<strong>承認待ち · コード <span class="code">${e(m.code ?? "")}</span></strong> ${owner ? button("承認", "approve-member", "quiet", `data-id="${m.id}"`) + button("拒否", "reject-member", "quiet danger-text", `data-id="${m.id}"`) : ""}` : ""}${owner ? button("名前", "rename-member", "quiet", `data-id="${m.id}" data-label="${e(m.label)}"`) : ""}${g.role !== "owner" ? button("失効", "revoke-member", "quiet danger-text", `data-id="${m.id}"`) : ""}</small>`).join("")}</div>${!g.revoked && view.state !== "frozen" ? `<div>${button("交換", "rotate", "quiet", `data-id="${g.id}" data-role="${g.role}" data-label="${e(g.label)}"`)}${g.role !== "owner" ? button("失効", "revoke", "quiet danger-text", `data-id="${g.id}"`) : ""}</div>` : ""}</div>`).join("")}</div>${owner ? `<details class="history"><summary>招待とオーナーの履歴（${history.length} 件）</summary>${history.length ? `<ol>${history.map(a => `<li>${[`${day(a.at)} ${new Date(a.at).toLocaleTimeString("ja", { hour: "2-digit", minute: "2-digit" })}`, e(historyNames[a.event] ?? a.event), a.role ? roleNames[a.role] : "", a.label ? e(a.label) : "", a.by ? `${e(a.by)}${a.device ? `（${e(a.device)}）` : ""}` : ""].filter(Boolean).join(" · ")}</li>`).join("")}</ol>` : "<p>まだありません</p>"}</details><hr><p>自動削除：${e(new Date(view.spec.lifecycle.purgeAt).toLocaleString("ja"))}<br>削除前に『旅を保存』で書き出してください。</p>${revisable() ? "" : `<p class="muted" data-sealed="manage">${notRevisable}</p>`}<div class="admin-actions">${button("旅を保存", "save", "secondary")}${revisable() ? button("チャットで直す", "revise", "secondary", view.state === "frozen" ? "disabled" : "") : ""}${undo ? button("1 つ前に戻す", "undo", "secondary") : ""}${button("設定・期限の変更", "settings", "secondary", view.state === "frozen" ? "disabled" : "")}${button("共有を終了", "freeze", "secondary", view.state === "frozen" ? "disabled" : "")}${button("完全に削除", "purge", "danger")}</div><p class="muted">共有終了はオーナー以外のリンクを失効させます。完全削除すると元に戻せません。</p>` : ""}`);
 }
 function showLink(url: string, owner = false, openHere = owner) { modal(owner ? "オーナーとして使う端末で開いてください" : "招待リンクができました", `<p>${owner ? "このリンクは最初に開いて登録した1つのブラウザだけをオーナーにします。後から再表示できません。3日以内に、普段使う端末のブラウザで開いてください。" : "メンバーに送ってください。開いたブラウザが1席ずつ登録され、定員に達するか受付期限を過ぎると使えなくなります。"}</p><label>リンク<input id="issued-link" readonly value="${e(url)}"></label><div class="admin-actions">${button("コピー", "copy", "primary")}${openHere ? `<a class="button secondary" href="${e(url)}">カプセルを開く</a>` : ""}</div>`); }
@@ -1541,6 +1564,7 @@ document.addEventListener("click", async event => {
     if (action === "assist-key-delete" && confirm("登録した API キーを削除しますか？もう一度登録すれば、また使えます。")) { await api("/v1/account/key", "DELETE"); await creationHome(); notice("API キーを削除しました。"); }
     if (action === "passkey-register") try { await registerPasskey(); } catch (err) { passkeyError(err); }
     if (action === "passkey-login") try { await passkeyLogin(); } catch (err) { passkeyError(err); }
+    if (action === "restore-key") try { await restoreKeyWithPasskey(); } catch (err) { passkeyError(err); }
     if (action === "creator-register") try { await creatorRegister(); } catch (err) { passkeyError(err); }
     // One message for every failure, as the host gives: a trip's passkey picked by mistake reads the same as an unknown one.
     if (action === "creator-login") try { await creatorLogin(); } catch (err) { if ((err as Error).name === "NotAllowedError") passkeyError(err); else notice("サインインできませんでした", true); }

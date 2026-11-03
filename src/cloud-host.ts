@@ -14,7 +14,9 @@ import type { MediaStore } from "./media-store";
 
 // A Grant is an invite: its link can be redeemed `seats` times until `claimBy`. Each redemption binds one browser as a Session (member).
 // `issuedBy`: the member (Session id) who handed it out; none for one handed out from outside the trip (publishing, recover).
-type Grant = { id: string; role: Role; digest: string; label: string; expires: number; revoked: number | null; created: number; lastUsed: number | null; seats: number; claimed: number; claimBy: number; issuedBy?: string; approval?: "auto" | "owner" };
+// The trip key wrapped for an invite link, opened only with the secret after the link's `#` (spec「5.1 旅行の鍵と受け渡し」). Of one generation: replacing the key drops it.
+type LinkKey = { generation: number; wrapped: string; owner: { seat: string; x25519: string; ed25519: string } };
+type Grant = { id: string; role: Role; digest: string; label: string; expires: number; revoked: number | null; created: number; lastUsed: number | null; seats: number; claimed: number; claimBy: number; linkKey?: LinkKey; issuedBy?: string; approval?: "auto" | "owner" };
 // Which invites each role may hand out: none stronger than its own. The one who handed an invite out and the owner may revoke it.
 const canIssue: Record<Role, Role[]> = { owner: ["owner", "editor", "participant", "viewer"], editor: ["viewer"], participant: [], viewer: [] };
 // `verifiedUntil`: until when this session's owner actions count as checked by its passkey (none: not checked).
@@ -27,7 +29,7 @@ const canIssue: Record<Role, Role[]> = { owner: ["owner", "editor", "participant
 // seatKey: a seat whose pair is made again brings its edges signed anew, and `since`, its previous public keys and their
 // signature over the new ones (docs/ephemeral-trip-capsule.md「5.5 旅行の鍵を替える」).
 // `rekey`: the owner seat's signature over this wrap, when the owner's browser replaced the trip key (POST rekey, spec「5.5 旅行の鍵を替える」).
-type SeatKey = { x25519: string; ed25519: string; generation: number; wrapped: string; ephemeral: string; secret?: { x25519: string; ed25519: string; passkey: string }; edges?: Array<{ seat: string; signature: string }>; since?: { x25519: string; ed25519: string; signature: string }; rekey?: { seat: string; signature: string } };
+type SeatKey = { x25519: string; ed25519: string; generation: number; wrapped: string; ephemeral: string; linked?: boolean; secret?: { x25519: string; ed25519: string; passkey: string }; edges?: Array<{ seat: string; signature: string }>; since?: { x25519: string; ed25519: string; signature: string }; rekey?: { seat: string; signature: string } };
 // `handoff`: the values of a seat waiting for the trip key, in the order of docs/ephemeral-trip-capsule.md「5.1 旅行の鍵と受け渡し」 (the commitment,
 // then the giver's, then the member's own). Every one is public; the host only holds them and checks who may write which.
 type Handoff = { attempt: string; commitment: string; giver?: { seat: string; ephemeral: string; x25519: string; ed25519: string }; reveal?: { x25519: string; ed25519: string; nonce: string } };
@@ -93,6 +95,8 @@ type Stage = { prefix: string; blob: string; names: string[]; done: boolean };
 // A kit refuses with its own Refused (src/kit.ts); the host's own refusals also carry a reason for the log and the seat's fate.
 class Fault extends Refused { constructor(status: number, message: string, public reason?: string, public seat?: "gone") { super(status, message); } }
 function fail(status: number, text: string): never { throw new Fault(status, text); }
+// A seat holds the key when it holds the present generation: one left out when the key was replaced waits again (spec「5.5 旅行の鍵を替える」).
+function keyedSeat(c: Capsule, s: Session) { return s.seatKey?.generation === (c.sealed?.generation ?? 1); }
 const token = () => randomBytes(32).toString("base64url");
 // A generation: the job row and the creator's running row are kept past its deadline only briefly; the host-wide slots (2) are rows too.
 const ASSIST_DEADLINE = 360_000, ASSIST_SLOTS = 2;
@@ -133,6 +137,7 @@ const nonce = z.string().regex(/^[A-Za-z0-9_-]{22}$/);  // 16 bytes
 const signature = z.string().regex(/^[A-Za-z0-9_-]{86}$/);  // 64 bytes
 const attempt = z.string().regex(/^[a-f0-9]{32}$/);
 const seatId = z.string().min(1).max(64);
+const inviteSecret = z.string().min(32).max(100);
 const keysOperation = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("seat"), x25519: rawKey, ed25519: rawKey, ephemeral: rawKey, generation: z.number().int().min(1), wrapped: sealed(200),
@@ -148,6 +153,9 @@ const keysOperation = z.discriminatedUnion("type", [
   z.object({ type: z.literal("abandon"), seat: seatId.optional(), attempt }).strict(),  // no seat: the caller's own attempt
   // The owner keeps the trip key after an owner seat was handed over (spec「5.5 旅行の鍵を替える」).
   z.object({ type: z.literal("keep") }).strict(),
+  // The wrapped key of an invite link, read by a seat that opened the link, and that seat's own keys put with it (spec「5.1 旅行の鍵と受け渡し」).
+  z.object({ type: z.literal("link"), secret: inviteSecret }).strict(),
+  z.object({ type: z.literal("seat-link"), secret: inviteSecret, x25519: rawKey, ed25519: rawKey, ephemeral: rawKey, generation: z.number().int(), wrapped: sealed(200) }).strict(),
 ]);
 const EDGES = 200;
 // Every ciphertext in what a request brings, for the check that it is of the trip key's present generation (spec「5.5 旅行の鍵を替える」).
@@ -184,7 +192,8 @@ const photoOperations = z.discriminatedUnion("type", [
 ]);
 const grantInput = z.object({ role: z.enum(["owner", "editor", "participant", "viewer"]), label: author.default("招待リンク"), expiresAt: isoTime, seats: z.number().int().min(1).max(50).default(1), claimDays: z.number().int().min(1).max(30).default(3), confirm: z.literal(true), rotate: z.string().optional(), approval: z.enum(["auto", "owner"]).optional() }).strict();
 // A sealed trip's invite is named in ciphertext sealed against the id the browser chose, or with one of the host's own names.
-const sealedGrantInput = grantInput.extend({ id: z.string().regex(/^[0-9a-f]{32}$/), label: z.union([cipher(CIPHER.short), z.enum(["自分用", "招待リンク"])]).default("招待リンク") });
+const linkKey = z.object({ generation: z.number().int(), wrapped: sealed(200), owner: z.object({ seat: seatId, x25519: rawKey, ed25519: rawKey }).strict() }).strict();
+const sealedGrantInput = grantInput.extend({ linkKey: linkKey.optional(), id: z.string().regex(/^[0-9a-f]{32}$/), label: z.union([cipher(CIPHER.short), z.enum(["自分用", "招待リンク"])]).default("招待リンク") });
 
 // Whether Anthropic accepts the key: listing models costs nothing. A key it refuses is false; an outage throws.
 async function anthropicAccepts(apiKey: string) {
@@ -347,6 +356,12 @@ export class CloudHost {
       throw gone ? new Fault(401, "この端末の登録は失効したか、期限が切れました", "seat-gone", "gone") : new Fault(401, "この端末の登録は失効したか、期限が切れました");
     }
     return { grant: g, member: s, secret: value };
+  }
+  // What opens a link's key vouches for the owner's keys it names, so they are the owner seat's as they stand, of this generation.
+  checkLink(c: Capsule, l: LinkKey) {
+    if (l.generation !== c.sealed?.generation) fail(400, "鍵の世代を確認してください");
+    const o = c.sessions.find(s => s.id === l.owner.seat);
+    if (c.grants.find(g => g.id === o?.grantId)?.role !== "owner" || o?.seatKey?.x25519 !== l.owner.x25519 || o.seatKey.ed25519 !== l.owner.ed25519) fail(400, "オーナーの鍵を確認してください");
   }
   idle(s: Session) { return (s.seen ?? this.clock()) + IDLE <= this.clock(); }
   leave(c: Capsule, gone: Session[]) { const added = gone.map(s => s.digest).filter(d => !c.left?.includes(d)); if (added.length) c.left = [...c.left ?? [], ...added].slice(-LEFT); }
@@ -864,7 +879,7 @@ export class CloudHost {
         }
         if (action === "grants" && req.method === "GET") {
           issuer(); const label = (sid: string) => c.sessions.find(s => s.id === sid)?.label ?? "（失効したメンバー）";
-          return Response.json(c.grants.filter(mine).map(({ digest, issuedBy, ...safe }) => ({ ...safe, issuedBy: issuedBy ? { id: issuedBy, label: label(issuedBy) } : null, members: c.sessions.filter(s => s.grantId === safe.id).map(({ digest, passkey, privateKey, seatKey, handoff, assistKey, assistWrapped, ...m }) => ({ ...m, passkey: Boolean(passkey), publicKey: seatKey ? { x25519: seatKey.x25519, ed25519: seatKey.ed25519 } : null, self: m.id === member.id })) })));
+          return Response.json(c.grants.filter(mine).map(({ digest, issuedBy, linkKey, ...safe }) => ({ ...safe, issuedBy: issuedBy ? { id: issuedBy, label: label(issuedBy) } : null, carriesKey: Boolean(c.sealed && linkKey && linkKey.generation === c.sealed.generation), members: c.sessions.filter(s => s.grantId === safe.id).map(s => { const { digest, passkey, privateKey, seatKey, handoff, assistKey, assistWrapped, ...m } = s; return { ...m, passkey: Boolean(passkey), publicKey: seatKey ? { x25519: seatKey.x25519, ed25519: seatKey.ed25519 } : null, self: m.id === member.id, keyed: Boolean(c.sealed) && keyedSeat(c, s) }; }) })));
         }
         // Newest first. The record is not written to by reading it, as with GET grants.
         if (action === "history" && req.method === "GET") { owner(); return Response.json(c.audit.filter(a => HISTORY.includes(a.event)).reverse().map(({ event, at, role, label, by, device, grant, seat, member }) => ({ event, at, role, label, by, device, grant, seat, member }))); }
@@ -889,12 +904,11 @@ export class CloudHost {
         // Every member reads every point; which seat left it is told only as whether it was this one.
         const footprints = () => (c.footprints ?? []).map(p => ({ id: p.id, at: p.at, ...("point" in p ? { point: p.point } : { lat: p.lat, lng: p.lng, accuracy: p.accuracy }), by: p.by, mine: p.seat === member.id, auto: Boolean(p.auto) }));
         // Only a seat that holds the key is told who waits for it; it is any role's to give, so it is not the grants list's.
-        // A seat holds the key when it holds the present generation: one left out when the key was replaced waits again (spec「5.5 旅行の鍵を替える」).
-        const generation = c.sealed?.generation ?? 1, holds = (s: Session) => s.seatKey?.generation === generation;
+        const holds = (s: Session) => keyedSeat(c, s);
         const waiting = () => member.seatKey ? c.sessions.filter(s => !holds(s) && !s.pending && s.id !== member.id).map(s => ({ id: s.id, label: s.label, handoff: s.handoff ?? null })) : [];
         // The public values of every seat holding a key, for a browser to walk the edges (src/trip-keys.ts reachableSeats): told
         // only to a seat that holds one, as `waiting` is.
-        const seats = () => c.sessions.filter(s => s.seatKey && !s.pending).map(s => ({ id: s.id, role: c.grants.find(g => g.id === s.grantId)?.role, x25519: s.seatKey!.x25519, ed25519: s.seatKey!.ed25519, edges: s.seatKey!.edges ?? [], ...s.seatKey!.since && { since: s.seatKey!.since } }));
+        const seats = () => c.sessions.filter(s => s.seatKey && !s.pending).map(s => ({ id: s.id, role: c.grants.find(g => g.id === s.grantId)?.role, x25519: s.seatKey!.x25519, ed25519: s.seatKey!.ed25519, edges: s.seatKey!.edges ?? [], ...s.seatKey!.since && { since: s.seatKey!.since }, ...s.seatKey!.linked && { linked: true } }));
         // Once the key is replaced, ciphertext of another generation is not written: a member who left holds the older key. One
         // without a generation is not of the trip's form, and is refused by the checks below (400).
         if (c.sealed && write && ["document", "spec", "footprints", "media", "members", "grants", "revise", "undo"].includes(action) && ciphers(input).some(v => /^v1\.\d+\./.test(v) && !v.startsWith(`v1.${c.sealed!.generation}.`))) throw new Fault(409, "旅行の鍵が替わりました。開き直してください", "generation");
@@ -918,6 +932,7 @@ export class CloudHost {
           const approval = v.approval ?? (v.rotate ? c.grants.find(g => g.id === v.rotate)?.approval : undefined) ?? "auto";
           if (v.role === "owner" && approval === "owner") fail(400, "オーナー招待は承認を使えません");
           if (v.role === "owner" && v.seats !== 1) fail(400, "オーナー招待は1席です");
+          if (v.linkKey) this.checkLink(c, v.linkKey);
           if (v.rotate) {
             const old = c.grants.find(g => g.id === v.rotate); if (!old || old.role !== v.role) fail(400, "交換対象が一致しません"); if (!mine(old)) fail(403, "交換できるのはオーナーと、この招待を出した人だけです");
             // An owner seat handed over must not take the last copy of the trip key with it (spec「5.5 旅行の鍵を替える」).
@@ -926,6 +941,7 @@ export class CloudHost {
           }
           entry = { event: v.rotate ? "rotate" : "grants", role: v.role, ...named({ grant: grantId, seat: member.id }, { label: v.label, by: member.label }), device: member.device };
           response = Response.json(this.issue(c, id, v.role, v.label, +new Date(v.expiresAt), v.seats, this.clock() + v.claimDays * 86400000, member.id, approval, grantId), { status: 201 });
+          if (v.linkKey) c.grants.find(g => g.id === grantId)!.linkKey = v.linkKey;
         } else if (action === "revoke" && req.method === "POST") {
           issuer(); this.verified(member); const v = z.object({ id: z.string().optional(), member: z.string().optional(), confirm: z.literal(true) }).strict().parse(input);
           if (v.member) {
@@ -1019,7 +1035,8 @@ export class CloudHost {
         } else if (action === "keys" && req.method === "PATCH") {
           // The seat's own keys (docs/ephemeral-trip-capsule.md「5.1 旅行の鍵と受け渡し」). Not a change to the plan, so no If-Match and no new revision, and
           // taken after sharing ends too: it is the key to read with. The first key of a trip is the owner's, once; a seat that has
-          // keys puts a new set only with its passkey checked just now, as a browser that took its seat key from the passkey does.
+          // keys puts a new set only with its passkey checked just now, as a browser that took its seat key from the passkey does
+          // (a member's seat by an invite link too, below: it trusts nobody's keys but what the link opened).
           const op = keysOperation.parse(input);
           if (op.type === "keep") {
             // The owner chose to keep the key after an owner seat was handed over: that question is not asked again. A seat
@@ -1027,6 +1044,21 @@ export class CloudHost {
             owner(); this.verified(member);
             c.departed = c.departed?.filter(d => d.why !== "owner"); if (!c.departed?.length) delete c.departed;
             response = Response.json({ ok: true });
+          } else if (op.type === "link" || op.type === "seat-link") {
+            // The seat has passed an invite's seats, approval and checks already, its own or another's: here the link only has to
+            // be alive, of this generation, past its seats and its time to take them too. A seat without a key (one taken before
+            // the trip was sealed, a browser that lost its storage) comes this way. An owner seat's keys are what other seats
+            // trust and what its passkey wraps: they are replaced only as `seat` replaces them.
+            if (grant.role === "owner" && member.seatKey) fail(409, "オーナーの席の鍵はリンクでは受け取れません");
+            const digest = this.digest(op.secret), by = c.grants.find(g => timingSafeEqual(Buffer.from(g.digest, "hex"), Buffer.from(digest, "hex")));
+            if (!by || by.revoked !== null || by.expires <= this.clock() || !by.linkKey || by.linkKey.generation !== c.sealed?.generation) fail(409, "このリンクでは鍵を受け取れません。オーナーに新しいリンクを頼んでください");
+            if (op.type === "link") response = Response.json({ ok: true, linkKey: by.linkKey });
+            else {
+              if (op.generation !== by.linkKey.generation) fail(400, "鍵の世代を確認してください");
+              const { type: _, secret: __, ...pub } = op;
+              member.seatKey = { ...pub, linked: true }; delete member.handoff;
+              response = Response.json({ ok: true, seatKey: member.seatKey });
+            }
           } else if (op.type !== "seat") {
             // The handoff (spec「5.1 旅行の鍵と受け渡し」). The host checks who may write what and that the values have the form of keys; the
             // commitment and the codes are the two screens' to check, so none is computed here.
@@ -1079,7 +1111,7 @@ export class CloudHost {
           if (op.generation !== (member.seatKey?.generation ?? 1)) fail(400, "鍵の世代を確認してください");
           if (op.secret) { if (!member.passkey) fail(400, "パスキーを登録してください"); this.verified(member); }
           const { type: _, secret, ...pub } = op;
-          member.seatKey = { ...pub, ...(secret && member.passkey ? { secret: { ...secret, passkey: member.passkey.id } } : {}) };
+          member.seatKey = { ...pub, ...member.seatKey?.linked && { linked: true }, ...(secret && member.passkey ? { secret: { ...secret, passkey: member.passkey.id } } : {}) };
           delete member.handoff;
           response = Response.json({ ok: true, seatKey: member.seatKey });
           }
@@ -1201,7 +1233,7 @@ export class CloudHost {
           const v = z.object({ generation: z.number().int(), spec: z.unknown(), document: z.unknown(), footprints: z.array(z.object({ id: z.string(), point: cipher(200), by: cipher(CIPHER.short) }).strict()).max(FOOTPRINTS),
             media: z.array(z.object({ id: z.string(), key: cipher(200), location: cipher(300).optional(), caption: cipher(CIPHER.short).optional() }).strict()).max(PHOTO_LIMITS.count).default([]),
             members: z.array(z.object({ id: z.string(), label: name }).strict()).max(200), grants: z.array(z.object({ id: z.string(), label: name }).strict()).max(200),
-            seats: z.array(z.object({ seat: seatId, wrapped: sealed(200), ephemeral: rawKey, signature }).strict()).min(1).max(200), confirm: z.literal(true) }).strict().parse(input);
+            seats: z.array(z.object({ seat: seatId, wrapped: sealed(200), ephemeral: rawKey, signature }).strict()).min(1).max(200), links: z.array(z.object({ grant: z.string(), key: linkKey }).strict()).max(50).default([]), confirm: z.literal(true) }).strict().parse(input);
           const generation = c.sealed.generation + 1;
           if (v.generation !== generation) fail(400, "鍵の世代を確認してください");
           let next: { spec: Envelope; document: Versioned }; try { next = kit.validate(v.spec, { ...(v.document as object), revision: c.document.revision }, c.created, true); } catch { fail(400, "旅程の形を確認してください"); }
@@ -1225,6 +1257,10 @@ export class CloudHost {
           for (const g of v.grants) c.grants.find(x => x.id === g.id)!.label = g.label;
           for (const x of to) x.s!.seatKey = { ...x.s!.seatKey!, generation, wrapped: x.wrapped, ephemeral: x.ephemeral, rekey: { seat: member.id, signature: x.signature } };
           c.sealed = { generation }; delete c.departed; delete c.previous;
+          // A link left unused holds the old key: whoever waits gets a new link, and a seat that left cannot use its own.
+          for (const g of c.grants) delete g.linkKey;
+          // Except a link issued just now, as the replaced invite it follows set this replacing going: wrapped anew by the owner's browser.
+          for (const l of v.links) { const g = c.grants.find(x => x.id === l.grant) ?? fail(400, "招待を確認してください"); this.checkLink(c, l.key); g.linkKey = l.key; }
           response = Response.json({ revision: c.document.revision });
         } else if (action === "spec" && req.method === "PATCH") {
           owner(); this.verified(member); if (state === "frozen") fail(403, "共有終了後は変更できません"); this.match(req, c);

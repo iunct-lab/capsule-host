@@ -34,7 +34,7 @@ import { photosPageShown } from "./moments";
 // The scenes come in groups, each on a disposable trip of its own that it opens with what it needs (`openTrip()` and, in the
 // group, the invites, passkeys, handoffs and the seal) and removes when it ends or fails (`closeTrip()`): `bun run verify:ui
 // <group>` runs one, and with no name every group runs in this order. A group prints its seconds when it passes.
-const groups: Record<string, () => Promise<void>> = { plan, members, seat, passkey, sealed, creator };
+const groups: Record<string, () => Promise<void>> = { plan, members, seat, linked, passkey, sealed, creator };
 const chosen = process.argv.slice(2);
 if (chosen.some(name => !Object.hasOwn(groups, name))) { console.error(`知らない群です: ${chosen.filter(name => !Object.hasOwn(groups, name)).join(", ")}。使える群: ${Object.keys(groups).join(", ")}`); process.exit(1); }
 const origin = process.env.CAPSULE_ORIGIN ?? "http://localhost:47840";
@@ -68,11 +68,11 @@ if (!endpoint) throw new Error("Chrome did not start");
 const ws = new WebSocket(endpoint); await new Promise((resolve, reject) => { ws.addEventListener("open", resolve, { once: true }); ws.addEventListener("error", () => reject(new Error("could not connect to Chrome")), { once: true }); });
 let seq = 0; const waiting = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>();
 // Every URL each page asked for, by the page's session (Network.requestWillBeSent), for the checks that no other origin is asked.
-const asked = new Map<string, string[]>();
+const asked = new Map<string, string[]>(), sent = new Map<string, string[]>();
 // A request a page's Fetch domain stopped, handed to that page's handler (the sealed trip's 「ここで直す」 answers Anthropic's part, #787).
 const paused = new Map<string, (params: { requestId: string; request: { url: string; method: string; headers: Record<string, string>; postData?: string } }) => void>();
 ws.addEventListener("message", m => { const d = JSON.parse(String(m.data)), w = waiting.get(d.id); if (w) { waiting.delete(d.id); d.error ? w.reject(new Error(d.error.message)) : w.resolve(d.result); }
-  if (d.method === "Network.requestWillBeSent" && d.sessionId) asked.set(d.sessionId, [...asked.get(d.sessionId) ?? [], d.params.request.url]);
+  if (d.method === "Network.requestWillBeSent" && d.sessionId) { asked.set(d.sessionId, [...asked.get(d.sessionId) ?? [], d.params.request.url]); if (d.params.request.postData) sent.set(d.sessionId, [...sent.get(d.sessionId) ?? [], d.params.request.postData]); }
   if (d.method === "Fetch.requestPaused" && d.sessionId) paused.get(d.sessionId)?.(d.params); });
 // A browser that went away must not leave a call waiting for ever: the cleanup below still has to run and name the capsule.
 const dropAll = (why: string) => { for (const [id, w] of waiting) { waiting.delete(id); w.reject(new Error(why)); } };
@@ -170,10 +170,11 @@ const fromPage = async (action: string, body: object, method = "POST") => {
 // The OS's passkey checks and creations are counted too: the authenticator answers them silently, so a count is the only way
 // to see they were asked.
 const answerYes = `(() => { window.asked ??= []; window.confirm = m => { window.asked.push(m); return true; }; window.checks = 0; window.made = 0; const get = navigator.credentials.get.bind(navigator.credentials); navigator.credentials.get = o => { window.checks++; return get(o); }; const create = navigator.credentials.create.bind(navigator.credentials); navigator.credentials.create = o => { window.made++; return create(o); }; return true; })()`;
-const invite = async (role = "participant") => {
+// The scenes of the code handoff take the link without its key (`withKey` false).
+const invite = async (role = "participant", withKey = false) => {
   await owner!.evaluate(`document.querySelector('[data-action="manage"]').click()`); await owner!.until(`!!document.querySelector('#dialog form[data-form="grant"]')`);
   await owner!.evaluate(`(() => { const f = document.querySelector('#dialog form[data-form="grant"]'); f.elements.namedItem("role").value = "${role}"; f.requestSubmit(); return true; })()`); await owner!.until(`!!document.querySelector("#issued-link")`);
-  const url = await owner!.evaluate(`document.querySelector("#issued-link").value`) as string; await owner!.evaluate(`document.querySelector('#dialog [data-action="close"]').click()`); return url;
+  const url = await owner!.evaluate(`document.querySelector("#issued-link").value`) as string; await owner!.evaluate(`document.querySelector('#dialog [data-action="close"]').click()`); return withKey ? url : url.replace(/&t=[^&]*/, "");
 };
 const openSave = async (p: typeof owner, from = "") => { await p!.evaluate(`document.querySelector('${from}[data-action="save"]').click()`); await p!.until(`!!document.querySelector('#dialog [data-action="copy-markdown"]')`); };
 const manageOpen = async () => { await owner!.evaluate(`document.querySelector('[data-action="manage"]').click()`); await owner!.until(`!!document.querySelector("#dialog details.history")`); };
@@ -281,7 +282,7 @@ async function openedName(p: NonNullable<typeof owner>, kind: "member" | "grant"
 }
 // The trip key handed from a page that holds it to a member's, the two comparing their codes (#703), as (v) (c) does.
 async function handOver(giver: NonNullable<typeof owner>, member: NonNullable<typeof owner>) {
-  await member.cdp("Page.reload"); await member.until(`document.querySelector('[data-sealed="locked"]')?.textContent === "オーナーかメンバーから鍵を受け取ってください"`, 20000);
+  await member.cdp("Page.reload"); await member.until(`document.querySelector('[data-sealed="locked"]')?.textContent === "この旅行を読むには鍵が要ります。オーナーから届くリンクを、このブラウザで開いてください"`, 20000);
   await member.evaluate(`document.querySelector('[data-action="receive-key"]').click()`); await member.until(`document.querySelector("#dialog")?.textContent.includes("「渡す」を押してもらってください")`, 20000);
   await giver.cdp("Page.reload"); await giver.until(`!!document.querySelector("[data-handoff-waiting]")`, 20000); await giver.evaluate(answerYes);
   await giver.evaluate(`document.querySelector('footer [data-action="give-key"]').click()`);
@@ -1056,6 +1057,15 @@ async function members() {
   const editorName = await openedName(editor, "member", issuer.id, issuer.label);
   await owner.evaluate(`document.querySelector('[data-action="manage"]').click()`); await owner.until(`!!document.querySelector("#dialog details.history")`);
   assert.equal(await owner.evaluate(`${editorInvite}.textContent.includes(${JSON.stringify(`発行: ${editorName}`)})`), true);
+  // (m2, #1094) Each seat says whether it holds the trip key and the day it was last opened; each invite, the seats its 失効 shuts
+  // out. The editor's own invite has none yet. The question before an invite's 失効 names its seats (answered no here). At 390px.
+  const seated = `[...document.querySelectorAll("#dialog .grant")].find(g => g.querySelector("small").textContent.startsWith("参加者") && g.querySelectorAll(".member").length === 1)`;
+  assert.equal(await owner.evaluate(`${editorInvite}.querySelector("[data-revoke-note]").textContent`), "失効しても入れなくなる席はありません");
+  assert.deepEqual(await owner.evaluate(`(() => { const m = ${seated}.querySelector(".member"); return [m.querySelector("[data-seat-key]")?.dataset.seatKey, /^最後に開いた日 \\d{1,2}\\/\\d{1,2}$/.test(m.querySelector("[data-seen]")?.textContent ?? ""), ${seated}.querySelector("[data-revoke-note]").textContent]; })()`), ["keyed", true, "失効すると 1 席（うち鍵あり 1 席）が入れなくなります"]);
+  await owner.evaluate(`(() => { window.kept = window.confirm; window.revokeAsked = []; window.confirm = m => { window.revokeAsked.push(m); return false; }; ${seated}.querySelector('[data-action="revoke"]').click(); return true; })()`);
+  await owner.until(`window.revokeAsked.length === 1`); const askedRevoke = await owner.evaluate(`(() => { window.confirm = window.kept; return window.revokeAsked[0]; })()`) as string;
+  assert.match(askedRevoke, /^この招待リンクと、そこから登録した全員を失効させますか？\n失効する席（1 席）:\n・.+ · 鍵あり · 最後に開いた日 \d{1,2}\/\d{1,2}$/);
+  assert.equal(await owner.evaluate(`(() => { const d = document.querySelector("#dialog"); return d.scrollWidth <= d.clientWidth && !!${seated}; })()`), true, "共有・管理 runs off the side at 390px, or the answer no revoked the invite");
   await owner.evaluate(`document.querySelector('#dialog [data-action="close"]').click()`);
   // A revoked invite leaves the list: the host drops revoked grants from what it keeps.
   await editor.evaluate(`${editorInvite}.querySelector('[data-action="revoke"]').click()`); await editor.until(`!!document.querySelector('#dialog form[data-form="grant"]') && !${editorInvite}`);
@@ -1500,6 +1510,80 @@ async function seat() {
   assert.equal(await owner.evaluate(`document.body.textContent.includes("自分だけの予定の目印")`), false);
   await member.close(); await dispose(memberContext);
   console.log("Seat verification passed: a participant's page saying 鍵を待っています, then 鍵を受け取る and the owner's 渡す (the codes typed into each other's screen, a wrong one putting nothing on the seat and a new commitment on trying again, then the key held with an edge on both seats), a participant signing out from the footer (the confirm names the way back, the top page no longer lists the trip, the trip says why it cannot be opened) and coming back with 「パスキーで戻る」 (with the storage lost too: the plan, the own entry and a footprint drawn without a reload), a participant's browser that lost its storage taking the key back with 「パスキーで鍵を取り戻す」 (cancelled: the page and the seat's key unchanged; then the plan, the own entry and a footprint drawn without a reload), a participant's own plan among the day's items (marked 自分だけ, no grip) and diary written, changed and removed, revised with a chat (the note that the chat reads the copy, the unreadable count, the diff before anything is sent, one sealed apply changing a plan and a diary entry and adding a plan, a viewer opening it with a first passkey), sealed by the page (a memo key from the passkey's PRF, no words sent, read again after a reload), unreadable ones (key and passkey gone) marked and removable, none of it shown to the owner.");
+}
+// #1074: an invite link opened in a new browser reads the sealed trip at once, and `t` goes nowhere. A seat with no key and a seat
+// that lost its storage read it by opening a link, with no new seat. A seat that took the key by a link takes the next key too.
+// #1086: an owner whose passkey is older than the seat's keys (the keys kept from reaching the host until it is registered). The check
+// past its five minutes wraps them, the one before sealing or (`later`) one after: the browser that loses everything reads by the passkey.
+async function keysWrappedByCheck(later: boolean) {
+  await nextMinute();
+  const created = await fetch(origin + "/v1/publish", { method: "POST", headers: { Origin: origin, "Content-Type": "application/json" }, body: JSON.stringify({ ...seed, confirm: true }) }); assert.equal(created.status, 201);
+  const c = await created.json() as { id: string; url: string }; capsuleId = c.id;
+  const context = (await send("Target.createBrowserContext")).browserContextId as string, p = await page(390, 844, true, context); owner = p;
+  await p.cdp("Fetch.enable", { patterns: [{ urlPattern: "*/keys*" }] });
+  paused.set(p.session, ({ requestId, request }) => { void (request.method === "PATCH" ? p.cdp("Fetch.failRequest", { requestId, errorReason: "Failed" }) : p.cdp("Fetch.continueRequest", { requestId })); });
+  await p.join(c.url); await sleep(600);
+  await p.cdp("WebAuthn.enable"); await p.cdp("WebAuthn.addVirtualAuthenticator", { options: { protocol: "ctap2", transport: "internal", hasResidentKey: true, hasUserVerification: true, isUserVerified: true, hasPrf: true } });
+  await p.evaluate(answerYes); await p.evaluate(`document.querySelector('footer [data-action="passkey-register"]').click()`); await p.until(`(${message} ?? "").startsWith("パスキーを登録しました")`, 20000);
+  await p.cdp("Fetch.disable"); paused.delete(p.session); await p.reload(); await p.evaluate(answerYes); await p.until(`!!document.querySelector('[data-trip-key="held"]')`, 15000);
+  const wrapped = () => p.evaluate(`(async () => !!(await (await vfetch("/v1/c/${capsuleId}")).json()).seatKey?.secret)()`) as Promise<boolean>;
+  if (!later) await advance(6 * 60000);
+  await sealFromBanner(p); checkedAt = await hostNow();
+  if (later) { assert.equal(await wrapped(), false, "the keys were wrapped with no check"); await advance(6 * 60000); await invite(); await p.until(`document.querySelector('[data-trip-key="held"]')`, 10000); }
+  assert.equal(await wrapped(), true, "a check left the seat's keys unwrapped");
+  await p.evaluate(`new Promise(ok => { const q = indexedDB.open("capsule", 1); q.onsuccess = () => { const t = q.result.transaction("private-keys", "readwrite"); t.objectStore("private-keys").clear(); t.oncomplete = () => { q.result.close(); ok(true); }; }; })`);
+  await p.evaluate(`localStorage.clear()`); await p.cdp("Network.clearBrowserCookies");
+  await p.cdp("Page.navigate", { url: `${origin}/c/${capsuleId}` }); await p.until(`!!document.querySelector('[data-action="passkey-login"]')`, 15000);
+  await p.evaluate(`document.querySelector('[data-action="passkey-login"]').click()`); await p.until(`!!document.querySelector(".timeline, .timeline-list")`, 20000);
+  await closeTrip(false); await p.close(); await dispose(context); owner = undefined;
+}
+async function linked() {
+  const { owner } = await openTrip(); const seatsNow = async () => (await owner.evaluate(`(async () => (await (await vfetch("/v1/c/${capsuleId}/grants")).json()).flatMap(g => g.members).length)()`)) as number;
+  const url = await invite("participant", true), t = new URLSearchParams(new URL(url).hash.slice(1)).get("t")!; assert.ok(t);
+  const aContext = (await send("Target.createBrowserContext")).browserContextId as string, a = await page(390, 844, true, aContext); await a.join(url);
+  await a.until(`!!document.querySelector(".timeline, .timeline-list") && document.querySelector('[data-trip-key]')?.dataset.tripKey === "held"`, 20000);
+  assert.ok((sent.get(a.session) ?? []).some(b => b.includes("seat-link")), "the member's page sent no key to its seat");
+  assert.equal([...a.requests(), ...owner.requests(), ...sent.get(a.session) ?? [], ...sent.get(owner.session) ?? []].some(u => u.split("#")[0]!.includes(t)), false, "the link's key went to the host");
+  await a.evaluate(`new Promise(ok => { const q = indexedDB.open("capsule", 1); q.onsuccess = () => { const t = q.result.transaction("private-keys", "readwrite"); t.objectStore("private-keys").clear(); t.oncomplete = () => { q.result.close(); ok(true); }; }; })`);
+  await a.cdp("Page.reload"); await a.until(`document.querySelector('[data-trip-key]')?.dataset.tripKey === "missing"`, 20000);
+  const seats = await seatsNow(), again = await invite("participant", true);
+  await a.cdp("Page.navigate", { url: again }); await a.until(`!!document.querySelector(".timeline, .timeline-list")`, 20000);
+  assert.equal(await seatsNow(), seats, "a seat that opened a link took a second seat");
+  const { page: b, context } = await joinAs("participant", 390, 844, false);
+  // #1075: the owner's top says who waits, on every page and in the first screen at 390px, and one link is all it takes.
+  assert.equal(await b.evaluate(`document.querySelector('[data-sealed="locked"]').textContent`), "この旅行を読むには鍵が要ります。オーナーから届くリンクを、このブラウザで開いてください");
+  await owner.reload(); await owner.evaluate(answerYes); await owner.until(`document.querySelector("[data-key-banner]")?.dataset.keyBanner === "1"`, 20000);
+  assert.ok((await owner.box("[data-key-banner]")).bottom < 844, "the banner is below the first screen");
+  assert.equal(await owner.evaluate(`document.querySelector("[data-key-banner] strong").textContent`), "1 人が鍵を待っています");
+  await owner.evaluate(`document.querySelector('[data-action="key-link"]').click()`); await owner.until(`!!document.querySelector("#issued-link")`, 20000);
+  const delivered = await owner.evaluate(`document.querySelector("#issued-link").value`) as string; await owner.evaluate(`document.querySelector('#dialog [data-action="close"]').click()`);
+  const deliveredId = await owner.evaluate(`(async () => (await (await vfetch("/v1/c/${capsuleId}/grants")).json()).at(-1).id)()`) as string;
+  assert.deepEqual(await owner.evaluate(`(async () => { const g = (await (await vfetch("/v1/c/${capsuleId}/grants")).json()).at(-1); return [g.role, g.seats, g.carriesKey]; })()`), ["participant", 1, true]);
+  const bId = await b.evaluate(`(async () => (await (await vfetch("/v1/c/${capsuleId}")).json()).self.id)()`) as string;
+  // (#1094) 共有・管理 tells the seat waiting and the link that carries the key to it, and both again once the link is opened. At 390px.
+  const keyShown = async () => {
+    await manageOpen();
+    const shown = await owner.evaluate(`(() => { const m = document.querySelector('#dialog [data-action="rename-member"][data-id="${bId}"]').closest(".member"), g = document.querySelector('#dialog [data-action="revoke"][data-id="${deliveredId}"]').closest(".grant"), d = document.querySelector("#dialog"); return [m.querySelector("[data-seat-key]")?.dataset.seatKey, g.querySelector("[data-link-note]")?.textContent, d.scrollWidth <= d.clientWidth]; })()`) as [string, string, boolean];
+    await owner.evaluate(`document.querySelector('#dialog [data-action="close"]').click()`); return shown;
+  };
+  const waitingNote = await keyShown();
+  assert.deepEqual([waitingNote[0], waitingNote[1].startsWith("旅行の鍵を載せたリンク · 鍵待ち 1 人（"), waitingNote[2]], ["waiting", true, true], `before the link was opened: ${JSON.stringify(waitingNote)}`);
+  const before = await seatsNow(); await b.cdp("Page.navigate", { url: delivered }); await b.until(`!!document.querySelector(".timeline, .timeline-list")`, 20000);
+  assert.equal(await seatsNow(), before, "the delivery link took a seat from one who had one");
+  await owner.reload(); await owner.until(`!document.querySelector("[data-key-banner]")`, 20000);
+  assert.deepEqual(await keyShown(), ["keyed", "旅行の鍵を載せたリンク · 鍵待ち 0 人", true], "after the link was opened");
+  assert.equal((await fromPage("revoke", { member: bId, confirm: true })).status, 200);
+  await owner.reload(); await owner.until(`(${message} ?? "").startsWith("旅行の鍵を替えました")`, 20000); assert.equal(await owner.evaluate(message), "旅行の鍵を替えました。");
+  await a.reload(); await a.until(`!!document.querySelector(".timeline, .timeline-list") && document.querySelector('[data-trip-key]')?.dataset.tripKey === "held"`, 20000);
+  // A rotated invite with a seat that held the key sets a replacing going: its new link still reads.
+  const seatOf = await owner.evaluate(`(async () => (await (await vfetch("/v1/c/${capsuleId}/grants")).json()).find(g => g.role !== "owner" && g.members.length))()`) as { id: string; label: string };
+  await owner.evaluate(answerYes); await manageOpen(); await owner.evaluate(`document.querySelector('#dialog [data-action="rotate"][data-id="${seatOf.id}"]').click()`);
+  await owner.until(`!!document.querySelector("#issued-link")`, 30000); const rotated = await owner.evaluate(`document.querySelector("#issued-link").value`) as string; await owner.evaluate(`document.querySelector('#dialog [data-action="close"]').click()`);
+  const cContext = (await send("Target.createBrowserContext")).browserContextId as string, c = await page(390, 844, true, cContext); await c.join(rotated); await c.until(`!!document.querySelector(".timeline, .timeline-list")`, 20000); await c.close(); await dispose(cContext);
+  await b.close(); await dispose(context); await a.close(); await dispose(aContext);
+  await closeTrip(false); await owner.close();
+  for (const later of [false, true]) await keysWrappedByCheck(later);
+  console.log("Link verification passed: a link read the sealed trip with nothing else asked, its key sent nowhere; a seat that lost its storage read it by a link with no new seat; a seat with no key by the owner's 鍵を配るリンク from the banner at the top; a rotated invite's link read it after the key it set replacing; the next key reached a seat that took its key by a link.");
 }
 async function passkey() {
   const { owner, authenticatorId } = await openTrip();
@@ -2145,7 +2229,7 @@ async function sealed() {
       await mover.evaluate(`document.querySelector('[data-action="manage"]').click()`); await mover.until(`!!document.querySelector('#dialog form[data-form="grant"]')`);
       await mover.evaluate(`(() => { const f = document.querySelector('#dialog form[data-form="grant"]'); f.elements.namedItem("role").value = "participant"; f.requestSubmit(); return true; })()`); await mover.until(`!!document.querySelector("#issued-link")`, 20000);
       const link = await mover.evaluate(`document.querySelector("#issued-link").value`) as string; await mover.evaluate(`document.querySelector('#dialog [data-action="close"]').click()`);
-      await member.join(link); await handOver(mover, member);
+      await member.join(link); await member.until(`!!document.querySelector(".hero h1")`, 20000);
       assert.equal(await member.evaluate(`document.querySelector(".hero h1").textContent`), title);
       // (x) #842: deleting the trip clears it from the owner's browser, and the member's browser that still had a seat opens it
       // to 410 and keeps nothing of it either.
@@ -2192,7 +2276,7 @@ async function sealed() {
     const seatOf = async (b: B) => await b.evaluate(`(async () => (await (await vfetch("/v1/c/${tripId}")).json()).self.id)()`) as string;
     const enter = async (url: string) => {
       const b = await browser(); members.push(b);
-      await b.cdp("Page.navigate", { url }); await b.until(`!!document.querySelector('[data-action="join"]')`);
+      await b.cdp("Page.navigate", { url: url.replace(/&t=[^&]*/, "") }); await b.until(`!!document.querySelector('[data-action="join"]')`);
       await b.evaluate(`document.querySelector('[data-action="join"]').click()`); await b.until(`!!document.querySelector('[data-action="receive-key"]')`, 20000);
       await b.evaluate(`document.querySelector('#dialog [data-action="close"]')?.click()`); return b;
     };
@@ -2290,7 +2374,7 @@ async function sealed() {
     const generation = async (b: B) => (await view(b)).sealed?.generation as number;
     const enter = async (url: string, b?: B) => {
       b ??= await browser();
-      await b.cdp("Page.navigate", { url }); await b.until(`!!document.querySelector('[data-action="join"]')`);
+      await b.cdp("Page.navigate", { url: url.replace(/&t=[^&]*/, "") }); await b.until(`!!document.querySelector('[data-action="join"]')`);
       await b.evaluate(`document.querySelector('[data-action="join"]').click()`); await b.until(`!!document.querySelector('[data-action="receive-key"]')`, 20000);
       await b.evaluate(`document.querySelector('#dialog [data-action="close"]')?.click()`); await b.evaluate(answerYes); return b;
     };
@@ -2317,7 +2401,7 @@ async function sealed() {
       await from.evaluate(`document.querySelector('[data-action="manage"]').click()`); await from.until(`!!document.querySelector('#dialog [data-action="rotate"][data-role="owner"]')`, 20000);
       await from.evaluate(`document.querySelector('#dialog [data-action="rotate"][data-role="owner"]').click()`);
       await from.until(`!!document.querySelector("#issued-link") || (document.querySelector("#message")?.textContent ?? "") !== ""`, 20000);
-      return await from.evaluate(`document.querySelector("#issued-link")?.value ?? ""`) as string;
+      return (await from.evaluate(`document.querySelector("#issued-link")?.value ?? ""`) as string).replace(/&t=[^&]*/, "");
     };
     const asked = (b: B) => b.evaluate(`document.querySelector("#dialog")?.open && document.querySelector("#dialog").textContent.includes("前のオーナーの端末で読める鍵のままです")`) as Promise<boolean>;
     let last: B | undefined, purged = false;

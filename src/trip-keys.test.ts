@@ -390,6 +390,28 @@ describe("rekey", () => {
     expect([...await reachableSeats(root(owner), listed(owner, a, c), cap)]).toEqual(["o"]);
   });
 
+  test("a key the owner signed before making the pair again is taken, by the pair its successor names, and a forged successor is not", async () => {
+    const owner = await seat("o", "owner"), b = await seat("b"); await edge(b, owner);
+    const trip = await newTripKey(), w = await wrapTripKey(trip, b.pub.x25519, cap, 2);
+    const seatKey = { generation: 2, ...w, x25519: b.pub.x25519, rekey: { seat: owner.id, signature: await signRekey(owner.keys.ed25519.privateKey, { capsuleId: cap, generation: 2, seat: b.id, x25519: b.pub.x25519, ...w }) } };
+    await remake(owner, []);
+    const accept = (seats: KeyedSeat[]) => acceptRekey({ self: root(b), known: 1, capsuleId: cap, seats, seatKey });
+    expect(await accept(listed(owner, b))).toBe(true);
+    const forged = listed(owner, b); forged[0]!.since!.signature = forged[0]!.since!.signature.replace(/^./, c => c === "A" ? "B" : "A");
+    expect(await accept(forged)).toBe(false);
+    // A successor the operator made: keys of its own, signed by themselves, with a key it signed. B never signed an edge over them.
+    const made = await seat("x", "owner"), fake = listed(owner, b), who = fake[0]!;
+    who.since = await signSuccession(made.keys.ed25519.privateKey, made.pub, { capsuleId: cap, seat: who.id, x25519: who.x25519, ed25519: who.ed25519 });
+    const madeWrap = await wrapTripKey(await newTripKey(), b.pub.x25519, cap, 2);
+    expect(await acceptRekey({ self: root(b), known: 1, capsuleId: cap, seats: fake, seatKey: { generation: 2, ...madeWrap, x25519: b.pub.x25519, rekey: { seat: owner.id, signature: await signRekey(made.keys.ed25519.privateKey, { capsuleId: cap, generation: 2, seat: b.id, x25519: b.pub.x25519, ...madeWrap }) } } })).toBe(false);
+    // The same past the reach: an owner that never made its pair again, reached by the edge over its present keys.
+    const still = await seat("p", "owner"); await edge(b, still);
+    const past = listed(still, b), pastOwner = past[0]!;
+    pastOwner.since = await signSuccession(made.keys.ed25519.privateKey, made.pub, { capsuleId: cap, seat: pastOwner.id, x25519: pastOwner.x25519, ed25519: pastOwner.ed25519 });
+    expect(await acceptRekey({ self: root(b), known: 1, capsuleId: cap, seats: past, seatKey: { generation: 2, ...madeWrap, x25519: b.pub.x25519, rekey: { seat: still.id, signature: await signRekey(made.keys.ed25519.privateKey, { capsuleId: cap, generation: 2, seat: b.id, x25519: b.pub.x25519, ...madeWrap }) } } })).toBe(false);
+    const stranger = await seat("s", "owner"); await edge(b, stranger); const list = listed(stranger, b);
+    expect(await acceptRekey({ self: root(b), known: 1, capsuleId: cap, seats: list, seatKey: { ...seatKey, rekey: { seat: stranger.id, signature: seatKey.rekey.signature } } })).toBe(false);
+  });
   test("owner 以外の世代: a member's browser takes a new generation only when an owner seat it reaches signed that wrap", async () => {
     const owner = await seat("o", "owner"), a = await seat("a"), b = await seat("b"), stranger = await seat("s", "owner");
     await edge(owner, a); await edge(a, owner); await edge(a, b); await edge(b, a);

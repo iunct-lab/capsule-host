@@ -6,6 +6,6 @@ import { join } from "node:path";
 test("an unknown group is refused with the groups' names, before anything runs", () => {
   const r = Bun.spawnSync(["bun", join(import.meta.dir, "verify-ui.ts"), "nope"], { env: { ...process.env, CAPSULE_ORIGIN: "http://localhost:1" } });
   expect(r.exitCode).toBe(1);
-  expect(r.stderr.toString()).toContain("使える群: plan, members, seat, passkey, sealed");
+  expect(r.stderr.toString()).toContain("使える群: plan, members, seat, linked, passkey, sealed");
   expect(r.stdout.toString()).toBe("");
 });

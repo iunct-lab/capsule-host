@@ -48,6 +48,22 @@ export async function unwrapTripKey(wrapped: string, ephemeral: string, seatX255
   return crypto.subtle.unwrapKey("raw", data, await hkdf(shared, tripInfo(capsuleId, generation)), { name: "AES-GCM", iv, additionalData: tripAad(capsuleId, generation) }, aes, extractable, ["encrypt", "decrypt"]);
 }
 
+// The trip key for an invite link (docs/ephemeral-trip-capsule.md「5.1 旅行の鍵と受け渡し」): wrapped with a key from a secret that travels only
+// after the link's `#` (`t=`), so the host holds what it cannot open and hands it to seats alone. The owner's public keys are
+// bound as associated data: what opens the key also vouches for them, and a new key the owner signs later is checked against them.
+export type LinkOwner = { seat: string; x25519: string; ed25519: string };
+export const newLinkSecret = () => b64(crypto.getRandomValues(new Uint8Array(32)));
+const linkInfo = (capsuleId: string, generation: number) => `capsule link key v1/${capsuleId}/${generation}`;
+const linkAad = (capsuleId: string, generation: number, o: LinkOwner) => text(`${capsuleId}/${generation}/${o.seat}/${o.x25519}/${o.ed25519}`);
+export async function sealLinkKey(trip: CryptoKey, linkSecret: string, capsuleId: string, generation: number, owner: LinkOwner): Promise<string> {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  return pack(iv, await crypto.subtle.wrapKey("raw", trip, await hkdf(unb64(linkSecret), linkInfo(capsuleId, generation)), { name: "AES-GCM", iv, additionalData: linkAad(capsuleId, generation, owner) }));
+}
+export async function openLinkKey(wrapped: string, linkSecret: string, capsuleId: string, generation: number, owner: LinkOwner): Promise<CryptoKey> {
+  const { iv, data } = unpack(wrapped);
+  return crypto.subtle.unwrapKey("raw", data, await hkdf(unb64(linkSecret), linkInfo(capsuleId, generation)), { name: "AES-GCM", iv, additionalData: linkAad(capsuleId, generation, owner) }, aes, true, ["encrypt", "decrypt"]);
+}
+
 // The seat's private keys wrapped with a key from the passkey's PRF output, so a browser with nothing kept gets them back
 // with one confirmation. The info differs from the memo key's (private-entries.ts), so the two wrapping keys never coincide.
 const seatInfo = (capsuleId: string) => `capsule seat key v1/${capsuleId}`;
@@ -392,7 +408,7 @@ export async function sealOperation(key: CryptoKey, capsuleId: string, generatio
 // signed by an owner seat it reaches by its own edges, so the operator cannot place a key of its own (spec「5.5 旅行の鍵を替える」).
 // `since`: a seat whose pair was made again (a passkey registered later) keeps its previous public keys and their signature over
 // the new ones, for one generation of pairs (spec「5.5 旅行の鍵を替える」): edges signed over the previous keys still lead to it.
-export type KeyedSeat = { id: string; role: Role; x25519: string; ed25519: string; edges: Array<{ seat: string; signature: string }>; since?: { x25519: string; ed25519: string; signature: string } };
+export type KeyedSeat = { id: string; role: Role; x25519: string; ed25519: string; edges: Array<{ seat: string; signature: string }>; since?: { x25519: string; ed25519: string; signature: string }; linked?: boolean };
 const successionText = (capsuleId: string, seat: string, next: SeatPublic) => text(`capsule seat successor v1/${capsuleId}/${seat}/${next.x25519}/${next.ed25519}`);
 export async function signSuccession(oldEd25519Private: CryptoKey, previous: SeatPublic, a: { capsuleId: string; seat: string; x25519: string; ed25519: string }): Promise<NonNullable<KeyedSeat["since"]>> {
   return { ...previous, signature: b64(await crypto.subtle.sign("Ed25519", oldEd25519Private, successionText(a.capsuleId, a.seat, a))) };
@@ -441,8 +457,18 @@ export async function acceptRekey(a: { self: { id: string; ed25519: string }; kn
   const k = a.seatKey;
   if (k.generation <= a.known) return true;
   const owner = k.rekey && a.seats.find(s => s.id === k.rekey!.seat);
-  if (!owner || owner.role !== "owner" || !(await reachableSeats(a.self, a.seats, a.capsuleId)).has(owner.id)) return false;
-  return verifyRekey(owner.id === a.self.id ? a.self.ed25519 : owner.ed25519, k.rekey!.signature, { capsuleId: a.capsuleId, generation: k.generation, seat: a.self.id, x25519: k.x25519, wrapped: k.wrapped, ephemeral: k.ephemeral });
+  const reached = owner && await reachableSeats(a.self, a.seats, a.capsuleId);
+  if (!owner || owner.role !== "owner" || !reached!.has(owner.id)) return false;
+  const r = { capsuleId: a.capsuleId, generation: k.generation, seat: a.self.id, x25519: k.x25519, wrapped: k.wrapped, ephemeral: k.ephemeral };
+  if (await verifyRekey(owner.id === a.self.id ? a.self.ed25519 : owner.ed25519, k.rekey!.signature, r)) return true;
+  // The owner's pair made again after this key was signed (a passkey wrapping the seat's keys): the pair before it, which `since` alone
+  // cannot vouch for, as it signs itself. It holds only when a seat reached signed an edge over those very keys.
+  if (!owner.since || !await verifySuccession(owner, a.capsuleId)) return false;
+  const before = { seat: owner.id, x25519: owner.since.x25519, ed25519: owner.since.ed25519 };
+  for (const s of a.seats.filter(x => reached!.has(x.id)))
+    for (const e of s.edges.filter(x => x.seat === owner.id))
+      if (await verifyEdge(s.id === a.self.id ? a.self.ed25519 : s.ed25519, e.signature, before, a.capsuleId)) return verifyRekey(before.ed25519, k.rekey!.signature, r);
+  return false;
 }
 // The whole sealed trip opened with the old key and sealed again under the new generation: the trip, each footprint's point and
 // name, each member's and invite's name. A name the host gave stays as it is. Nothing that fails to open is dropped quietly: it

@@ -17,7 +17,7 @@ import { recipe } from "./recipe";
 import { revisable, reviseTrip, undoTrip } from "./revise";
 import { emptyTrip } from "./template";
 import { b64 } from "./private-entries";
-import { confirmationCodes, matchesCommitment, openName, openPoint, sealName, sealPoint, sealTrip, sealMove, sealSpec, openField, openTrip, sealOperation, newAttempt, newHandoffKeys, newSeatKeys, newTripKey, seatPublic, signEdge, unwrapSeatSecret, unwrapTripKey, verifyEdge, wrapSeatSecret, wrapTripKey, acceptRekey, reachableSeats, resealAll, sealField, signRekey, signSuccession, type SeatKeys } from "./trip-keys";
+import { newLinkSecret, openLinkKey, sealLinkKey, confirmationCodes, matchesCommitment, openName, openPoint, sealName, sealPoint, sealTrip, sealMove, sealSpec, openField, openTrip, sealOperation, newAttempt, newHandoffKeys, newSeatKeys, newTripKey, seatPublic, signEdge, unwrapSeatSecret, unwrapTripKey, verifyEdge, wrapSeatSecret, wrapTripKey, acceptRekey, reachableSeats, resealAll, sealField, signRekey, signSuccession, type SeatKeys } from "./trip-keys";
 
 // Exercises actual SQLite statements through D1's asynchronous shape, without claiming remote D1 QA.
 
@@ -1045,6 +1045,114 @@ describe("trip keys", () => {
     expect(sessions(t).find(s => s.seatKey).seatKey.secret.passkey).toBe(devices.get(owner)!.id);
     // The trip is read as it was: the plan, the revision and the schema do not move.
     expect(view.document.revision).toBe(before.document.revision);
+  });
+  // The list tells whether each seat holds the present generation and whether each invite carries it, and never the values.
+  test("grants list keyed: seats holding the key, seats waiting and invites carrying it", async () => {
+    const t = await keyedTrip(), a = await t.hand(t.owner, await t.join()), w = await t.join(), who = { seat: t.owner.id, ...t.owner.pub };
+    const carried = await (await t.request("/grants", "POST", { role: "participant", id: crypto.randomUUID().replaceAll("-", ""), expiresAt: t.seed.spec.lifecycle.purgeAt, seats: 2, confirm: true, linkKey: { generation: 1, wrapped: await sealLinkKey(t.trip, newLinkSecret(), t.created.id, 1, who), owner: who } }, t.owner.cookie)).json();
+    const res = await t.request("/grants", "GET", undefined, t.owner.cookie), text = await res.clone().text(), list = await res.json() as any[];
+    const seat = (id: string) => list.flatMap(g => g.members).find((m: any) => m.id === id);
+    expect([seat(t.owner.id).keyed, seat(a.id).keyed, seat(w.id).keyed]).toEqual([true, true, false]);
+    expect(list.find(g => g.id === carried.grantId).carriesKey).toBe(true);
+    expect(list.find(g => g.id === w.grant).carriesKey).toBe(false);
+    for (const word of ["linkKey", "seatKey", "wrapped"]) expect(text).not.toContain(word);
+    // What was already listed stays as it was.
+    expect(Object.keys(seat(a.id))).toEqual(expect.arrayContaining(["id", "label", "device", "created", "passkey", "publicKey", "self"]));
+  });
+  test("grants list keyed: a plain trip tells no key, and seats stored before `seen` are listed", async () => {
+    // A plain trip is opened only by its owner until it is sealed (`plain trips are refused`), so the owner's seat is the one listed.
+    // Its owner's browser puts the seat's keys before it seals the trip: a seat holding generation 1 is still told no key.
+    const t = await setup(), owner = await stepUp(t.request, await t.login(t.created.url));
+    expect((await put(t, owner, (await made(t.created.id)).body)).status).toBe(200);
+    const row = t.db.db.query("SELECT key, payload FROM trip_capsules").get() as { key: string; payload: string }, c = JSON.parse(row.payload);
+    for (const s of c.sessions) delete s.seen;
+    t.db.db.query("UPDATE trip_capsules SET payload = ? WHERE key = ?").run(JSON.stringify(c), row.key);
+    const res = await t.request("/grants", "GET", undefined, owner); expect(res.status).toBe(200);
+    const list = await res.json() as any[];
+    expect(list.map(g => g.carriesKey)).toEqual(list.map(() => false));
+    expect(list.flatMap(g => g.members).map((m: any) => [m.keyed, m.seen])).toEqual([[false, undefined]]);
+  });
+  describe("the key of an invite link", () => {
+    const issueBody = (t: Awaited<ReturnType<typeof setup>>, body: object = {}) => ({ role: "participant", label: "招待リンク", id: crypto.randomUUID().replaceAll("-", ""), expiresAt: t.seed.spec.lifecycle.purgeAt, seats: 1, confirm: true, ...body });
+    // A sealed trip and a link issued as the screen issues it.
+    async function linked() {
+      const t = await setup(), owner = await stepUp(t.request, await t.login(t.created.url)), s = await sealedTrip(t.request, t.created.id, owner);
+      const self = (await (await t.request("", "GET", undefined, owner)).json()).self.id as string, who = { seat: self, ...s.owner.pub };
+      const issue = async (body: object = {}) => { const linkSecret = newLinkSecret(); return { res: await t.request("/grants", "POST", issueBody(t, { linkKey: { generation: 1, wrapped: await sealLinkKey(s.trip, linkSecret, t.created.id, 1, who), owner: who }, ...body }), owner), linkSecret }; };
+      return { t, owner, s, who, issue };
+    }
+    const take = (t: Awaited<ReturnType<typeof setup>>, cookie: string, secret: string) => t.request("/keys", "PATCH", { type: "link", secret }, cookie);
+    const secretOf = (url: string) => new URLSearchParams(new URL(url).hash.slice(1)).get("k")!;
+    test("a seat that opened the link takes the key and puts its own, and is told apart in the seats", async () => {
+      const { t, owner, who, issue } = await linked(), { res, linkSecret } = await issue(), { url } = await res.json(), member = await t.login(url), k = secretOf(url);
+      expect(JSON.stringify(await (await t.request("/grants", "GET", undefined, owner)).json())).not.toContain("linkKey");
+      const got = await (await take(t, member, k)).json();
+      expect(got.linkKey.owner).toEqual(who);
+      const trip = await openLinkKey(got.linkKey.wrapped, linkSecret, t.created.id, 1, got.linkKey.owner);
+      const seat = await newSeatKeys(), pub = await seatPublic(seat), wrap = await wrapTripKey(trip, pub.x25519, t.created.id, 1);
+      expect((await t.request("/keys", "PATCH", { type: "seat-link", secret: k, ...pub, ...wrap, generation: 1 }, member)).status).toBe(200);
+      const view = await (await t.request("", "GET", undefined, member)).json();
+      expect(await unwrapTripKey(view.seatKey.wrapped, view.seatKey.ephemeral, seat.x25519.privateKey, t.created.id, 1)).toBeDefined();
+      expect((await (await t.request("", "GET", undefined, owner)).json()).seats.find((x: any) => x.id === view.self.id).linked).toBe(true);
+    });
+    test("a wrong secret, other owner keys or another generation do not open it", async () => {
+      const { t, s, who } = await linked(), right = newLinkSecret(), wrapped = await sealLinkKey(s.trip, right, t.created.id, 1, who);
+      await expect(openLinkKey(wrapped, newLinkSecret(), t.created.id, 1, who)).rejects.toThrow();
+      await expect(openLinkKey(wrapped, right, t.created.id, 1, { ...who, ed25519: "A".repeat(43) })).rejects.toThrow();
+      await expect(openLinkKey(wrapped, right, t.created.id, 2, who)).rejects.toThrow();
+    });
+    test("no seat, a revoked invite or an invite without a key gets nothing", async () => {
+      const { t, owner, issue } = await linked(), { url } = await (await issue()).res.json(), member = await t.login(url);
+      expect((await take(t, "capsule=none", secretOf(url))).status).toBe(401);
+      const plain = await (await t.request("/grants", "POST", issueBody(t), owner)).json();
+      expect((await take(t, member, secretOf(plain.url))).status).toBe(409);
+      expect((await take(t, member, "x".repeat(40))).status).toBe(409);
+      const other = await (await issue()).res.json();
+      expect((await t.request("/revoke", "POST", { id: other.grantId, confirm: true }, owner)).status).toBe(200);
+      expect((await take(t, member, secretOf(other.url))).status).toBe(409);
+    });
+    test("a link of another generation is refused when issued", async () => {
+      const { issue, who } = await linked(), { res } = await issue({ linkKey: { generation: 2, wrapped: "v1." + "A".repeat(100), owner: who } });
+      expect(res.status).toBe(400);
+    });
+    test("a seat of an invite that holds no key reads the trip as before", async () => {
+      const { t, owner } = await linked(), plain = await (await t.request("/grants", "POST", issueBody(t), owner)).json();
+      expect((await t.request("", "GET", undefined, await t.login(plain.url))).status).toBe(200);
+    });
+    test("an invite past its end gets nothing", async () => {
+      const { t, issue } = await linked(), { url } = await (await issue()).res.json(), member = await t.login(url);
+      const soon = new Date(now + 3600000).toISOString(), short = await (await issue({ expiresAt: soon })).res.json(), before = now;
+      now += 2 * 3600000;
+      expect((await take(t, member, secretOf(short.url))).status).toBe(409); now = before;
+    });
+    test("past its seats and its time to take them, a link still hands the key to one who has a seat", async () => {
+      const { t, issue } = await linked(), { url } = await (await issue()).res.json(), member = await t.login(url), used = await (await issue()).res.json();
+      await t.login(used.url);
+      expect((await take(t, member, secretOf(used.url))).status).toBe(200);
+    });
+    test("a member's seat puts a new pair by a link, as a browser that lost its storage does; an owner's holding the key does not", async () => {
+      const { t, owner, s, issue, who } = await linked(), { res, linkSecret } = await issue(), { url } = await res.json(), member = await t.login(url), k = secretOf(url);
+      const put = async (cookie: string) => { const seat = await newSeatKeys(), pub = await seatPublic(seat); return t.request("/keys", "PATCH", { type: "seat-link", secret: k, ...pub, ...await wrapTripKey(await openLinkKey((await sealLinkKey(s.trip, linkSecret, t.created.id, 1, who)), linkSecret, t.created.id, 1, who), pub.x25519, t.created.id, 1), generation: 1 }, cookie); };
+      expect((await put(member)).status).toBe(200); expect((await put(member)).status).toBe(200);
+      expect((await put(owner)).status).toBe(409); expect((await take(t, owner, k)).status).toBe(409);
+      expect((await (await t.request("", "GET", undefined, owner)).json()).seatKey.x25519).toBe(s.owner.pub.x25519);
+      // An owner seat left at an older generation is not replaced either.
+      const row = t.db.db.query("SELECT payload FROM trip_capsules").get() as { payload: string }, c = JSON.parse(row.payload);
+      c.sessions.find((x: any) => x.seatKey?.x25519 === s.owner.pub.x25519).seatKey.generation = 0; t.db.db.run("UPDATE trip_capsules SET payload = ?", [JSON.stringify(c)]);
+      expect((await put(owner)).status).toBe(409);
+    });
+    test("a link cannot name a member's seat as the owner's, even with that seat's own keys", async () => {
+      const { t, owner, s, who, issue } = await linked(), { res, linkSecret } = await issue(), { url } = await res.json(), member = await t.login(url), k = secretOf(url), seat = await newSeatKeys(), pub = await seatPublic(seat);
+      await t.request("/keys", "PATCH", { type: "seat-link", secret: k, ...pub, ...await wrapTripKey(s.trip, pub.x25519, t.created.id, 1), generation: 1 }, member);
+      const id = (await (await t.request("", "GET", undefined, member)).json()).self.id as string, named = { seat: id, ...pub };
+      expect((await issue({ linkKey: { generation: 1, wrapped: await sealLinkKey(s.trip, linkSecret, t.created.id, 1, named), owner: named } })).res.status).toBe(400); void owner; void who;
+    });
+    test("the owner's keys a link names are the owner seat's as they stand", async () => {
+      const { t, owner, s, issue, who } = await linked(), wrapped = await sealLinkKey(s.trip, newLinkSecret(), t.created.id, 1, who);
+      for (const named of [{ ...who, seat: "nobody" }, { ...who, ed25519: "A".repeat(43) }, { ...who, x25519: "A".repeat(43) }]) expect((await issue({ linkKey: { generation: 1, wrapped, owner: named } })).res.status).toBe(400);
+      const { url } = await (await issue()).res.json(), member = (await (await t.request("", "GET", undefined, await t.login(url))).json()).self.id as string;
+      expect((await issue({ linkKey: { generation: 1, wrapped, owner: { ...who, seat: member } } })).res.status).toBe(400); void owner;
+    });
   });
   test("a value that is not a wrapped key is refused with 400", async () => {
     const t = await setup(), owner = await stepUp(t.request, await t.login(t.created.url)), { body } = await made(t.created.id);
@@ -3867,6 +3975,46 @@ describe("rekey", () => {
     const v = await t.read(m.cookie), key = await unwrapTripKey(v.seatKey.wrapped, v.seatKey.ephemeral, m.seat.x25519.privateKey, t.created.id, generation);
     return { key, trip: await openTrip(key, t.created.id, v), view: v };
   };
+  test("替える drops the invites' link keys: a link left unused holds the old key", async () => {
+    const t = await keyedTrip(), a = await t.hand(t.owner, await t.join()), b = await t.hand(t.owner, await t.join()), link = newLinkSecret(), who = { seat: t.owner.id, ...t.owner.pub };
+    const old = await unwrapTripKey((await t.read(t.owner.cookie)).seatKey.wrapped, (await t.read(t.owner.cookie)).seatKey.ephemeral, t.owner.seat.x25519.privateKey, t.created.id, 1, true);
+    const issued = await (await t.request("/grants", "POST", { role: "participant", id: crypto.randomUUID().replaceAll("-", ""), expiresAt: t.seed.spec.lifecycle.purgeAt, confirm: true, linkKey: { generation: 1, wrapped: await sealLinkKey(old, link, t.created.id, 1, who), owner: who } }, t.owner.cookie)).json();
+    const secret = new URLSearchParams(new URL(issued.url).hash.slice(1)).get("k")!;
+    expect((await t.request("/keys", "PATCH", { type: "link", secret }, b.cookie)).status).toBe(200);
+    expect((await t.request("/revoke", "POST", { member: b.id, confirm: true }, t.owner.cookie)).status).toBe(200);
+    expect((await (await rekey(t, t.owner, [t.owner, a])).send()).status).toBe(200);
+    expect(t.stored().grants.some((g: any) => g.linkKey)).toBe(false);
+    expect((await t.request("/keys", "PATCH", { type: "link", secret }, a.cookie)).status).toBe(409);
+  });
+  test("grants list keyed: 替える takes the key off a link left out, and a seat left out waits", async () => {
+    const t = await keyedTrip(), a = await t.hand(t.owner, await t.join()), b = await t.hand(t.owner, await t.join()), who = { seat: t.owner.id, ...t.owner.pub };
+    const issued = await (await t.request("/grants", "POST", { role: "participant", id: crypto.randomUUID().replaceAll("-", ""), expiresAt: t.seed.spec.lifecycle.purgeAt, confirm: true, linkKey: { generation: 1, wrapped: await sealLinkKey(t.trip, newLinkSecret(), t.created.id, 1, who), owner: who } }, t.owner.cookie)).json();
+    expect((await (await rekey(t, t.owner, [t.owner, a])).send()).status).toBe(200);
+    const list = await (await t.request("/grants", "GET", undefined, t.owner.cookie)).json() as any[], seat = (id: string) => list.flatMap(g => g.members).find((m: any) => m.id === id);
+    expect(list.find(g => g.id === issued.grantId).carriesKey).toBe(false);
+    expect([seat(t.owner.id).keyed, seat(a.id).keyed, seat(b.id).keyed]).toEqual([true, true, false]);
+  });
+  test("替える: a seat that took its key by a link is wrapped to and told apart, and a link issued just now is wrapped anew", async () => {
+    const t = await keyedTrip(), left = await t.hand(t.owner, await t.join()), who = { seat: t.owner.id, ...t.owner.pub }, m = await t.join(), first = newLinkSecret(), next = newLinkSecret();
+    const v = await t.read(t.owner.cookie), old = await unwrapTripKey(v.seatKey.wrapped, v.seatKey.ephemeral, t.owner.seat.x25519.privateKey, t.created.id, 1, true);
+    const issued = await (await t.request("/grants", "POST", { role: "participant", id: crypto.randomUUID().replaceAll("-", ""), expiresAt: t.seed.spec.lifecycle.purgeAt, confirm: true, linkKey: { generation: 1, wrapped: await sealLinkKey(old, first, t.created.id, 1, who), owner: who } }, t.owner.cookie)).json();
+    const secret = new URLSearchParams(new URL(issued.url).hash.slice(1)).get("k")!, seat = await newSeatKeys(), pub = await seatPublic(seat);
+    expect((await t.request("/keys", "PATCH", { type: "seat-link", secret, ...pub, ...await wrapTripKey(old, pub.x25519, t.created.id, 1), generation: 1 }, m.cookie)).status).toBe(200);
+    const member: Keyed = { ...m, seat, pub };
+    expect((await t.request("/revoke", "POST", { member: left.id, confirm: true }, t.owner.cookie)).status).toBe(200);
+    const r = await rekey(t, t.owner, [t.owner, member]);
+    expect((await r.send({ links: [{ grant: issued.grantId, key: { generation: 2, wrapped: "v1." + "A".repeat(100), owner: { ...who, seat: member.id } } }] })).status).toBe(400);
+    expect((await r.send({ links: [{ grant: "nope", key: { generation: 2, wrapped: await sealLinkKey(r.key, next, t.created.id, 2, who), owner: who } }] })).status).toBe(400);
+    expect((await r.send({ links: [{ grant: issued.grantId, key: { generation: 2, wrapped: await sealLinkKey(r.key, next, t.created.id, 2, who), owner: who } }] })).status).toBe(200);
+    expect(t.stored().grants.find((g: any) => g.id === issued.grantId).linkKey.generation).toBe(2);
+    expect((await opens(t, member, 2)).trip!.spec.title).toBe("テスト旅行");
+    expect((await t.read(t.owner.cookie)).seats.find((s: any) => s.id === member.id).linked).toBe(true);
+    // A new pair (a passkey registered later) keeps the mark: the next replacing still wraps to the seat.
+    const again = await newSeatKeys(), againPub = await seatPublic(again);
+    await stepUp(t.request, member.cookie);
+    expect((await t.request("/keys", "PATCH", { type: "seat", ...againPub, ...await wrapTripKey(await unwrapTripKey((await t.read(member.cookie)).seatKey.wrapped, (await t.read(member.cookie)).seatKey.ephemeral, seat.x25519.privateKey, t.created.id, 2, true), againPub.x25519, t.created.id, 2), generation: 2, secret: await wrapSeatSecret(again, crypto.getRandomValues(new Uint8Array(32)), t.created.id) }, member.cookie)).status).toBe(200);
+    expect(t.stored().sessions.find((s: any) => s.id === member.id).seatKey.linked).toBe(true);
+  });
   test("替える: the owner seals the trip again under the next generation and wraps it to the seats that remain", async () => {
     const t = await keyedTrip(), a = await t.hand(t.owner, await t.join()), b = await t.hand(t.owner, await t.join());
     expect((await t.request("/revoke", "POST", { member: b.id, confirm: true }, t.owner.cookie)).status).toBe(200);

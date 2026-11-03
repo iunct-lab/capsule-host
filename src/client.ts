@@ -8,9 +8,10 @@ import { reviseText, reviseTrip, undoTrip, type Diff, type Previous } from "./re
 import { exportFiles, tripHtml, tripMarkdown, zip } from "./export";
 import { PRF_INPUT, assistSealingKey, b64, unb64, newMemoKey, unwrapMemoKey, wrapMemoKey, wrappingKey, openEntry, sealEntry, privateMarkdown, seal as sealWords, open as openWords, type PlainEntry } from "./private-entries";
 import { generate, REVISE_LIMIT, REVISE_SYSTEM, todayLine } from "./assist";
-import { openField, sealField, openPhotoImage, openPhotoLocation, sealPhoto, type PhotoSize, openName, openPoint, sealMove, sealName, sealPoint, openTrip, resealTrip, sealOperation, sealSpec, confirmationCodes, matchesCommitment, newAttempt, newHandoffKeys, newSeatKeys, newTripKey, seatPublic, signEdge, unwrapSeatSecret, unwrapTripKey, wrapSeatSecret, wrapTripKey, acceptRekey, reachableSeats, resealAll, signRekey, signSuccession, verifyEdge, verifySuccession, type KeyedSeat } from "./trip-keys";
+import { openField, sealField, openPhotoImage, openPhotoLocation, sealPhoto, type PhotoSize, openName, openPoint, sealMove, sealName, sealPoint, openTrip, resealTrip, sealOperation, sealSpec, confirmationCodes, matchesCommitment, newAttempt, newHandoffKeys, newSeatKeys, newTripKey, seatPublic, signEdge, unwrapSeatSecret, unwrapTripKey, wrapSeatSecret, wrapTripKey, newLinkSecret, openLinkKey, sealLinkKey, type LinkOwner, acceptRekey, reachableSeats, resealAll, signRekey, signSuccession, verifyEdge, verifySuccession, type KeyedSeat } from "./trip-keys";
 import { privateReviseText, takePrivate, privateDiff } from "./private-revise";
 import { expiredIn, type Joined } from "./joined";
+import { linkNote, memberTags, revokeConfirm, revokeNote, waitingSeats, type ListedGrant } from "./seat-status";
 import { autoDue, footprints, spotsOf, type Point } from "./footprints";
 import type { MapCamera, MapData } from "./map";
 import { itemAt, linkPhotos, photoDays, photoInstant, photoPlace, photosPageShown, photosUploadable, type Shown } from "./moments";
@@ -72,7 +73,12 @@ async function api(action = "", method = "GET", body?: unknown, revision = view?
   const res = await fetch(url.startsWith("/v1/c/") ? `${url}${url.includes("?") ? "&" : "?"}ui=2` : url, { method, headers: { ...(body !== undefined ? { "Content-Type": "application/json" } : {}), ...(revision !== undefined ? { "If-Match": `"${revision}"` } : {}) }, ...(body !== undefined ? { body: JSON.stringify(body) } : {}) });
   if (res.status === 428 && !retried) {
     try { await (url.startsWith("/v1/c/") ? stepUp() : creatorCheck()); } catch (err) { throw (err as Error).name === "NotAllowedError" ? new Error("パスキーの操作を中止しました。") : err; }
-    return api(action, method, body, revision, true);
+    // The check that let the action through also wraps the seat's keys, if none is wrapped yet. After the action: it replaces the
+    // owner's keys, which the action may name. Not after `rekey`: the keys on the page are of the generation just replaced.
+    const prf = checkedPrf; checkedPrf = undefined;
+    const done = await api(action, method, body, revision, true);
+    if (prf && action !== "rekey") await sealSeatKeys(prf).catch(() => undefined);
+    return done;
   }
   if (res.status === 204) return null;
   if (!res.ok) {
@@ -338,6 +344,49 @@ async function giveKey(seat: string, label: string) {
     await finishHandoff(`${label}に旅行の鍵を渡しました。`);
   } catch (err) { if (run === handoffRun) modal(title, `<p>${e((err as Error).message)}</p>${again}`); }
 }
+// The invite link's key (docs/ephemeral-trip-capsule.md「5.1 旅行の鍵と受け渡し」). The link says `#k=<the invite>&t=<the secret that opens the wrapped key>`;
+// `t` is never sent. A trip's page keeps the two for this tab until the seat has its key: taking a seat, or an owner's approval
+// of it, may come first. A browser with a seat and no key takes it here and needs nothing else.
+type LinkKey = { generation: number; wrapped: string; owner: LinkOwner };
+const linkSlot = () => `capsule-link:${id}`;
+function keepLink() { const h = new URLSearchParams(location.hash.slice(1)), k = h.get("k"), t = h.get("t"); try { if (id && k && t) sessionStorage.setItem(linkSlot(), JSON.stringify({ k, t })); } catch { /* a browser that keeps nothing joins without the key */ } }
+let takingLink = false;
+async function takeLink() {
+  const kept = id && (() => { try { return sessionStorage.getItem(linkSlot()); } catch { return null; } })();
+  if (!kept || takingLink) return;
+  if (tripKey || !view.sealed) { sessionStorage.removeItem(linkSlot()); return; }
+  takingLink = true;
+  try {
+    const { k, t } = JSON.parse(kept) as { k: string; t: string };
+    const { linkKey: l } = await api("keys", "PATCH", { type: "link", secret: k }) as { linkKey: LinkKey };
+    const trip = await openLinkKey(l.wrapped, t, id!, l.generation, l.owner), seat = await newSeatKeys(), pub = await seatPublic(seat), wrap = await wrapTripKey(trip, pub.x25519, id!, l.generation);
+    await api("keys", "PATCH", { type: "seat-link", secret: k, ...pub, ...wrap, generation: l.generation });
+    const secret = { x25519: await sealedAway(seat.x25519.privateKey, "X25519", ["deriveBits"]), ed25519: await sealedAway(seat.ed25519.privateKey, "Ed25519", ["sign"]) };
+    await keepSeat(pub.x25519, secret, pub.ed25519, l.generation);
+    // The owner's keys came with what the link opened: a new key the owner signs is taken along this edge (spec「5.5 旅行の鍵を替える」).
+    await api("keys", "PATCH", { type: "edge", seat: l.owner.seat, signature: await signEdge(secret.ed25519, l.owner, id!) }).catch(() => undefined);
+    sessionStorage.removeItem(linkSlot());
+    await reload(); notice("旅行の鍵を受け取りました。");
+  } catch (err) {
+    // A failure on the way (no network, too many requests) leaves the link for the next reading.
+    const final = (err as Error).name === "OperationError" || (err as { status?: number }).status === 409;
+    if (final) sessionStorage.removeItem(linkSlot());
+    notice((err as Error).name === "OperationError" ? "このリンクでは鍵を開けません。オーナーに新しいリンクを頼んでください" : (err as Error).message, true);
+  }
+  finally { takingLink = false; }
+}
+// An invite, issued with the trip key wrapped for its link when this browser holds the key. An owner invite takes none: other
+// seats trust the owner by what links to it, which a new owner seat does not have (spec「5.5 旅行の鍵を替える」). A rotated invite may
+// set a replacing of the key going as soon as the page is read again: its link is wrapped anew then (rekeyTrip).
+const freshLinks = new Map<string, string>();
+async function issueInvite(body: { role?: string; rotate?: string; [field: string]: unknown }): Promise<{ url: string }> {
+  const own = view.seatKey, mine = await seatSecret(), who = view.role === "owner" && view.self && own ? { id: view.self.id, x25519: own.x25519, ed25519: own.ed25519 } : view.seats?.find(s => s.role === "owner");
+  if (!id || !view.sealed || !tripKey || !own || !mine || !who || body.role === "owner") return api("grants", "POST", body);
+  const t = newLinkSecret(), owner = { seat: who.id, x25519: who.x25519, ed25519: who.ed25519 }, trip = await unwrapTripKey(own.wrapped, own.ephemeral, mine.x25519, id, own.generation, true);
+  const v = await api("grants", "POST", { ...body, linkKey: { generation: own.generation, wrapped: await sealLinkKey(trip, t, id, own.generation, owner), owner } }) as { url: string; grantId: string };
+  if (body.rotate) freshLinks.set(v.grantId, t);
+  return { ...v, url: `${v.url}&t=${t}` };
+}
 // 「パスキーで読む」: the memo key of a seat that has one, opened in this browser with one check.
 async function readWithPasskey() {
   const prf = await prfAssertion();
@@ -403,7 +452,8 @@ async function registerPasskey() {
   // The new passkey's PRF output: given at creation by some authenticators, otherwise asked for once more (Chrome gives none at
   // creation). Nothing has reached the host yet, so a passkey without PRF is refused with the old one still in place.
   // The trip's seat keys are wrapped with the new passkey's output too when this browser holds them. That is asked after the
-  // passkey is on the seat (below), where the same ceremony is also the check PATCH keys needs.
+  // passkey is on the seat (below), naming the new passkey, where the same ceremony is also the check PATCH keys needs: an output
+  // given at creation checks nothing, and the old passkey is still offered to a check that names none.
   const seats = Boolean(seat);
   let next = memo && prfOf(credential), privateKey: string | undefined;
   if (memo && !next) {
@@ -419,13 +469,14 @@ async function registerPasskey() {
   // The host dropped what the old passkey wrapped; this seat's pair is wrapped again with the new passkey's output.
   if (view.seatKey) delete view.seatKey.secret;
   let sealFailed = false;
-  if (seats) try { await sealSeatKeys(next ?? await prfAssertion(credential.rawId)); } catch { sealFailed = true; }
+  if (seats) try { await sealSeatKeys(await prfAssertion(credential.rawId)); } catch { sealFailed = true; }
   const again = view.passkey; view.passkey = true; if (dialog.open) dialog.close(); render();
   notice(`${again ? "この端末のパスキーに登録し直しました。前に登録したパスキーでは戻れなくなります。" : "パスキーを登録しました。ブラウザのデータを消しても「パスキーで戻る」から同じ席に戻れます。"}${view.role === "owner" ? "招待の発行や削除などの前の本人確認にも使います。" : view.role === "editor" ? "招待の発行・失効の前の本人確認にも使います。" : ""}${sealFailed ? "旅行の鍵をこのパスキーで包めませんでした。鍵はこの端末にだけあります。もう一度登録し直すと包めます。" : ""}`);
 }
 // The check the host asks for before an owner's important action. A browser without a passkey registers one, which counts as the check.
 // An owner who lost the passkey gets the owner invite moved to another browser by whoever published the trip (spec「2.3 Grant（招待）と Session（メンバー）」).
 const lostPasskey = "パスキーを失ったときは、旅行を発行した人にオーナー招待の差し替え（aws/recover.ts）を頼み、新しい端末で開いてください。";
+let checkedPrf: BufferSource | undefined;
 async function stepUp() {
   if (!passkeys) throw new Error(`この操作はパスキーの使えるブラウザ（Safari・Chrome）で行ってください。${lostPasskey}`);
   if (!view.passkey) {
@@ -433,11 +484,12 @@ async function stepUp() {
     return registerPasskey();
   }
   const { challenge, rpId } = await api("passkey/challenge", "POST", {});
-  const credential = await navigator.credentials.get({ publicKey: { challenge: unb64(challenge), rpId, userVerification: "required" } }) as PublicKeyCredential | null;
+  const credential = await navigator.credentials.get({ publicKey: { challenge: unb64(challenge), rpId, userVerification: "required", extensions: prfAsk } }) as PublicKeyCredential | null;
   if (!credential) throw new Error("この操作にはパスキーでの本人確認が必要です");
   const r = credential.response as AuthenticatorAssertionResponse;
   try { await api("passkey/verify", "POST", { challenge, id: credential.id, clientDataJSON: b64(r.clientDataJSON), authenticatorData: b64(r.authenticatorData), signature: b64(r.signature) }); }
   catch (err) { throw new Error(`${(err as Error).message}。この旅行に登録したパスキーを選んでください。${lostPasskey}`); }
+  checkedPrf = prfOf(credential);
 }
 async function passkeyLogin() {
   const { challenge, rpId } = await api("passkey/challenge", "POST", {});
@@ -579,7 +631,7 @@ async function forgetTrip(trip: string) {
   if (trip === id) { tripKey = undefined; tripKeyFrom = ""; }
 }
 // A sealed trip is listed on this browser by its plain dates only: its title stays out of localStorage (spec「5.3 暗号化した旅行で Host にできないこと」).
-async function reload() { await load(); if (id) remember(list => [...list.filter(t => t.id !== id), { id, title: view.sealed ? "暗号化した旅行" : view.spec.title, startsOn: view.spec.trip.startsOn, endsOn: view.spec.trip.endsOn, purgeAt: view.spec.lifecycle.purgeAt }]); }
+async function reload() { await load(); await takeLink(); if (id) remember(list => [...list.filter(t => t.id !== id), { id, title: view.sealed ? "暗号化した旅行" : view.spec.title, startsOn: view.spec.trip.startsOn, endsOn: view.spec.trip.endsOn, purgeAt: view.spec.lifecycle.purgeAt }]); }
 // The page a trip opens on is chosen once, on the first load: a press of a tab, a reload or the 20-second refresh keeps the one shown.
 async function load() {
   loads++;
@@ -611,7 +663,8 @@ async function rekeyIfDue() {
 let rekeyAsked = false;
 // The trip key replaced with the next generation by this owner's browser (docs/ephemeral-trip-capsule.md「5.5 旅行の鍵を替える」): the trip as the host holds
 // it opened with the present key and sealed again with a new one (resealAll), the new key wrapped to every seat this seat reaches
-// by the edges and signed by this seat, all in one POST rekey. A seat not reached takes the key again by the codes. Another
+// by the edges and every seat that took it by a link (whose mark the host keeps, spec「5.1 旅行の鍵と受け渡し」), signed by this seat, all in one
+// POST rekey. A seat not reached takes the key again by the codes. Another
 // member's change meanwhile (409) is read again once; a second one stops.
 let rekeying = false, rekeyFailed = false;
 async function rekeyTrip() {
@@ -623,9 +676,11 @@ async function rekeyTrip() {
     const sealed = await resealAll(old, key, id, generation, { spec: raw.spec as unknown as SealedSpec, document: raw.document as unknown as SealedDocument, footprints: raw.footprints.map(p => ({ id: p.id, point: p.point, by: p.by })), media: raw.media, members: grants.flatMap(g => g.members).map(m => ({ id: m.id, label: m.label })), grants: grants.map(g => ({ id: g.id, label: g.label })) });
     const seats = raw.seats ?? [], reached = await reachableSeats({ id: raw.self.id, ed25519: k.ed25519 }, seats, id);
     // This seat's own wrap goes to the key it just showed it holds, not to the one the list names.
-    const to = seats.filter(s => reached.has(s.id)).map(s => s.id === raw.self!.id ? { ...s, x25519: k.x25519 } : s);
+    const to = seats.filter(s => reached.has(s.id) || s.linked).map(s => s.id === raw.self!.id ? { ...s, x25519: k.x25519 } : s);
     const wraps = await Promise.all(to.map(async s => { const w = await wrapTripKey(key, s.x25519, id, generation); return { seat: s.id, ...w, signature: await signRekey(secret.ed25519, { capsuleId: id, generation, seat: s.id, x25519: s.x25519, ...w }) }; }));
-    try { await api("rekey", "POST", { generation, ...sealed, seats: wraps, confirm: true }, raw.document.revision); }
+    const who = { seat: raw.self.id, x25519: k.x25519, ed25519: k.ed25519 };
+    const links = await Promise.all([...freshLinks].filter(([grant]) => grants.some(g => g.id === grant)).map(async ([grant, t]) => ({ grant, key: { generation, wrapped: await sealLinkKey(key, t, id, generation, who), owner: who } })));
+    try { await api("rekey", "POST", { generation, ...sealed, seats: wraps, links, confirm: true }, raw.document.revision); }
     catch (err) { if ((err as { status?: number }).status === 409 && attempt === 0) continue; throw (err as { status?: number }).status === 409 ? new Error("鍵を替えられませんでした。開き直してください") : err; }
     await keepGeneration(generation); await reload();
     const left = seats.length - to.length;
@@ -640,7 +695,7 @@ let locked = "", sealedNow: { spec: SealedSpec; document: SealedDocument } | und
 async function openSealed() {
   locked = ""; view.unreadable = []; sealedNow = undefined;
   if (!view.sealed) return;
-  if (!tripKey) { view.footprints = []; locked = keyRefused ? unverifiedKey : restorable() ? restoreHint : "オーナーかメンバーから鍵を受け取ってください"; return; }
+  if (!tripKey) { view.footprints = []; locked = keyRefused ? unverifiedKey : restorable() ? restoreHint : askLink; return; }
   const t = await openTrip(tripKey, id!, view as unknown as { spec: SealedSpec; document: SealedDocument });
   if (!t) { view.footprints = []; locked = "旅程を開けません（旅行の鍵が合いません）"; return; }
   // The ciphertext as the host sent it, kept for a revise or an undo: a record left as it was is sent back as it came (resealTrip).
@@ -731,6 +786,7 @@ async function creationHome() {
   const unowned: Array<{ id: string; title: string; startsOn: string; endsOn: string; purgeAt: string }> = creatorLabel ? await api("/v1/creators/trips", "POST", {}).catch(() => []) : [];
   app.innerHTML = `<header class="topbar"><a class="brand" href="/">旅のカプセル</a></header><main><section class="content"><span class="eyebrow">YOUR PRIVATE TRIP</span><h1>旅ごとに、<br>小さなしおりを。</h1><p>公開ページには誰の旅行も載せません。作成した旅行は、招待した人とだけ共有できます。</p>${joined().length ? `<div class="card"><h2>この端末で参加中の旅行</h2><div class="grant-list">${joined().reverse().map(t => `<div class="grant"><div><strong>${e(t.title)}</strong><small>${e(t.startsOn)}〜${e(t.endsOn)}</small></div><a class="button secondary" href="/c/${t.id}">開く</a></div>`).join("")}</div></div>` : ""}${!canCreate ? `<div class="card"><p>旅行のしおりは、受け取った招待リンクから開いてください。アカウント登録は不要です。</p></div><div class="card"><h2>旅行を作る方へ</h2>${passkeys ? `<p>作成者として登録済みの方は、パスキーでサインインしてください。</p><div class="admin-actions">${button("作成者としてサインイン", "creator-login", "secondary")}</div>` : '<p class="muted">このブラウザではパスキーが使えないため、作成者としてサインインできません。</p>'}</div>` : `${creatorLabel ? `<div class="card"><p>作成者: <strong>${e(creatorLabel)}</strong></p><p class="muted">作った旅行は、保存したときに、この端末をオーナーにするか、オーナーのリンクを受け取って別の端末・別の人に渡すかを選びます。</p><div class="admin-actions">${button("別の端末を追加", "creator-add-device", "quiet")}${button("サインアウト", "creator-signout", "quiet")}</div>${creator?.delegated === false ? `<hr><h3>作成権限を分ける</h3><p class="muted">旅行のオーナーに、新しい旅行を作る権利を分けられます。分けた人はさらに分けられず、作成者の権利では誰の旅行の中身も読めません。委任リンクは画面に表示せず、コピーします。</p><label>作成権限を渡す旅行の URL<input data-delegate-trip inputmode="url" placeholder="その旅行のページの URL"></label><div class="admin-actions">${button("委任リンクをコピー", "creator-delegate", "quiet")}</div>` : ""}${creator?.delegates?.length ? `<h3>分けた作成者</h3><div class="grant-list">${creator.delegates.map(d => `<div class="grant"><div><strong>${e(d.label)}</strong><small>${e(d.device)} · ${e(new Date(d.created).toLocaleDateString("ja-JP"))}</small></div>${button("失効", "creator-revoke-delegate", "quiet danger-text", `data-id="${e(d.id)}" data-title="${e(d.label)}"`)}</div>`).join("")}</div>` : ""}</div>` : ""}${unowned.length ? `<div class="card"><h2>オーナーを決めていない旅行</h2><p class="muted">保存したあと、オーナーを選ばずに閉じた旅行です。オーナーを決めるまで誰も開けません。削除予定日を過ぎると自動で消えます。「オーナーを決める」を押すと、前に受け取ったオーナーリンクは使えなくなります。</p><div class="grant-list">${unowned.map(t => `<div class="grant"><div><strong>${e(t.title)}</strong><small>${e(t.startsOn)}〜${e(t.endsOn)} · 削除予定 ${e(t.purgeAt.slice(0, 10))}</small></div><div>${button("オーナーを決める", "unowned-owner", "secondary", `data-id="${t.id}"`)}${button("削除", "unowned-purge", "quiet danger-text", `data-id="${t.id}" data-title="${e(t.title)}"`)}</div></div>`).join("")}</div></div>` : ""}<form data-form="create" class="card"><h2>新しい旅行を作成</h2>${localOnly ? '<p class="warning">開発用のローカル環境です。外部公開はしていません。</p>' : ""}<label>旅行のタイトル<input name="title" required maxlength="160" placeholder="週末の旅行"></label><label>行き先<input name="destination" required maxlength="160" placeholder="行き先を入力"></label><div class="form-grid"><label>初日<input name="start" type="date" required value="${today}"></label><label>最終日<input name="end" type="date" required value="${today}"></label></div><button class="primary">空のしおりを確認</button></form>${assistCard()}<div class="card"><h2>チャットで作って、貼り付ける</h2><p>「作り方をコピー」を押して、ChatGPTなどの使い慣れたアプリに貼り、旅行の希望を伝えてください。返ってきた答えを、前後の文ごとそのまま下に貼れます。</p><div class="admin-actions">${button("作り方をコピー", "copy-recipe", "secondary")}</div><label>チャットの返事<textarea data-paste rows="5" placeholder="返事をそのまま貼ってください（前後の文が混ざっていても大丈夫です）"></textarea></label><div class="admin-actions">${button("内容を確認する", "check-paste", "primary")}</div><ul class="paste-problems" hidden></ul><p class="muted">貼った内容は、確かめるためにこのサーバーへ送りますが、確認して保存するまでは残しません。本名・予約番号が混ざっていないか、取り込み前に確かめてください。</p><hr><h3>ファイルから取り込む</h3><label>旅程ファイル<input type="file" accept="application/json,.json" data-import="trip"></label></div>`}</section></main>`;
 }
+const askLink = "この旅行を読むには鍵が要ります。オーナーから届くリンクを、このブラウザで開いてください";
 const unverifiedKey = "新しい鍵を確かめられません。オーナーかメンバーから鍵を受け取り直してください";
 const lastKey = "鍵を持つメンバーが他にいないため、交換すると旅程をだれも読めなくなります。先に別の端末かメンバーに鍵を渡してください";
 // A seat whose private keys the passkey wrapped, of the trip's generation, whose browser lost them: 「パスキーで鍵を取り戻す」 brings them back.
@@ -744,6 +800,8 @@ const keyStatus = () => !id || view.state === "draft" ? ""
   : view.role !== "owner" || view.keyed ? `<span data-trip-key="waiting">鍵を待っています。鍵を持つメンバーと確認コードを伝え合うと受け取れます</span>${button("鍵を受け取る", "receive-key", "quiet")}` : "";
 // Seats that wait for the key, shown to a seat that holds it (any role): each with 「渡す」.
 const handoffWaiting = () => tripKey && view.waiting?.length ? view.waiting.map(w => `<span data-handoff-waiting="${e(w.id)}">${e(w.label)}が鍵を待っています</span>${button("渡す", "give-key", "quiet", `data-id="${e(w.id)}" data-label="${e(w.label)}"`)}`).join("") : "";
+// To the owner, at the top of every page: one link for everyone who waits (docs/ephemeral-trip-capsule.md「5.1 旅行の鍵と受け渡し」).
+const keyBanner = () => view.role === "owner" && tripKey && view.waiting?.length && view.state !== "frozen" ? `<div class="preview-banner" data-key-banner="${view.waiting.length}"><div><strong>${view.waiting.length} 人が鍵を待っています</strong><p>リンクをグループに 1 回貼れば、開くだけで読めるようになります。</p></div>${button("鍵を配るリンクを作る", "key-link", "primary")}</div>` : "";
 const editor = () => view.role === "owner" || view.role === "editor";
 // Every role keeps entries of its own, a viewer too, until sharing ends (the role table does not apply to them).
 const mine = () => Boolean(id) && (view.state === "active" || view.state === "reflection");
@@ -1232,6 +1290,7 @@ function render() {
   const remaining = Math.max(0, Math.ceil((+new Date(s.lifecycle.purgeAt) - Date.now()) / 86400000));
   app.innerHTML = `<header class="topbar"><a class="brand" href="/" aria-label="ホーム（旅のカプセル）"><span class="brand-icon">旅</span> <span class="brand-name">旅のカプセル</span> <span class="brand-en">TRIP CAPSULE</span></a><div class="top-actions">${id ? '<a class="button quiet" href="/">ホーム</a>' : ""}<span class="role">${roleNames[view.role]}</span>${id ? button("再読込", "reload", "quiet") : ""}${id ? button("旅を保存", "save", "secondary") : ""}${id && revisable() && view.role === "editor" && editable() ? button("チャットで直す", "revise", "secondary") : ""}${id && (view.role === "owner" || view.role === "editor") ? button("共有・管理", "manage", "primary") : ""}</div></header>
     <div class="lifecycle ${remaining <= 7 ? "urgent" : ""}"><span>● ${stateNames[view.state]}</span><span>${dateLabel(s.lifecycle.purgeAt.slice(0, 10))} に自動削除 · あと${remaining}日${remaining <= 7 && editor() ? " — 削除前に「旅を保存」で書き出してください" : ""}</span></div>
+    ${keyBanner()}
     ${view.unreadable?.length ? `<p class="warning" data-unreadable="${view.unreadable.length}">この端末で開けない記録が ${view.unreadable.length} 件あります</p>` : ""}
     ${view.state === "draft" ? `<div class="preview-banner"><div><strong>このしおりは公開前のプレビューです。</strong><p>内容・表示名・削除期限を確認して保存します。保存しただけでは招待リンクは配られません。</p></div>${button("内容を確認して作成", "publish", "primary")}</div>` : ""}
     <main><section class="hero"><div class="hero-copy"><span class="eyebrow">${e(s.presentation?.kicker ?? "A LITTLE GETAWAY")}</span><h1>${e(s.title)}</h1><p>${e(s.summary ?? "")}</p><div class="trip-meta"><span>${dateLabel(s.trip.startsOn)} — ${dateLabel(s.trip.endsOn)}</span><span>${e(s.timezone)}</span></div><div class="people">${(s.presentation?.travelers ?? []).map(t => `<span>${e(t.name.slice(0, 1))}</span>`).join("")}<small>${(s.presentation?.travelers ?? []).map(t => e(t.name) + (t.note ? `（${e(t.note)}）` : "")).join("・")}</small></div></div><div class="postcard" aria-hidden="true"><div class="postcard-top">POSTCARD <span>${e(s.presentation?.postcardLabel ?? s.trip.destinations[0]!)}</span></div><div class="landscape"><div class="sun"></div><div class="island one"></div><div class="island two"></div><div class="sea"></div><div class="boat">⛵</div></div><div class="postcard-bottom">${e(s.presentation?.postcardCaption ?? "旅に、出かけよう。").replace(/\n/g, "<br>")}<span>TRIP<br>CAPSULE</span></div></div></section>
@@ -1405,10 +1464,12 @@ function saveModal() {
   pageText = undefined; fetchPage();
   modal("旅を保存", `<h3>旅程のページを保存</h3><p>日ごとの旅程・準備・候補などを、ブラウザで開ける 1 つのファイル（HTML）で保存します。アプリが無くても開けます。スマホでは共有から「ファイルに保存」や LINE・メールに送って残せます。</p><div class="admin-actions">${button("旅程のページを保存", "save-page", "primary")}</div><hr><h3>Markdown をコピー</h3><p>旅程・準備・候補・費用メモ・メモ・思い出をテキストでコピーします。軽く、メモアプリなどに貼ればアプリ無しで読めます。</p><div class="admin-actions">${button("Markdown をコピー", "copy-markdown", "secondary")}</div>${editor() ? `<hr><h3>ZIP を保存</h3><p>旅行のファイルをまとめて保存します。スマホでは「ファイル」アプリ（iPhone）やファイルマネージャ（Android）で ZIP をタップすると展開されます。</p><ul>${view.spec.exports.map(x => `<li>${e(saveNotes[x])}</li>`).join("")}</ul><div class="admin-actions">${view.sealed ? button("ZIP を保存", "save-zip", "secondary") : `<a class="button secondary" href="/v1/c/${id}/export">ZIP を保存</a>`}</div>` : ""}${view.unreadable?.length ? `<p class="warning" data-unreadable-save>この端末で開けない記録 ${view.unreadable.length} 件は、保存する内容に入りません</p>` : ""}`);
 }
+// The invites as 共有・管理 last listed them, names opened: an invite's 失効 asks with the seats it shuts out.
+let listedGrants = new Map<string, ListedGrant>();
 // An editor gets the same dialog for the viewer invites it hands out (the host lists only those); the rest is the owner's.
 async function manage() {
   const owner = view.role === "owner", run = manageRun, shown = dialog.open;
-  const [grants, history] = await Promise.all([api("grants"), owner ? api("history") : []]) as [Array<{ id: string; role: Role; label: string; expires: number; revoked: number | null; seats: number; claimed: number; claimBy: number; issuedBy: { id: string; label: string } | null; members: Array<{ id: string; label: string; device: string; created: number; self: boolean; pending?: boolean; code?: string }> }>, Array<{ event: string; at: number; role?: Role; label?: string; by?: string; device?: string; grant?: string; seat?: string; member?: string }>];
+  const [grants, history] = await Promise.all([api("grants"), owner ? api("history") : []]) as [Array<{ id: string; role: Role; label: string; expires: number; revoked: number | null; seats: number; claimed: number; claimBy: number; issuedBy: { id: string; label: string } | null; carriesKey?: boolean; members: Array<{ id: string; label: string; device: string; created: number; self: boolean; pending?: boolean; code?: string; keyed?: boolean; seen?: number }> }>, Array<{ event: string; at: number; role?: Role; label?: string; by?: string; device?: string; grant?: string; seat?: string; member?: string }>];
   if (view.sealed) {
     if (owner) await sealNames();
     for (const g of grants) {
@@ -1426,11 +1487,17 @@ async function manage() {
     }
   }
   const day = (t: number) => new Date(t).toLocaleDateString("ja");
+  // Who waits for the key is counted from the seats listed here, as their tags say: view.waiting is told only to a seat holding
+  // the key, and leaves this seat out.
+  const sealed = Boolean(view.sealed), waiting = waitingSeats(grants.filter(g => !g.revoked));
+  const tags = (m: Parameters<typeof memberTags>[0]) => memberTags(m, sealed).map(t => ` <span class="tag ${t.kind}" ${t.kind === "seen" ? "data-seen" : `data-seat-key="${t.kind}"`}>${e(t.text)}</span>`).join("");
+  const notes = (g: typeof grants[number]) => { const link = linkNote(g, sealed, waiting); return g.revoked ? "" : `${g.role !== "owner" ? `<small data-revoke-note>${e(revokeNote(g, sealed))}</small>` : ""}${link ? `<small data-link-note>${e(link)}</small>` : ""}`; };
   const undo = owner && revisable() && view.state !== "frozen" && await api("undo").then(() => true, () => false);
   // While the lists were read, another dialog was drawn (完全に削除 pressed) or the one this was asked from was closed: drawing now
   // would replace that one or open it again. Not the close event's count: it comes after close() returns, so after a 共有・管理 pressed at once.
   if (run !== manageRun || shown && !dialog.open) return;
-  modal(owner ? "招待とメンバー、旅の終わり" : "閲覧者の招待", `${owner ? "" : "<p>あなたが出した閲覧者の招待です。失効できるのは自分が出した招待だけです。</p>"}<p>招待リンクは人数分の席を持ち、開いたブラウザを1席ずつ登録します。定員に達するか受付期限を過ぎたリンクは使えなくなり、登録済みのブラウザだけが入れます。登録したブラウザの鍵（Cookie）が他人に渡ると、その人も入れます。</p><p>招待の発行・失効${owner ? "、共有終了、削除、期限の変更" : ""}の前に、この端末のパスキーで本人確認します（5 分間有効）。</p>${location.protocol === "http:" ? '<p class="warning">現在はこのPC内のローカル版です。別の端末から使うには、HTTPSの公開ホストへ配置してください。</p>' : ""}<form data-form="grant"><div class="form-grid"><label>権限<select name="role">${owner ? '<option value="participant">参加者：候補・チェック・思い出</option><option value="viewer">閲覧者：見るだけ</option><option value="editor">編集者：旅程も編集</option>' : '<option value="viewer">閲覧者：見るだけ</option>'}</select></label><label>リンク名（任意）<input name="label" maxlength="80" placeholder="空欄なら自動で付けます"></label><label>人数（席）<input name="seats" type="number" required min="1" max="50" value="1"></label><label>受付期限（日）<input name="claimDays" type="number" required min="1" max="30" value="3"></label>${owner ? '<label>参加の承認<select name="approval"><option value="auto">自動で参加（既定）</option><option value="owner">オーナーが確認コードで承認</option></select></label>' : ""}</div>${owner ? '<p class="muted">機密度の高い旅行向け。参加者の画面に出る 6 桁のコードを LINE などで聞いて照合します。</p>' : ""}<button class="primary" ${view.state === "frozen" ? "disabled" : ""}>招待リンクを発行</button></form><div class="grant-list">${grants.map(g => `<div class="grant"><div><strong>${e(g.label)}</strong><small>${roleNames[g.role]} · ${g.revoked ? "失効済み" : `登録 ${g.claimed}/${g.seats}席 · ${g.claimed >= g.seats ? "定員に達し受付終了" : g.claimBy <= Date.now() ? "受付期限切れ" : "受付 " + day(g.claimBy) + "まで"}`}</small>${owner ? `<small>発行: ${e(g.issuedBy?.label ?? "オーナー（発行時）")}</small>` : ""}${g.revoked ? "" : g.members.map(m => `<small class="member">${e(m.label)}${m.self ? "（この端末）" : ""} · ${e(m.device)} · ${day(m.created)}登録 ${m.pending ? `<strong>承認待ち · コード <span class="code">${e(m.code ?? "")}</span></strong> ${owner ? button("承認", "approve-member", "quiet", `data-id="${m.id}"`) + button("拒否", "reject-member", "quiet danger-text", `data-id="${m.id}"`) : ""}` : ""}${owner ? button("名前", "rename-member", "quiet", `data-id="${m.id}" data-label="${e(m.label)}"`) : ""}${g.role !== "owner" ? button("失効", "revoke-member", "quiet danger-text", `data-id="${m.id}"`) : ""}</small>`).join("")}</div>${!g.revoked && view.state !== "frozen" ? `<div>${button("交換", "rotate", "quiet", `data-id="${g.id}" data-role="${g.role}" data-label="${e(g.label)}"`)}${g.role !== "owner" ? button("失効", "revoke", "quiet danger-text", `data-id="${g.id}"`) : ""}</div>` : ""}</div>`).join("")}</div>${owner ? `<details class="history"><summary>招待とオーナーの履歴（${history.length} 件）</summary>${history.length ? `<ol>${history.map(a => `<li>${[`${day(a.at)} ${new Date(a.at).toLocaleTimeString("ja", { hour: "2-digit", minute: "2-digit" })}`, e(historyNames[a.event] ?? a.event), a.role ? roleNames[a.role] : "", a.label ? e(a.label) : "", a.by ? `${e(a.by)}${a.device ? `（${e(a.device)}）` : ""}` : ""].filter(Boolean).join(" · ")}</li>`).join("")}</ol>` : "<p>まだありません</p>"}</details><hr><p>自動削除：${e(new Date(view.spec.lifecycle.purgeAt).toLocaleString("ja"))}<br>削除前に『旅を保存』で書き出してください。</p>${revisable() ? "" : `<p class="muted" data-sealed="manage">${notRevisable}</p>`}<div class="admin-actions">${button("旅を保存", "save", "secondary")}${revisable() ? button("チャットで直す", "revise", "secondary", view.state === "frozen" ? "disabled" : "") : ""}${undo ? button("1 つ前に戻す", "undo", "secondary") : ""}${button("設定・期限の変更", "settings", "secondary", view.state === "frozen" ? "disabled" : "")}${button("共有を終了", "freeze", "secondary", view.state === "frozen" ? "disabled" : "")}${button("完全に削除", "purge", "danger")}</div><p class="muted">共有終了はオーナー以外のリンクを失効させます。完全削除すると元に戻せません。</p>` : ""}`);
+  listedGrants = new Map(grants.map(g => [g.id, g]));
+  modal(owner ? "招待とメンバー、旅の終わり" : "閲覧者の招待", `${owner ? "" : "<p>あなたが出した閲覧者の招待です。失効できるのは自分が出した招待だけです。</p>"}<p>招待リンクは人数分の席を持ち、開いたブラウザを1席ずつ登録します。定員に達するか受付期限を過ぎたリンクは使えなくなり、登録済みのブラウザだけが入れます。登録したブラウザの鍵（Cookie）が他人に渡ると、その人も入れます。</p><p>招待の発行・失効${owner ? "、共有終了、削除、期限の変更" : ""}の前に、この端末のパスキーで本人確認します（5 分間有効）。</p>${location.protocol === "http:" ? '<p class="warning">現在はこのPC内のローカル版です。別の端末から使うには、HTTPSの公開ホストへ配置してください。</p>' : ""}<form data-form="grant"><div class="form-grid"><label>権限<select name="role">${owner ? '<option value="participant">参加者：候補・チェック・思い出</option><option value="viewer">閲覧者：見るだけ</option><option value="editor">編集者：旅程も編集</option>' : '<option value="viewer">閲覧者：見るだけ</option>'}</select></label><label>リンク名（任意）<input name="label" maxlength="80" placeholder="空欄なら自動で付けます"></label><label>人数（席）<input name="seats" type="number" required min="1" max="50" value="1"></label><label>受付期限（日）<input name="claimDays" type="number" required min="1" max="30" value="3"></label>${owner ? '<label>参加の承認<select name="approval"><option value="auto">自動で参加（既定）</option><option value="owner">オーナーが確認コードで承認</option></select></label>' : ""}</div>${owner ? '<p class="muted">機密度の高い旅行向け。参加者の画面に出る 6 桁のコードを LINE などで聞いて照合します。</p>' : ""}<button class="primary" ${view.state === "frozen" ? "disabled" : ""}>招待リンクを発行</button></form><div class="grant-list">${grants.map(g => `<div class="grant"><div><strong>${e(g.label)}</strong><small>${roleNames[g.role]} · ${g.revoked ? "失効済み" : `登録 ${g.claimed}/${g.seats}席 · ${g.claimed >= g.seats ? "定員に達し受付終了" : g.claimBy <= Date.now() ? "受付期限切れ" : "受付 " + day(g.claimBy) + "まで"}`}</small>${owner ? `<small>発行: ${e(g.issuedBy?.label ?? "オーナー（発行時）")}</small>` : ""}${g.revoked ? "" : g.members.map(m => `<small class="member">${e(m.label)}${m.self ? "（この端末）" : ""} · ${e(m.device)} · ${day(m.created)}登録${tags(m)} ${m.pending ? `<strong>承認待ち · コード <span class="code">${e(m.code ?? "")}</span></strong> ${owner ? button("承認", "approve-member", "quiet", `data-id="${m.id}"`) + button("拒否", "reject-member", "quiet danger-text", `data-id="${m.id}"`) : ""}` : ""}${owner ? button("名前", "rename-member", "quiet", `data-id="${m.id}" data-label="${e(m.label)}"`) : ""}${g.role !== "owner" ? button("失効", "revoke-member", "quiet danger-text", `data-id="${m.id}"`) : ""}</small>`).join("")}${notes(g)}</div>${!g.revoked && view.state !== "frozen" ? `<div>${button("交換", "rotate", "quiet", `data-id="${g.id}" data-role="${g.role}" data-label="${e(g.label)}"`)}${g.role !== "owner" ? button("失効", "revoke", "quiet danger-text", `data-id="${g.id}"`) : ""}</div>` : ""}</div>`).join("")}</div>${owner ? `<details class="history"><summary>招待とオーナーの履歴（${history.length} 件）</summary>${history.length ? `<ol>${history.map(a => `<li>${[`${day(a.at)} ${new Date(a.at).toLocaleTimeString("ja", { hour: "2-digit", minute: "2-digit" })}`, e(historyNames[a.event] ?? a.event), a.role ? roleNames[a.role] : "", a.label ? e(a.label) : "", a.by ? `${e(a.by)}${a.device ? `（${e(a.device)}）` : ""}` : ""].filter(Boolean).join(" · ")}</li>`).join("")}</ol>` : "<p>まだありません</p>"}</details><hr><p>自動削除：${e(new Date(view.spec.lifecycle.purgeAt).toLocaleString("ja"))}<br>削除前に『旅を保存』で書き出してください。</p>${revisable() ? "" : `<p class="muted" data-sealed="manage">${notRevisable}</p>`}<div class="admin-actions">${button("旅を保存", "save", "secondary")}${revisable() ? button("チャットで直す", "revise", "secondary", view.state === "frozen" ? "disabled" : "") : ""}${undo ? button("1 つ前に戻す", "undo", "secondary") : ""}${button("設定・期限の変更", "settings", "secondary", view.state === "frozen" ? "disabled" : "")}${button("共有を終了", "freeze", "secondary", view.state === "frozen" ? "disabled" : "")}${button("完全に削除", "purge", "danger")}</div><p class="muted">共有終了はオーナー以外のリンクを失効させます。完全削除すると元に戻せません。</p>` : ""}`);
 }
 function showLink(url: string, owner = false, openHere = owner) { modal(owner ? "オーナーとして使う端末で開いてください" : "招待リンクができました", `<p>${owner ? "このリンクは最初に開いて登録した1つのブラウザだけをオーナーにします。後から再表示できません。3日以内に、普段使う端末のブラウザで開いてください。" : "メンバーに送ってください。開いたブラウザが1席ずつ登録され、定員に達するか受付期限を過ぎると使えなくなります。"}</p><label>リンク<input id="issued-link" readonly value="${e(url)}"></label><div class="admin-actions">${button("コピー", "copy", "primary")}${openHere ? `<a class="button secondary" href="${e(url)}">カプセルを開く</a>` : ""}</div>`); }
 document.addEventListener("click", async event => {
@@ -1486,6 +1553,10 @@ document.addEventListener("click", async event => {
     if (action === "remove-post" && confirm(`この投稿を消しますか？取り消せません。${(post(b) as { promoted?: boolean } | undefined)?.promoted ? "旅程に追加した予定は残ります。" : ""}`)) await mutate({ type: "remove", list: b.dataset.list, id: b.dataset.id });
     if (action === "include") await mutate({ type: "include", id: b.dataset.id, included: b.dataset.included === "true" });
     if (action === "manage") await manage();
+    if (action === "key-link") {
+      const gid = newGrantId(), v = await issueInvite({ role: "participant", label: await nameFor("grant", gid, "鍵を配るリンク"), id: gid, seats: view.waiting!.length, expiresAt: view.spec.lifecycle.purgeAt, confirm: true });
+      modal("鍵を配るリンク", `<p>このリンクをグループに 1 回貼ってください。鍵を待っている人は、開くだけで読めるようになります。</p><label>リンク<input id="issued-link" readonly value="${e(v.url)}"></label><div class="admin-actions">${button("コピー", "copy", "primary")}</div><p class="muted">旅行のメンバーにだけ渡してください。席が空いていれば、リンクを開いた人も読めます。</p>`);
+    }
     if (action === "save") saveModal();
     if (action === "copy") { const field = document.querySelector<HTMLInputElement>("#issued-link")!; try { await navigator.clipboard.writeText(field.value); notice("リンクをコピーしました。"); } catch { field.select(); notice("リンクを選択しました。コピーして保存してください。"); } }
     if (action === "join") { const joined = await api("sessions", "POST", { secret: joinSecret }); joinSecret = ""; history.replaceState(null, "", location.pathname); if (joined.pending) return pendingScreen(joined.code); await reload(); modal("この端末を登録しました", `<p>次からは <strong>${e(location.host)}</strong> を開くと「この端末で参加中の旅行」から入れます。このページをブックマークするか、ホーム画面に追加しておくと確実です。</p><p class="muted">受け取った招待リンクも、このブラウザでなら開き直せます。ブラウザのデータ（Cookie）を消すと登録が消え、${passkeys ? "パスキーを登録していなければ" : ""}オーナーからの再招待が必要になります。</p>${passkeys ? `<div class="admin-actions">${button("Face ID / 指紋で戻れるようにする（任意）", "passkey-register", "secondary")}</div><p class="muted">Cookie を消したときに同じ席に戻れます。${view.role === "owner" ? "オーナーは、招待の発行や削除などの前の本人確認にも使います。" : view.role === "editor" ? "編集者は、招待の発行・失効の前の本人確認にも使います。" : ""}閲覧の盗み見を防ぐものではありません。</p>` : ""}`); }
@@ -1585,24 +1656,24 @@ document.addEventListener("click", async event => {
     if (action === "signout" && confirm(`この端末からログアウトしますか？${view.passkey ? "登録したパスキーで、この旅行の「パスキーで戻る」から戻れます。" : `パスキーを登録していないため、ログアウトすると、${view.role === "owner" ? "運用者によるオーナーリンクの出し直し（aws/recover.ts）" : "オーナーの再招待"}が要ります。`}`)) {
       await api("signout", "POST", { confirm: true }); remember(list => list.filter(t => t.id !== id)); location.href = "/";
     }
-    if (action === "rekey") { await stepUp(); dialog.close(); await rekeyTrip(); }
-    if (action === "rekey-keep") { await stepUp(); await api("keys", "PATCH", { type: "keep" }); dialog.close(); await reload(); notice("鍵はそのままです"); }
+    if (action === "rekey") { await stepUp(); const prf = checkedPrf; checkedPrf = undefined; dialog.close(); await rekeyTrip(); if (prf) await sealSeatKeys(prf).catch(() => undefined); }
+    if (action === "rekey-keep") { await stepUp(); const prf = checkedPrf; checkedPrf = undefined; await api("keys", "PATCH", { type: "keep" }); dialog.close(); await reload(); if (prf) await sealSeatKeys(prf).catch(() => undefined); notice("鍵はそのままです"); }
     if (action === "approve-member") { await api("approve", "POST", { member: b.dataset.id, approve: true, confirm: true }); await manage(); }
     if (action === "reject-member" && confirm("拒否しますか？席は戻りません")) { await api("approve", "POST", { member: b.dataset.id, approve: false, confirm: true }); await manage(); }
     if (action === "pending-reload") location.reload();
     // A seat that held the key is gone: reading the trip again lets the owner's browser replace the key (load) before the list is shown.
     if (action === "revoke-member" && confirm("この端末の登録を失効させますか？席は戻りません。再参加には新しい招待リンクが必要です。")) { await api("revoke", "POST", { member: b.dataset.id, confirm: true }); await reload(); await manage(); }
     if (action === "rename-member") { const label = prompt("メンバーの表示名", b.dataset.label)?.trim(); if (label) { await namesSealing; await api("members", "PATCH", { id: b.dataset.id, label: await nameFor("member", b.dataset.id!, label) }); await manage(); } }
-    if (action === "revoke" && confirm("この招待リンクと、そこから登録した全員を失効させますか？")) { await api("revoke", "POST", { id: b.dataset.id, confirm: true }); await reload(); await manage(); }
+    if (action === "revoke" && confirm((g => g ? revokeConfirm(g, Boolean(view.sealed)) : "この招待リンクと、そこから登録した全員を失効させますか？")(listedGrants.get(b.dataset.id!)))) { await api("revoke", "POST", { id: b.dataset.id, confirm: true }); await reload(); await manage(); }
     // The owner invite handed over takes its seat's key with it: with no other seat holding the present one, the trip would be
     // read by nobody (spec「5.5 旅行の鍵を替える」). The same rule as the host's (409 last-key), on the seats that hold a key and do not wait for one.
     if (action === "rotate" && b.dataset.role === "owner" && view.sealed && !(view.seats ?? []).some(s => s.id !== view.self?.id && !view.waiting?.some(w => w.id === s.id))) notice(lastKey, true);
     else if (action === "rotate" && confirm(`新しいリンクに交換し、古いリンクを直ちに失効させますか？${b.dataset.role === "owner" && view.sealed ? "新しいオーナーは、鍵を持つメンバーと確認コードを合わせて鍵を受け取ります。" : ""}`)) {
       // The new invite keeps the name: the host's own as it is, one of the members' sealed against the new invite's id.
       const gid = newGrantId(), host = b.dataset.label === "自分用" || b.dataset.label === "招待リンク";
-      const v = await api("grants", "POST", { role: b.dataset.role, label: host ? b.dataset.label : await nameFor("grant", gid, b.dataset.label!), ...view.sealed && { id: gid }, expiresAt: view.spec.lifecycle.purgeAt, confirm: true, rotate: b.dataset.id });
+      const v = await issueInvite({ role: b.dataset.role, label: host ? b.dataset.label : await nameFor("grant", gid, b.dataset.label!), ...view.sealed && { id: gid }, expiresAt: view.spec.lifecycle.purgeAt, confirm: true, rotate: b.dataset.id });
       // An owner invite handed over takes this seat with it: there is nothing left to read again (the new owner is asked, spec「5.5 旅行の鍵を替える」).
-      if (b.dataset.role !== "owner") await reload();
+      if (b.dataset.role !== "owner") { await reload(); freshLinks.clear(); }
       showLink(v.url, b.dataset.role === "owner");
     }
     if (action === "freeze" && confirm("共有を終了し、オーナー以外のリンクをすべて失効させますか？以降は読み取り専用です。")) { await api("freeze", "POST", { confirm: true }); dialog.close(); await reload(); }
@@ -1690,7 +1761,7 @@ document.addEventListener("submit", async event => {
       await savePrivate({ type: "put", entry: await sealEntry(key, entry) });
       if (!item) { diaryDay = f.day!; editingDiaryId = ""; render(); }
     }
-    if (form.dataset.form === "grant") { const gid = newGrantId(), v = await api("grants", "POST", { role: f.role, label: await nameFor("grant", gid, f.label!.trim() || `${roleNames[f.role as Role]}の招待 ${new Date().toLocaleDateString("ja", { month: "numeric", day: "numeric" })}`), ...view.sealed && { id: gid }, seats: Number(f.seats), claimDays: Number(f.claimDays), approval: f.approval ?? "auto", expiresAt: view.spec.lifecycle.purgeAt, confirm: true }); showLink(v.url); }
+    if (form.dataset.form === "grant") { const gid = newGrantId(), v = await issueInvite({ role: f.role, label: await nameFor("grant", gid, f.label!.trim() || `${roleNames[f.role as Role]}の招待 ${new Date().toLocaleDateString("ja", { month: "numeric", day: "numeric" })}`), ...view.sealed && { id: gid }, seats: Number(f.seats), claimDays: Number(f.claimDays), approval: f.approval ?? "auto", expiresAt: view.spec.lifecycle.purgeAt, confirm: true }); showLink(v.url); }
     if (form.dataset.form === "revise-private" && revisingPrivate) {
       // Sealed here, every entry, and sent in one apply: the host takes all of them or none.
       const d = revisingPrivate, key = await memoKey(); if (!key) throw new Error("自分だけのメモの鍵を開けませんでした。もう一度「チャットで直す」から開いてください。");
@@ -1944,6 +2015,7 @@ function joinScreen() {
 }
 async function boot() {
   const secret = id ? new URLSearchParams(location.hash.slice(1)).get("k") ?? "" : "";
+  keepLink();
   try {
     const enrollment = id ? "" : new URLSearchParams(location.hash.slice(1)).get("creator") ?? "";
     if (enrollment) return await creatorEnrollScreen(enrollment);
@@ -1967,7 +2039,7 @@ document.addEventListener("visibilitychange", () => void autoFootprint());
 // An enrollment link pasted into a tab already showing the top page changes only the fragment, as a delegation link does in a
 // tab already showing its trip.
 // On the trip's page it is read afresh, so that the trip shown before (and its reading every 20 seconds) is not drawn over the screen.
-addEventListener("hashchange", () => { const link = new URLSearchParams(location.hash.slice(1)); if (id && link.get("delegate")) location.reload(); else if (!id && link.get("creator")) void boot(); });
+addEventListener("hashchange", () => { const link = new URLSearchParams(location.hash.slice(1)); if (id && (link.get("delegate") || link.get("t"))) location.reload(); else if (!id && link.get("creator")) void boot(); });
 setInterval(async () => {
   if (!id || !view || document.hidden || dialog.open || dragging) return;
   // Asked again after the request: a grip pressed while it was in flight must not have its day redrawn under the finger.

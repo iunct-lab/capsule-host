@@ -51,7 +51,7 @@ export function tripHtml(spec: Spec, doc: Document) {
 }
 const sha256 = async (s: string) => [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s)))].map(b => b.toString(16).padStart(2, "0")).join("");
 export async function exportFiles(id: string, spec: Spec, doc: Document, updatedAt: string) {
-  const calendar = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Switchboard//Trip Capsule//JA", "CALSCALE:GREGORIAN"];
+  const calendar = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//capsule-host//Trip Capsule//JA", "CALSCALE:GREGORIAN"];
   for (const i of doc.items.filter(i => i.status === "confirmed" && i.startsAt)) calendar.push("BEGIN:VEVENT", `UID:${id}-${i.id}@trip-capsule`, `DTSTAMP:${stamp(updatedAt)}`, `DTSTART:${stamp(i.startsAt!)}`, ...(i.endsAt ? [`DTEND:${stamp(i.endsAt)}`] : []), `SUMMARY:${ics(i.title)}`, `DESCRIPTION:${ics(i.description ?? "")}`, ...(i.place ? [`LOCATION:${ics(i.place.label)}`] : []), "END:VEVENT");
   calendar.push("END:VCALENDAR");
   const files: Record<string, string> = {};

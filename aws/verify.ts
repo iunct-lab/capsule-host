@@ -121,6 +121,10 @@ try {
   assert.equal(page.headers.get("Cache-Control"), "no-cache");
   for (const path of ["/c/00000000000000000000000000000000", "/app.js", "/app.css"]) { const r = await request(path); assert.equal(r.status, 200, path); assert.equal(r.headers.get("Cache-Control"), "no-cache", path); }
   assert.equal((await request("/v1/account", "GET", undefined, "")).headers.get("Cache-Control"), "no-store");
+  // An answer CloudFront writes itself on /v1/* (plain http is refused) carries the API policy's headers (ApiSecurityHeaders).
+  const plain = await fetch(origin.replace(/^https:/, "http:") + "/v1/account", { redirect: "manual" });
+  assert.equal(plain.status, 403);
+  for (const [name, value] of [["Cache-Control", "no-store"], ["X-Frame-Options", "DENY"], ["X-Content-Type-Options", "nosniff"], ["Referrer-Policy", "no-referrer"]] as const) assert.equal(plain.headers.get(name), value, name);
   const seed = testTrip(); seed.spec.title = title;
   // Keep this fictional trip active when the fixed item dates are in the past, so participant checks remain permitted.
   const end = new Date(Date.now() + 2 * 86400000).toISOString().slice(0, 10);
@@ -408,6 +412,7 @@ try {
     assert.equal((await request(sAt("/media"), "POST", photoBody, sMember)).status, 201);
     for (const cookie of [sMember, sViewer, sealedOwner]) {
       const got = await request(sAt(`/media/${photoId}/display`), "GET", undefined, cookie); assert.equal(got.status, 200);
+      assert.equal(got.headers.get("Cache-Control"), "private, max-age=3600", "CloudFront's /v1/* policy replaced the Host's Cache-Control");
       assert.equal(Buffer.compare(Buffer.from(await got.arrayBuffer()), Buffer.from(photo.display)), 0, "the host did not return the image as it came");
     }
     assert.equal((await request(sAt(`/media/${photoId}/thumb`), "GET", undefined, "")).status, 401);

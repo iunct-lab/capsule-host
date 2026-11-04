@@ -29,9 +29,13 @@ Lambda同時実行上限が10の新規アカウントは予約同時実行を確
 
 まずCloudFormation変更セットを確認して実行する。初回はPublicOriginが無効なプレースホルダーなので、実旅程は発行しない。出力Originを得たら、同じdeployに `--parameter-overrides PublicOrigin=https://DISTRIBUTION.cloudfront.net` を付けて更新する。循環依存を避けるための2段階設定。
 
-参加者のCookieとパスキーはこのOrigin（パスキーのRP IDは `PublicOrigin` のホスト名）に紐づく。Distributionを作り直す、独自ドメインへ切り替えるなどでドメインが変わると、進行中の旅行の登録（Cookie・パスキー）は全員分が無効になり、ownerは `aws/recover.ts`、参加者は再招待が必要になる。旅行の途中でドメインを変えない。
+参加者のCookieとパスキーはこのOrigin（パスキーのRP IDは `PublicOrigin` のホスト名）に紐づく。Distributionを作り直す、独自ドメインへ切り替えるなどでドメインが変わると、進行中の旅行の登録（Cookie・パスキー）は全員分が無効になり、ownerは `aws/recover.ts`、参加者は再招待が必要になる。旅行の途中でドメインを変えない。独自ドメインへの移行は旅行の合間に行うもので、この文書の手順では扱わない。
+
+標準ドメイン（`*.cloudfront.net`）の証明書では、閲覧者向けの最低 TLS を 1.2 以上に制限できない（`Cdn` に `ViewerCertificate` を指定していないので CloudFront の標準証明書になり、セキュリティポリシーは TLSv1 に固定される。`MinimumProtocolVersion` を TLSv1.2 以上にできるのは独自の証明書を付けたときだけ）。CloudFront から Web Function のオリジン（`api`）へは `OriginSSLProtocols: [TLSv1.2]` で 1.2 以上に限っている。閲覧者向けを制限するには独自ドメインが要るが、独自ドメインは求めない（現時点）。
 
 AssetsBucket出力で指定された非公開S3へ `dist/public/` の6ファイル（画面の `index.html`・`app.js`・`app.css` と、足あとの地図の部品 `map.js`・`maplibre-worker.mjs`・`map.css`）だけを配置する。`aws s3 sync dist/public/ s3://BUCKET/ --profile YOUR_PROFILE --region ap-northeast-1` を使う。data/・原本・実旅程・ownerリンク・リポジトリ全体をアップロードしない。更新時はCloudFrontのキャッシュを無効化する。画面の3ファイルにはCloudFrontの応答ヘッダーポリシー（`SecurityHeaders`）が `Cache-Control: no-cache` を付けるので、端末のブラウザは開くたびにETagで確かめ直し（変わっていなければ304）、配置の後に前の版の `app.js` を使い続けない。エッジのキャッシュは無効化で新しくなるので、無効化は省かない。CloudFrontは画面のファイルを `Accept-Encoding` に合わせて Brotli か gzip に圧縮して返す（`DefaultCacheBehavior` の `Compress`。圧縮するのは 1,000 B〜10,000,000 B のファイルだけなので、`index.html`（約 700 B）と地図データ `map/*.pmtiles` は圧縮されず、地図データは Range のまま）。`sync` に `--delete` を付けない（同じバケットの `map/` の地図データを消してしまう）。
+
+`/v1/*` には静的用の `SecurityHeaders` ではなく API 用の応答ヘッダーポリシー（`ApiSecurityHeaders`）を付ける。`Cache-Control: no-store`・`X-Content-Type-Options`・`X-Frame-Options`・`Referrer-Policy`・HSTS を、すべて `Override: false` で足すので、Host が付けた値（写真の `private, max-age=3600` など）がそのまま優先され、Host を通らない CloudFront 自身の応答（拒否など）にだけ効く。CSP と `no-cache` は付けない。
 
 ### パラメータ
 
@@ -56,7 +60,7 @@ AssetsBucket出力で指定された非公開S3へ `dist/public/` の6ファイ�
 
 **写真は既定で無効**で、スタックのパラメータ `Photos`（`'0'` が既定、`'1'` で有効）が Host と Web の `CAPSULE_PHOTOS` になる。有効にするのは、機微な情報が増えうること・費用がかさむことを検討して決めてから（`sam deploy` に `--parameter-overrides Photos=1`）。無効のあいだ `Media` は空で費用は出ず、`aws/verify.ts` は写真の場面を走らせず、Host が断ることだけを確かめる（有効のスタックでは全部走る）。
 
-メンバーが上げた写真の画像は、旅行の鍵で暗号化した bytes（表示用とサムネイルの 2 つ）のまま、スタックの非公開 S3 バケット `Media` に置く（`src/aws-media.ts`。何を暗号化するかは仕様書の「5.2 暗号化するもの・平文に残すもの」）。バケットは公開を全部ブロックし、CloudFront の経路も署名付き URL も持たない。画像は `/v1/c/<id>/media/<写真の id>/(thumb|display)` を Web Function が Cookie の席で判定して返す（応答は `private, max-age=3600`）。キーは `<カプセルの行のキー>/<アップロードごとの名前>.(thumb|display)` で、旅行の削除（オーナーの完全削除・運用者の terminate・期限の sweep）は、行を空にする前にその prefix を消す。消せなければ行を残して次の sweep でやり直す。バケットの 181 日の有効期限は、その歯止め（旅行は作成から 180 日までなので、消し漏れがあっても 181 日で消える）で、削除の正は Host の `removeAll`。中身が暗号文なので、S3 の暗号化（SSE）は運用者に対する守りではなく既定のまま。`DeletionPolicy: Retain` なので、スタックを消してもバケットは残る（中身が空であることを確かめて手で消す）。`aws/verify.ts` は、検証用のスタックで、写真を上げ → 上げた暗号文がそのまま返る → 鍵を替えても開ける → purge の後にその prefix のオブジェクトが 0 件、を確かめる（バケット名と prefix は出力しない）。
+メンバーが上げた写真の画像は、旅行の鍵で暗号化した bytes（表示用とサムネイルの 2 つ）のまま、スタックの非公開 S3 バケット `Media` に置く（`src/aws-media.ts`。何を暗号化するかは仕様書の「5.2 暗号化するもの・平文に残すもの」）。バケットは公開を全部ブロックし、CloudFront の経路も署名付き URL も持たない。画像は `/v1/c/<id>/media/<写真の id>/(thumb|display)` を Web Function が Cookie の席で判定して返す（応答は `private, max-age=3600`）。キーは `<カプセルの行のキー>/<アップロードごとの名前>.(thumb|display)` で、旅行の削除（オーナーの完全削除・運用者の terminate・期限の sweep）は、行を空にする前にその prefix を消す。消せなければ行を残して次の sweep でやり直す。バケットの 181 日の有効期限は、その歯止め（旅行は作成から 180 日までなので、消し漏れがあっても 181 日で消える）で、削除の正は Host の `removeAll`。中身が暗号文なので、S3 の暗号化（SSE）は運用者に対する守りではなく既定のまま。`DeletionPolicy: Retain` なので、スタックを消してもバケットは残る（中身が空であることを確かめて手で消す。下の「廃止のとき」）。`aws/verify.ts` は、検証用のスタックで、写真を上げ → 上げた暗号文がそのまま返る → 鍵を替えても開ける → purge の後にその prefix のオブジェクトが 0 件、を確かめる（バケット名と prefix は出力しない）。
 
 ### 足あとの地図の背景（地図データ）
 
@@ -115,6 +119,14 @@ bun aws/verify-expiry.ts https://DISTRIBUTION.cloudfront.net FUNCTION_NAME YOUR_
 所要は**6分半〜13分**（期限まで6分＋sweep待ちが最大7分。期限の削除（sweep）は `rate(5 minutes)` の周期のどこに当たるかと、期限索引が結果整合であることの両方で遅れるので、期限から7分まで待つ）。長いので配置のたびには回さない。回すのは、期限・sweep・ライフサイクルの経路に触ったときと、実旅行のあるスタックへ初めて配置する前に1回（検証用のスタックで）。
 
 **実行中に他のカプセルが発行されたり期限を迎えたりしないこと。** 判定は「発行前のチャンク件数に戻るか」なので、静かに存在しているカプセルは害にならないが、同時に増減すると誤って合格・不合格になる。
+
+配置済みの設定が `aws/template.yaml`・`aws/edge-logs.yaml` に書いたとおりかは、読み取りだけで確かめる（何も変えない）:
+
+```sh
+bun aws/config-check.ts STACK YOUR_PROFILE ap-northeast-1 [--budget]
+```
+
+`/v1/*` の behavior（キャッシュポリシー・ViewerProtocolPolicy・Origin の OAC とプロトコル）、静的の既定の behavior（キャッシュポリシー・ViewerProtocolPolicy・Origin の OAC・`viewer-request` の関数）、ロググループ `Logs`・`WebLogs`・`WebLogsLocal`・`cdn`（us-east-1）の保持 90 日を、項目ごとに pass / fail で出す。`--budget` を付けると、そのスタックの `Budget`（`BudgetLimitUsd` と `BudgetEmail` を渡したスタックだけにある）の種類・期間・上限・通知も見て、無ければ `fail 予算: 未設定` を出す。終了コードは 0 = 差なし、1 = 差あり（引数が足りないときも）、2 = 読み取れなかった。ID・ARN・URL・アカウント ID は出さないので、出力はそのまま Issue に貼れる。要る権限は `cloudformation:DescribeStacks`・`cloudfront:GetDistributionConfig`・`logs:DescribeLogGroups`（2 つのリージョン）、`--budget` では加えて `cloudformation:DescribeStackResources`・`sts:GetCallerIdentity`・`budgets:ViewBudget`。配置だけに絞った権限（`cloudfront:GetDistributionConfig` や予算の読み取りが無いもの）では読めないので、これらを読める資格情報で回す。
 
 ## 旅程発行
 
@@ -221,6 +233,47 @@ Host が数える上限（`src/cloud-host.ts` の `rate()`。1 分あたり、Dy
 予算アラート: パラメータ `BudgetLimitUsd`（整数の USD）と `BudgetEmail` を渡すと、アカウント全体の月額予算（AWS Budgets）を作る。実際の費用が80%を超えたときと、月末の予測が100%を超えたときにメールが届く。通知だけで、超えても何も止まらない。予算はアカウント全体のものなので、**同じアカウントの 1 つのスタックにだけ**渡す（2 つに渡すと同じ予算が 2 本になる）。一度渡せば、以後の `sam deploy` は渡さなかったパラメータを前回の値のまま使うので、予算は残る（消えるのは `BudgetLimitUsd=0` を明示したときだけで、そのとき変更セットに `Budget` の Remove が出る）。通知先のメールはリポジトリに書かない。`BudgetEmail` なしで金額だけを渡しても予算は作られない（変更セットに `Budget` の Add が出ないことで分かる）。
 
 AWS上で公開前に確認: SAM lint、作成と重複更新、席の引換と端末束縛、受付期限、viewer/participant制限、メンバー単位の失効、期限拒否とスケジュール物理削除（`aws/verify-expiry.ts` を検証用のスタックで1回）、ZIP出力、パスキーの登録と復帰（RP IDがOriginのホスト名であること、cookie無しの復帰要求が席を消費しないこと）、秘密が配布物・ログにないこと（`aws/verify.ts` が API のアクセスログと Host の拒否の行を読み、Cookie の値・招待 secret・`#k=`・題名が無いことを確かめる）。静的画面のブラウザー確認も必要。
+
+### 廃止のとき
+
+Host を廃止する（スタックを消す）のは、有効な旅行が 1 件も無くなってから。スタックを消しても、誤った削除で旅程が一度に消えないよう `DeletionPolicy: Retain`（`UpdateReplacePolicy` も）を付けたものは残り、付けていないものはスタックと一緒に消える:
+
+| 論理名 | 種類 | スタックを消すと |
+|---|---|---|
+| `Data`（`aws/template.yaml`） | DynamoDB のテーブル | 残る（Retain） |
+| `Assets`（`aws/template.yaml`） | S3（画面の 6 ファイルと地図データ） | 残る（Retain） |
+| `Media`（`aws/template.yaml`） | S3（写真の暗号文） | 残る（Retain） |
+| `aws/code.yaml` のバケット | S3（Web Function の zip。バージョン付き） | 残る（Retain） |
+| `/capsule-host/<スタック名>/creator-key/*` | Parameter Store（作成者の API キー。Host が動いている間に作るもので、スタックの資源ではない） | 残る。30 日使われないキーを消す `Host` の掃除もスタックと一緒に消える |
+| `Logs`・`WebLogs`・`WebLogsLocal`（`aws/template.yaml`）、`aws/edge-logs.yaml` のロググループ | CloudWatch Logs（保持 90 日） | 消える。消えたら戻らない |
+| ほか（関数・`HmacKey`・配信・予算など） | | 消える |
+
+順番:
+
+1. 有効な旅行を数える。`bun aws/capsules.ts check-decommission FUNCTION_NAME YOUR_PROFILE ap-northeast-1` は、有効な（削除予定より前の）旅行の数・状態ごとの数・いちばん遅い削除予定を出す（ID・題名は出さない）。1 件でも残っていれば「有効な旅行が残っています。廃止しません。」と出して終了コード 1、無ければ 0。0 になるまで先へ進まない
+2. Export を確かめる。Host は Export（owner のブラウザが暗号化した旅程から作る）を見られず、記録も無い。残っている旅行の owner に、Export が済んだかを聞く。`reflection` / `frozen` は Export できる段階
+3. 旅行を終わらせる。削除予定を待つか、owner が完全削除する。Export が済んだと owner が答えた旅行だけ、`bun aws/capsules.ts terminate …`（取り消せない）で終わらせてよい。1 に戻り、終了コード 0 を見る
+4. 物理削除が済むのを待つ。owner の完全削除と `terminate` は旅程と写真をその場で消す。削除予定を迎えた旅行は、`check-decommission` はもう数えないが、旅程と写真を実際に消すのは 5 分ごとの sweep で、`Media` を消せなければ行を残して次の sweep でやり直す。1 で終了コード 0 を見た時刻から 5 分より長く待ち、その間の Host のログ（`/aws/lambda/<関数名>`）に sweep の失敗（`"reason":"sweep:media"` の行か、DynamoDB の失敗などで呼び出しそのものが落ちたエラー）が無いことを確かめる。あれば、失敗の無い 5 分を待ち直す
+5. ログを残すなら書き出す。ロググループは次の 6 で消える（直近 90 日の侵害確認の証跡も）。残すなら先に `aws logs create-export-task` で S3 に書き出す。書き出し先はロググループと同じリージョンのバケット（配信ログの `/capsule-host/<スタック名>/cdn` は us-east-1）で、CloudWatch Logs が書けるバケットポリシーが要る
+6. スタックを消す。`$STACK-edge-logs`（us-east-1。配信を指しているので先）→ `$STACK` → `$STACK-code`
+7. 残ったものを手で消す。上の表の「残る」5 つを、中身を確かめてから消す（`Media` は旅行の削除のたびに prefix ごと消えるので空のはず。`Data` は有効な旅行の行が無いはず。`aws/code.yaml` のバケットはバージョン付きなので、古い版も全部消してからバケットを消す。Parameter Store は `aws ssm get-parameters-by-path --path /capsule-host/<スタック名>/creator-key` で見て消す）。`Data`・`Media`・`Assets` の中身は下の `aws/remnants.ts` で数えて確かめ、消した後にもう一度走らせて終了コード 0 を見る
+
+消す仕組みを自動にはしない（消すのは手で、確かめてから）。
+
+廃止のあとの残りは `bun aws/remnants.ts STACK YOUR_PROFILE ap-northeast-1` で数える。スタックが消えた後（`DELETE_COMPLETE`）も、同じ名前で最後に消したスタックの資源を ID で引いて読む。`Data` の項目数・そのうち旅程の本体（payload の行。1 つの旅行が何行かに分かれる）の行数・`Media` と `Assets` のオブジェクト数を出し、どれかが 1 以上なら `残りあり` と終了コード 1、全部 0 なら `残りなし` と 0（数えられなかったときは 2）。数えるだけで何も消さず、旅行の中身・テーブルやバケットの名前・ARN・アカウント ID は出さない:
+
+```text
+Data: 289
+  うち旅程の本体の行: 0
+Media: 0
+Assets: 9
+残りあり
+```
+
+- `うち旅程の本体の行` と `Media` が 0 なら、旅程と写真は残っていない。`Data` にはほかに、purge した旅行の印（TTL で 30 日後に消える）と発行者ごとの旅行の数の行（0 になっても消えない）が残るので、テーブルを消すまで 0 にならない。`Assets` は画面と地図データ
+- 手で消したテーブル・バケットは `Data: 0（table なし）`・`Media: 0（bucket なし）` のように 0 と数える。7 で全部消した後に走らせて `残りなし` を見る
+- 消えたスタックを CloudFormation が見せるのは消してから 90 日ほどなので、7 はその間に済ませる（過ぎると「スタックが見つからない」と終了コード 2）。同じ名前で新しいスタックを作った後は、新しいスタックの資源を数える
+- 要る権限は読み取りだけ: `cloudformation:ListStacks`（消えたスタックの ID を引く）・`ListStackResources`、`dynamodb:Scan`、`s3:ListBucket`
 
 ## バックアップ方針
 

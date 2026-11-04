@@ -16,6 +16,14 @@ test("the viewer address is the one CloudFront names, an IPv4 or IPv6 address wi
   expect(viewerIp(new Headers({ "cloudfront-viewer-address": "no-port" }))).toBe("");
 });
 const viaCloudFront = { "cloudfront-viewer-address": "198.51.100.7:46532" };
+// An answer refused before the Host carries the headers every Host answer carries (cloud-host.ts secure()), HSTS included on https.
+function expectGuarded(headers: Headers) {
+  expect(headers.get("cache-control")).toBe("no-store");
+  expect(headers.get("referrer-policy")).toBe("no-referrer");
+  expect(headers.get("x-content-type-options")).toBe("nosniff");
+  expect(headers.get("x-frame-options")).toBe("DENY");
+  expect(headers.get("strict-transport-security")).toBe("max-age=31536000");
+}
 test("the viewer address comes from CloudFront, never from X-Forwarded-For or a client's cf-connecting-ip", async () => {
   const db = new LocalD1(), host = new CloudHost({ DB: db, CAPSULE_HMAC_KEY: "secret".repeat(10), CAPSULE_ORIGIN: "https://capsule.example" }), ips: string[] = [];
   host.log = line => ips.push(line.ip);
@@ -30,6 +38,7 @@ test("the viewer address comes from CloudFront, never from X-Forwarded-For or a 
     ips.length = 0;
     const refused = await serveWeb(new Request(`https://capsule.example/v1/c/${id}`, { headers: { "x-forwarded-for": "198.51.100.7" } }), host);
     expect(refused.status).toBe(403);
+    expectGuarded(refused.headers);
     expect(ips).toEqual([]);
   } finally { db.close(); }
 });
@@ -64,6 +73,17 @@ test("over HTTP, every Set-Cookie arrives and a body reaches the Host", async ()
   } finally { server.close(); }
 });
 
+test("the Host's own Cache-Control passes through untouched: a photo stays private, max-age=3600", async () => {
+  const server = createServer((req, res) => { void serveNode(req, res, { fetch: async () => new Response("jpeg", { headers: { "cache-control": "private, max-age=3600", "content-type": "image/jpeg" } }) }); });
+  await new Promise<void>(done => server.listen(0, "127.0.0.1", done));
+  try {
+    const port = (server.address() as { port: number }).port;
+    const response = await fetch(`http://127.0.0.1:${port}/v1/c/x/media/y`, { headers: viaCloudFront });
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("private, max-age=3600");
+  } finally { server.close(); }
+});
+
 test("a body far over the Host's own limit is refused before it is read in full", async () => {
   let reached = false;
   const server = createServer((req, res) => { void serveNode(req, res, { fetch: async () => { reached = true; return new Response("no"); } }); });
@@ -72,6 +92,8 @@ test("a body far over the Host's own limit is refused before it is read in full"
     const port = (server.address() as { port: number }).port;
     const response = await fetch(`http://127.0.0.1:${port}/v1/publish`, { method: "POST", headers: { ...viaCloudFront, "content-type": "application/json" }, body: Buffer.alloc(3 * 1024 * 1024, 97) });
     expect(response.status).toBe(413);
+    expectGuarded(response.headers);
+    expect(await response.json()).toEqual({ error: "本文が大きすぎます" });
     expect(reached).toBe(false);
   } finally { server.close(); }
 });
@@ -85,6 +107,8 @@ test("a Host that throws gets a 500, and the log names the error's kind, never i
     const port = (server.address() as { port: number }).port;
     const response = await fetch(`http://127.0.0.1:${port}/v1/x`, { headers: viaCloudFront });
     expect(response.status).toBe(500);
+    expectGuarded(response.headers);
+    expect(await response.json()).toEqual({ error: "サーバーでエラーが起きました" });
     expect(lines.map(l => JSON.parse(l))).toEqual([{ kind: "error", name: "TypeError" }]);
   } finally { console.log = log; server.close(); }
 });

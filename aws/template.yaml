@@ -307,6 +307,21 @@ Resources:
             - { Header: Permissions-Policy, Value: "camera=(), microphone=(), geolocation=(self)", Override: true }
             # The browser revalidates the page files (ETag) on every open, so it does not keep a previous deploy's app.js; the edge is renewed by the invalidation (#428).
             - { Header: Cache-Control, Value: no-cache, Override: true }
+  # /v1/*'s own policy, not SecurityHeaders: no CSP and no no-cache (a photo's private, max-age=3600 must stay). Every item is Override: false,
+  # so the Host's own headers win and these only fill an answer the Host never wrote (CloudFront's own errors).
+  ApiSecurityHeaders:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub "${AWS::StackName}-api-security"
+        SecurityHeadersConfig:
+          ContentTypeOptions: { Override: false }
+          FrameOptions: { FrameOption: DENY, Override: false }
+          ReferrerPolicy: { ReferrerPolicy: no-referrer, Override: false }
+          StrictTransportSecurity: { AccessControlMaxAgeSec: 31536000, Override: false }
+        CustomHeadersConfig:
+          Items:
+            - { Header: Cache-Control, Value: no-store, Override: false }
   ApiRequest:
     Type: AWS::CloudFront::OriginRequestPolicy
     Properties:
@@ -347,6 +362,7 @@ Resources:
             AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
             CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
             OriginRequestPolicyId: !Ref ApiRequest
+            ResponseHeadersPolicyId: !Ref ApiSecurityHeaders
   AssetsPolicy:
     Type: AWS::S3::BucketPolicy
     Properties:

@@ -51,12 +51,40 @@ export function fakeAuthenticator(options: { rsa?: boolean; origin?: string } = 
 export type Send = (path: string, method: string, body?: unknown, cookie?: string) => Promise<Response>;
 export const devices = new Map<string, ReturnType<typeof fakeAuthenticator>>();
 export async function stepUp(send: Send, cookie: string) {
-  const { challenge } = await (await send("/passkey/challenge", "POST", {})).json() as { challenge: string }, device = devices.get(cookie);
+  const challenge = await challengeOf(send("/passkey/challenge", "POST", {})), device = devices.get(cookie);
   if (device) { await expectOk(send("/passkey/verify", "POST", { challenge, id: device.id, ...device.assert(challenge) }, cookie)); return cookie; }
   const fresh = fakeAuthenticator(); devices.set(cookie, fresh);
   await expectOk(send("/passkey", "POST", { challenge, ...fresh.register(challenge) }, cookie)); return cookie;
 }
 async function expectOk(r: Promise<Response>) { const res = await r; if (res.status !== 200) throw new Error(`${res.status} ${await res.text()}`); return res; }
+// The challenge of a passkey check, or the refusal in its place: sending on without a challenge only turns a refused challenge
+// (429 when the address's login allowance is spent) into a 400 for the request after it (#1154).
+export async function challengeOf(response: Response | Promise<Response>) {
+  const res = await response, body = await res.json().catch(() => undefined) as { challenge?: string; error?: unknown } | undefined;
+  if (res.status !== 200) throw new Error(`passkey/challenge ${res.status} ${typeof body?.error === "string" ? body.error : ""}`);
+  return body!.challenge as string;
+}
+// The requests a script against the real Host sent and the Host refused (400 and over), the latest `limit` of them, for the
+// output of a run that fails: an assert names only the status of the request it checks, often one after the refused one
+// (#1154). Kept: the method, the action as the Host's refusal log names it (src/cloud-host.ts fetch: the path without
+// /v1/c/<id>/ or /v1/), the status and the body's `error` cut to 120 characters. Never the query, the headers or a body sent,
+// so no cookie, link secret or trip id reaches the output.
+export function refusals(limit = 10) {
+  const kept: string[] = [];
+  return {
+    async fetch(url: string, init?: RequestInit) {
+      const res = await fetch(url, init);
+      if (res.status >= 400) {
+        const path = new URL(url).pathname, m = /^\/v1\/c\/[a-f0-9]{32}(?:\/(.*))?$/.exec(path);
+        const error = await res.clone().json().then(b => typeof b?.error === "string" ? b.error.slice(0, 120) : "", () => "");
+        kept.push(`refused: ${init?.method ?? "GET"} ${m ? m[1] ?? "" : path.replace(/^\/v1\//, "")} ${res.status} ${error}`);
+        if (kept.length > limit) kept.shift();
+      }
+      return res;
+    },
+    report: () => kept.length ? [`Host が断った要求（直近 ${kept.length} 件、古い順）:`, ...kept].join("\n") : "Host が断った要求: なし",
+  };
+}
 
 // What a test sends to a capsule: as setup's `request` in src/cloud-host.test.ts (path under the capsule, If-Match revision, Origin).
 export type CapsuleRequest = (path?: string, method?: string, body?: unknown, cookie?: string, revision?: number, source?: string) => Promise<Response>;

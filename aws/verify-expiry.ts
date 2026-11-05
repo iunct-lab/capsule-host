@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { invoke } from "./invoke";
 import { emptyTrip } from "../src/template";
-import { fakeAuthenticator, sealedRequests, sealedTrip, type CapsuleRequest } from "../src/test-fixture";
+import { challengeOf, fakeAuthenticator, refusals, sealedRequests, sealedTrip, type CapsuleRequest } from "../src/test-fixture";
 
 // Watches two disposable fictional capsules reach their deadline on the real stack: one left plain (its owner took the seat and
 // never sealed it, as a trip published before sealing was handed out stays until its deadline), one sealed by its owner right
@@ -15,8 +15,10 @@ const at = () => new Date().toISOString().slice(11, 19) + "Z";
 const log = (line: string) => console.log(`${at()}  ${line}`);
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 const day = (back: number) => new Date(Date.now() - back * 86400000).toISOString().slice(0, 10);
+// The requests the Host refused, printed when the run fails (#1154): an assert names only the status of the request it checks.
+const seen = refusals();
 // A capsule's requests, as the new screen sends them (ui=2, src/client.ts api()): the host asks a request without it to reload.
-const under = (id: string): CapsuleRequest => (path = "", method = "GET", body?, cookie?, revision = 1) => fetch(`${origin}/v1/c/${id}${path}?ui=2`, { method, headers: { Origin: origin, "Content-Type": "application/json", "If-Match": `"${revision}"`, ...(cookie ? { Cookie: cookie } : {}) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+const under = (id: string): CapsuleRequest => (path = "", method = "GET", body?, cookie?, revision = 1) => seen.fetch(`${origin}/v1/c/${id}${path}?ui=2`, { method, headers: { Origin: origin, "Content-Type": "application/json", "If-Match": `"${revision}"`, ...(cookie ? { Cookie: cookie } : {}) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
 const redeem = (request: CapsuleRequest, url: string, cookie = "") => request("/sessions", "POST", { secret: new URLSearchParams(new URL(url).hash.slice(1)).get("k") }, cookie);
 async function join(request: CapsuleRequest, url: string) {
   assert.equal(new URL(url).origin, origin);
@@ -28,7 +30,7 @@ async function join(request: CapsuleRequest, url: string) {
 // or checks with it.
 const devices = new Map<string, ReturnType<typeof fakeAuthenticator>>();
 async function check(request: CapsuleRequest, cookie: string) {
-  const { challenge } = await (await request("/passkey/challenge", "POST", {}, cookie)).json(), device = devices.get(cookie), fresh = fakeAuthenticator({ origin });
+  const challenge = await challengeOf(request("/passkey/challenge", "POST", {}, cookie)), device = devices.get(cookie), fresh = fakeAuthenticator({ origin });
   const r = device ? await request("/passkey/verify", "POST", { challenge, id: device.id, ...device.assert(challenge) }, cookie) : await request("/passkey", "POST", { challenge, ...fresh.register(challenge) }, cookie);
   assert.equal(r.status, 200); if (!device) devices.set(cookie, fresh);
 }
@@ -107,6 +109,9 @@ try {
   assert.equal(now, before, `sweepが${SWEEP_WAIT / 60000}分以内にチャンクを消しませんでした（${stored} -> ${now}、期待 ${before}）`);
   log(`chunks ${stored} -> ${before}`);
   console.log("Expiry verification passed: invite expired 401; a trip left plain by its owner and a sealed one both expired 410; payload chunks swept.");
+} catch (err) {
+  console.error(seen.report());   // before the cleanup below, whose own refusals would push out the ones that failed the run
+  throw err;
 } finally {
   // The capsules are expected to be gone by now; purge anyway so a failure part-way does not leave one behind.
   // The title is checked only while a trip is plain (a sealed one's is the screen's to compare), so each is sent its own.

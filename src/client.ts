@@ -10,7 +10,7 @@ import { PRF_INPUT, assistSealingKey, b64, unb64, newMemoKey, unwrapMemoKey, wra
 import { generate, REVISE_LIMIT, REVISE_SYSTEM, todayLine } from "./assist";
 import { openField, sealField, openPhotoImage, openPhotoLocation, sealPhoto, type PhotoSize, openName, openPoint, sealMove, sealName, sealPoint, openTrip, resealTrip, sealOperation, sealSpec, confirmationCodes, matchesCommitment, newAttempt, newHandoffKeys, newSeatKeys, newTripKey, seatPublic, signEdge, unwrapSeatSecret, unwrapTripKey, wrapSeatSecret, wrapTripKey, newLinkSecret, openLinkKey, sealLinkKey, type LinkOwner, acceptRekey, reachableSeats, resealAll, signRekey, signSuccession, verifyEdge, verifySuccession, type KeyedSeat } from "./trip-keys";
 import { privateReviseText, takePrivate, privateDiff } from "./private-revise";
-import { expiredIn, type Joined } from "./joined";
+import { expiredIn, listedRow, type Joined } from "./joined";
 import { linkNote, memberTags, revokeConfirm, revokeNote, waitingSeats, type ListedGrant } from "./seat-status";
 import { autoDue, footprints, spotsOf, type Point } from "./footprints";
 import type { MapCamera, MapData } from "./map";
@@ -630,8 +630,9 @@ async function forgetTrip(trip: string) {
   if (heldSeat?.trip === trip) heldSeat = undefined;
   if (trip === id) { tripKey = undefined; tripKeyFrom = ""; }
 }
-// A sealed trip is listed on this browser by its plain dates only: its title stays out of localStorage (spec「5.3 暗号化した旅行で Host にできないこと」).
-async function reload() { await load(); await takeLink(); if (id) remember(list => [...list.filter(t => t.id !== id), { id, title: view.sealed ? "暗号化した旅行" : view.spec.title, startsOn: view.spec.trip.startsOn, endsOn: view.spec.trip.endsOn, purgeAt: view.spec.lifecycle.purgeAt }]); }
+// The title opened is kept as plain text in this browser's storage only, never sent to the host (docs/ephemeral-trip-capsule.md §1.4): this browser
+// already holds the keys that open the trip. A sealed trip not opened here keeps the title last opened, else 「暗号化した旅行」 (listedRow).
+async function reload() { await load(); await takeLink(); if (id) remember(list => [...list.filter(t => t.id !== id), listedRow(list.find(t => t.id === id), { id, title: view.spec.title, startsOn: view.spec.trip.startsOn, endsOn: view.spec.trip.endsOn, purgeAt: view.spec.lifecycle.purgeAt }, !view.sealed || !locked)]); }
 // The page a trip opens on is chosen once, on the first load: a press of a tab, a reload or the 20-second refresh keeps the one shown.
 async function load() {
   loads++;
@@ -690,7 +691,7 @@ async function rekeyTrip() {
 }
 // A sealed trip (docs/ephemeral-trip-capsule.md「5.2 暗号化するもの・平文に残すもの」, docs/ephemeral-trip-capsule.md「5.3 暗号化した旅行で Host にできないこと」) is opened here, once, right after it is read: the rest of the screen draws the
 // plain trip as before. What did not open or did not pass the plain shape is left out and counted (`unreadable`). The opened words
-// live in `view` only, never in IndexedDB or localStorage. `locked`: why the plan cannot be shown on this browser.
+// live in `view` only, never in IndexedDB, and in localStorage only the title the top page lists (reload). `locked`: why the plan cannot be shown on this browser.
 let locked = "", sealedNow: { spec: SealedSpec; document: SealedDocument } | undefined;
 async function openSealed() {
   locked = ""; view.unreadable = []; sealedNow = undefined;
@@ -801,7 +802,7 @@ const keyStatus = () => !id || view.state === "draft" ? ""
 // Seats that wait for the key, shown to a seat that holds it (any role): each with 「渡す」.
 const handoffWaiting = () => tripKey && view.waiting?.length ? view.waiting.map(w => `<span data-handoff-waiting="${e(w.id)}">${e(w.label)}が鍵を待っています</span>${button("渡す", "give-key", "quiet", `data-id="${e(w.id)}" data-label="${e(w.label)}"`)}`).join("") : "";
 // To the owner, at the top of every page: one link for everyone who waits (docs/ephemeral-trip-capsule.md「5.1 旅行の鍵と受け渡し」).
-const keyBanner = () => view.role === "owner" && tripKey && view.waiting?.length && view.state !== "frozen" ? `<div class="preview-banner" data-key-banner="${view.waiting.length}"><div><strong>${view.waiting.length} 人が鍵を待っています</strong><p>リンクをグループに 1 回貼れば、開くだけで読めるようになります。</p></div>${button("鍵を配るリンクを作る", "key-link", "primary")}</div>` : "";
+const keyBanner = () => view.role === "owner" && tripKey && view.waiting?.length && view.state !== "frozen" ? `<div class="preview-banner" data-key-banner="${view.waiting.length}"><div><strong>${view.waiting.length} 人がまだ旅程を読めません</strong><p>リンクを作ってグループに 1 回貼れば、開くだけで読めるようになります。</p></div>${button("読めるようにするリンクを作る", "key-link", "primary")}</div>` : "";
 const editor = () => view.role === "owner" || view.role === "editor";
 // Every role keeps entries of its own, a viewer too, until sharing ends (the role table does not apply to them).
 const mine = () => Boolean(id) && (view.state === "active" || view.state === "reflection");
@@ -1554,8 +1555,8 @@ document.addEventListener("click", async event => {
     if (action === "include") await mutate({ type: "include", id: b.dataset.id, included: b.dataset.included === "true" });
     if (action === "manage") await manage();
     if (action === "key-link") {
-      const gid = newGrantId(), v = await issueInvite({ role: "participant", label: await nameFor("grant", gid, "鍵を配るリンク"), id: gid, seats: view.waiting!.length, expiresAt: view.spec.lifecycle.purgeAt, confirm: true });
-      modal("鍵を配るリンク", `<p>このリンクをグループに 1 回貼ってください。鍵を待っている人は、開くだけで読めるようになります。</p><label>リンク<input id="issued-link" readonly value="${e(v.url)}"></label><div class="admin-actions">${button("コピー", "copy", "primary")}</div><p class="muted">旅行のメンバーにだけ渡してください。席が空いていれば、リンクを開いた人も読めます。</p>`);
+      const gid = newGrantId(), v = await issueInvite({ role: "participant", label: await nameFor("grant", gid, "読めるようにするリンク"), id: gid, seats: view.waiting!.length, expiresAt: view.spec.lifecycle.purgeAt, confirm: true });
+      modal("読めるようにするリンク", `<p>下のリンクをグループに 1 回貼ってください。まだ読めない人は、開くだけで読めるようになります。</p><label>リンク<input id="issued-link" readonly value="${e(v.url)}"></label><div class="admin-actions">${button("コピー", "copy", "primary")}</div><p class="muted">旅行のメンバーにだけ渡してください。席が空いていれば、リンクを開いた人も読めます。</p>`);
     }
     if (action === "save") saveModal();
     if (action === "copy") { const field = document.querySelector<HTMLInputElement>("#issued-link")!; try { await navigator.clipboard.writeText(field.value); notice("リンクをコピーしました。"); } catch { field.select(); notice("リンクを選択しました。コピーして保存してください。"); } }

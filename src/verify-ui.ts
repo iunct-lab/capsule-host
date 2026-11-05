@@ -1554,8 +1554,10 @@ async function linked() {
   assert.equal(await b.evaluate(`document.querySelector('[data-sealed="locked"]').textContent`), "この旅行を読むには鍵が要ります。オーナーから届くリンクを、このブラウザで開いてください");
   await owner.reload(); await owner.evaluate(answerYes); await owner.until(`document.querySelector("[data-key-banner]")?.dataset.keyBanner === "1"`, 20000);
   assert.ok((await owner.box("[data-key-banner]")).bottom < 844, "the banner is below the first screen");
-  assert.equal(await owner.evaluate(`document.querySelector("[data-key-banner] strong").textContent`), "1 人が鍵を待っています");
+  assert.equal(await owner.evaluate(`document.querySelector("[data-key-banner] strong").textContent`), "1 人がまだ旅程を読めません");
+  assert.equal(await owner.evaluate(`document.querySelector('[data-key-banner] [data-action="key-link"]').textContent`), "読めるようにするリンクを作る");
   await owner.evaluate(`document.querySelector('[data-action="key-link"]').click()`); await owner.until(`!!document.querySelector("#issued-link")`, 20000);
+  assert.equal(await owner.evaluate(`document.querySelector("#dialog .modal-heading h2").textContent`), "読めるようにするリンク");
   const delivered = await owner.evaluate(`document.querySelector("#issued-link").value`) as string; await owner.evaluate(`document.querySelector('#dialog [data-action="close"]').click()`);
   const deliveredId = await owner.evaluate(`(async () => (await (await vfetch("/v1/c/${capsuleId}/grants")).json()).at(-1).id)()`) as string;
   assert.deepEqual(await owner.evaluate(`(async () => { const g = (await (await vfetch("/v1/c/${capsuleId}/grants")).json()).at(-1); return [g.role, g.seats, g.carriesKey]; })()`), ["participant", 1, true]);
@@ -1583,7 +1585,7 @@ async function linked() {
   await b.close(); await dispose(context); await a.close(); await dispose(aContext);
   await closeTrip(false); await owner.close();
   for (const later of [false, true]) await keysWrappedByCheck(later);
-  console.log("Link verification passed: a link read the sealed trip with nothing else asked, its key sent nowhere; a seat that lost its storage read it by a link with no new seat; a seat with no key by the owner's 鍵を配るリンク from the banner at the top; a rotated invite's link read it after the key it set replacing; the next key reached a seat that took its key by a link.");
+  console.log("Link verification passed: a link read the sealed trip with nothing else asked, its key sent nowhere; a seat that lost its storage read it by a link with no new seat; a seat with no key by the owner's 読めるようにするリンク from the banner at the top; a rotated invite's link read it after the key it set replacing; the next key reached a seat that took its key by a link.");
 }
 async function passkey() {
   const { owner, authenticatorId } = await openTrip();
@@ -1664,6 +1666,15 @@ async function sealed() {
   // What the host holds of the trip, read from the owner's page: the generation and which of the words are there in plain
   // (`window.plainWords`, replaced by the words to look for).
   const stored = `(async () => { const t = await (await vfetch("/v1/c/${capsuleId}")).text(); return [JSON.parse(t).sealed?.generation, window.plainWords.filter(w => t.includes(w))]; })()`;
+  // #1105: the trip's row on the top page of a browser, read there and the trip's page opened again (`back`: what shows once it is
+  // drawn). The title this browser opened, kept on it only; 「暗号化した旅行」 where it has not opened the trip (never the ciphertext).
+  const listedTitle = async (p: NonNullable<typeof owner>, back = `!!document.querySelector('[data-trip-key="held"]')`) => {
+    await p.cdp("Page.navigate", { url: `${origin}/` }); await p.until(`!!document.querySelector('.grant a[href="/c/${capsuleId}"]')`);
+    const shown = await p.evaluate(`document.querySelector('.grant a[href="/c/${capsuleId}"]').closest(".grant").querySelector("strong").textContent`) as string;
+    await p.cdp("Page.navigate", { url: `${origin}/c/${capsuleId}` }); await p.until(back, 20000); await p.evaluate(answerYes);
+    return shown;
+  };
+  assert.equal(await listedTitle(owner), title, "the top page does not list the sealed trip by the title its owner's browser opened");
   // The trip as the page opens it: what the page makes 旅を保存 (a') and チャットで直す (r) from.
   const openedTrip = await opened(owner);
   // Each answer is a copy: revisable() hands back the trip's own lists, and an answer's edits must not change the next one's.
@@ -1716,6 +1727,7 @@ async function sealed() {
     const link = await invite(role), context = (await send("Target.createBrowserContext")).browserContextId as string, reader = Object.assign(await page(390, 844, true, context), { context });
     await reader.cdp("Page.navigate", { url: link }); await reader.until(`!!document.querySelector('[data-action="join"]')`);
     await reader.evaluate(`document.querySelector('[data-action="join"]').click()`); await reader.until(`!!document.querySelector('[data-action="receive-key"]')`, 20000);
+    assert.equal(await listedTitle(reader, `!!document.querySelector('[data-action="receive-key"]')`), "暗号化した旅行", "a browser without the trip's key lists it by other than 「暗号化した旅行」");
     await reader.evaluate(`document.querySelector('[data-action="receive-key"]').click()`); await reader.until(`document.querySelector("#dialog")?.textContent.includes("「渡す」を押してもらってください")`, 20000);
     await owner!.evaluate(`(window.stale = true, location.reload())`); await owner!.until(`!window.stale && !!document.querySelector("[data-handoff-waiting]")`, 20000);
     // The seat waiting with a commitment is the new one's: the participant above, whose key was removed, waits too.
@@ -1948,6 +1960,7 @@ async function sealed() {
   await owner.reload(); await owner.evaluate(answerYes);
   assert.equal(await owner.evaluate(`document.querySelector(".hero h1").textContent`), renamed.trip);
   assert.equal(await owner.evaluate(`document.body.textContent.includes(${JSON.stringify(renamed.item)})`), true);
+  assert.equal(await listedTitle(owner), renamed.trip, "the top page still lists the trip by its title before the owner changed it");
   const sealedEditor = await takeKey("editor"); await sealedEditor.reload();
   await reviseFrom(sealedEditor); await sealedEditor.until(`!!document.querySelector('#dialog [data-action="undo"]')`);
   await sealedEditor.evaluate(`document.querySelector('#dialog [data-action="undo"]').click()`); await sealedEditor.until(`${message} === "設定も戻るため、オーナーだけが戻せます"`);

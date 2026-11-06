@@ -81,6 +81,8 @@ type ModuleSpec =
 
 `navigation` に含まれないモジュールは描画しない。同じ Runtime でも、「時刻中心の出張」「場所候補を皆で決める旅行」「チェックリスト中心のキャンプ」のようにかなり異なるアプリを生成できる。
 
+旅行期間も行き先も持たない用途（出欠確認・持ち物リスト・幹事のメモ）は、2 つ目の Domain Kit の共有ボード（`kind: "board"`、`src/board-schema.ts`・`src/board-kit.ts`）で作る。Spec は旅程から `trip`・`presentation`・`lifecycle.reflectionDays` を除いたもので、モジュールは日付の要らない `suggestion-board`・`checklist`・`budget`・`notes`・`reflection` だけ、Document は `items` を持たない（候補は `promoted` を持たない）。出力は `markdown`・`json`・`html`。状態は active → owner の共有終了で frozen → `purgeAt` で purged で、旅行後（reflection）の期間は無い（`reflection` のページは共有中ずっと書ける）。招待・席・期限・削除は旅程と同じ Host のコードを通り、中身は旅程と同じく旅行の鍵で暗号化して置く（§5。暗号化した形は題・紹介文・ページ名と各記録の言葉が暗号文）。作り方は [docs/recipes/board.md](recipes/board.md)、Spec だけで作った例は `docs/examples/board-attendance.json`（出欠確認）と `docs/examples/board-packing.json`（持ち物リスト）。
+
 ### 1.3 旅程データ
 
 中心となる `ItineraryItem` は、交通・宿泊・活動などを同じ時系列に置ける形にする。

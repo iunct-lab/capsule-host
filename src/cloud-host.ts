@@ -6,7 +6,7 @@ import { LocalKeyStore, open, seal, type KeyStore } from "./key-store";
 import { ASSIST_LIMIT, ASSIST_MODEL, anthropicGenerate, todayLine, type Follow, type Generated } from "./assist";
 import { instant as isoTime, localDay, sameTitle, author, pointSchema, cipher, CIPHER, PASTE_LIMIT } from "./fields";
 import { Refused, type DomainKit, type Envelope, type Role, type Versioned } from "./kit";
-import { kits as registered, kitOf, DEFAULT_KIND } from "./kits";
+import { kits as registered, kitOf, judgePasted, DEFAULT_KIND } from "./kits";
 import { deviceLabel, CLAIM_WINDOW } from "./device";
 import { rpIdOf, verifyAssertion, verifyRegistration, type Passkey } from "./webauthn";
 import { PHOTO_LIMITS, SEALED_OVERHEAD, tooLargeText, type PhotoAsset } from "./media";
@@ -680,11 +680,12 @@ export class CloudHost {
     // Both of these are pure: no capsule, nothing written. A creator is holding their phone and their chat assistant's
     // answer, and needs to know what to paste and what is wrong with what came back. Nobody else is shown how to make a trip.
     if (["/v1/recipe", "/v1/check"].includes(url.pathname) && !identity && !creator) fail(401, "作成者としてサインインしてください");
-    if (url.pathname === "/v1/recipe" && req.method === "GET") return Response.json({ kind: this.made.kind, text: this.made.recipe.text });
+    // `kind`: a registered kind's recipe (src/kits.ts); without one, the kind the top page makes, as an older screen asks.
+    if (url.pathname === "/v1/recipe" && req.method === "GET") { const kind = url.searchParams.get("kind"), kit = kind === null ? this.made : Object.hasOwn(this.kits, kind) ? this.kits[kind]! : fail(404, "この種類では使えません"); return Response.json({ kind: kit.kind, text: kit.recipe.text }); }
     if (url.pathname === "/v1/check" && req.method === "POST") {
       const v = z.object({ text: z.string() }).strict().parse(await this.json(req));
       if (Buffer.byteLength(v.text) > PASTE_LIMIT) fail(413, "貼り付けが長すぎます。旅程の部分だけを貼ってください");
-      return Response.json(this.made.judge(v.text, now));
+      return Response.json(judgePasted(v.text, now, this.kits, this.made));
     }
     const assist = /^\/v1\/assist(?:\/([a-f0-9]{32}))?$/.exec(url.pathname);
     if (assist && !assist[1] && req.method === "POST") {

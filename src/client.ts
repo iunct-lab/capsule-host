@@ -1,14 +1,16 @@
 import Anthropic from "@anthropic-ai/sdk";
 import type { Spec, Document, Role, State, Item, SealedSpec, SealedDocument, PlainPoint } from "./schema";
+import type { BoardSpec, BoardDocument, SealedBoardSpec, SealedBoardDocument } from "./board-schema";
+import { validateBoard } from "./board-schema";
 import { validate, untimed, localDay, sameTitle, specSchema, pointSchema } from "./schema";
 import { explain } from "./paste";
 import { placeholder, gapBefore } from "./timing";
 import { emptyTrip } from "./template";
 import { reviseText, reviseTrip, undoTrip, type Diff, type Previous } from "./revise";
-import { exportFiles, tripHtml, tripMarkdown, zip } from "./export";
+import { boardFiles, exportFiles, pageHtml, pageMarkdown, tripHtml, tripMarkdown, zip } from "./export";
 import { PRF_INPUT, assistSealingKey, b64, unb64, newMemoKey, unwrapMemoKey, wrapMemoKey, wrappingKey, openEntry, sealEntry, privateMarkdown, seal as sealWords, open as openWords, type PlainEntry } from "./private-entries";
 import { generate, REVISE_LIMIT, REVISE_SYSTEM, todayLine } from "./assist";
-import { openField, sealField, openPhotoImage, openPhotoLocation, sealPhoto, type PhotoSize, openName, openPoint, sealMove, sealName, sealPoint, openTrip, resealTrip, sealOperation, sealSpec, confirmationCodes, matchesCommitment, newAttempt, newHandoffKeys, newSeatKeys, newTripKey, seatPublic, signEdge, unwrapSeatSecret, unwrapTripKey, wrapSeatSecret, wrapTripKey, newLinkSecret, openLinkKey, sealLinkKey, type LinkOwner, acceptRekey, reachableSeats, resealAll, signRekey, signSuccession, verifyEdge, verifySuccession, type KeyedSeat } from "./trip-keys";
+import { openField, sealField, openPhotoImage, openPhotoLocation, sealPhoto, type PhotoSize, openName, openPoint, sealMove, sealName, sealPoint, openCapsule, openTrip, resealTrip, sealOperation, sealSpec, confirmationCodes, matchesCommitment, newAttempt, newHandoffKeys, newSeatKeys, newTripKey, seatPublic, signEdge, unwrapSeatSecret, unwrapTripKey, wrapSeatSecret, wrapTripKey, newLinkSecret, openLinkKey, sealLinkKey, type LinkOwner, acceptRekey, reachableSeats, resealAll, signRekey, signSuccession, verifyEdge, verifySuccession, type KeyedSeat } from "./trip-keys";
 import { privateReviseText, takePrivate, privateDiff } from "./private-revise";
 import { expiredIn, listedRow, type Joined } from "./joined";
 import { linkNote, memberTags, revokeConfirm, revokeNote, waitingSeats, type ListedGrant } from "./seat-status";
@@ -29,7 +31,7 @@ let plain = new Map<string, PlainEntry | null>();
 // `openFootprints` opens them into this shape first (`HostFootprint`).
 type Footprint = { id: string; at: string; lat: number; lng: number; accuracy: number; by: string; mine: boolean; auto: boolean };
 type HostFootprint = Omit<Footprint, "lat" | "lng" | "accuracy"> & (PlainPoint | { point: string });
-type View = { id?: string; spec: Spec; document: Document; role: Role; state: State | "draft"; passkey?: boolean; private?: PrivateEntry[]; privateKey?: string | null; seatKey?: SeatKey | null; keyed?: boolean; handoff?: Handoff | null; waiting?: Array<{ id: string; label: string; handoff: Handoff | null }>; footprints?: Footprint[]; media?: Shown[]; photos?: boolean; sealed?: { generation: number } | null; unreadable?: string[]; updated?: string; created?: number; label?: string; self?: { id: string; label: string }; assistKey?: boolean; assistWrapped?: string | null; assistModel?: string; mustSeal?: boolean; rekey?: "auto" | "ask" | null; seats?: KeyedSeat[] };
+type View = { id?: string; spec: Spec | BoardSpec; document: Document | BoardDocument; role: Role; state: State | "draft"; passkey?: boolean; private?: PrivateEntry[]; privateKey?: string | null; seatKey?: SeatKey | null; keyed?: boolean; handoff?: Handoff | null; waiting?: Array<{ id: string; label: string; handoff: Handoff | null }>; footprints?: Footprint[]; media?: Shown[]; photos?: boolean; sealed?: { generation: number } | null; unreadable?: string[]; updated?: string; created?: number; label?: string; self?: { id: string; label: string }; assistKey?: boolean; assistWrapped?: string | null; assistModel?: string; mustSeal?: boolean; rekey?: "auto" | "ask" | null; seats?: KeyedSeat[] };
 // This seat's keys for the trip as the host keeps them (docs/ephemeral-trip-capsule.md「5.1 旅行の鍵と受け渡し」): public keys and what is already wrapped.
 // `rekey`: the owner seat's signature over this wrap, when the owner's browser replaced the trip key (docs/ephemeral-trip-capsule.md「5.5 旅行の鍵を替える」).
 type SeatKey = { x25519: string; ed25519: string; generation: number; wrapped: string; ephemeral: string; secret?: { x25519: string; ed25519: string; passkey: string }; edges?: Array<{ seat: string; signature: string }>; since?: KeyedSeat["since"]; rekey?: { seat: string; signature: string } };
@@ -57,6 +59,12 @@ const dialog = document.querySelector<HTMLDialogElement>("#dialog")!;
 const id = /^\/c\/([a-f0-9]{32})$/.exec(location.pathname)?.[1];
 // 開いたときに足あとを残す (#481): turned on by this device for this trip, so it stays here and is never sent to the host.
 let autoStep = (() => { try { return Boolean(id) && localStorage.getItem(`auto-footprint:${id}`) === "1"; } catch { return false; } })();
+// A board (src/board-schema.ts) has no dates, places or items: the trip's own pages and actions are drawn for a trip only.
+const isTrip = () => view.spec.kind === "trip";
+// The capsule as the trip's own pages read it. A board reaching one is the screen's own slip: it says so rather than draw a wrong page.
+function trip(): { spec: Spec; document: Document } { if (view.spec.kind !== "trip") throw new Error("旅程ではありません"); return view as { spec: Spec; document: Document }; }
+// A listed capsule's days, or what it is when it has none (a board: src/cloud-host.ts lists it without dates).
+const period = (t: { startsOn?: string; endsOn?: string }) => t.startsOn ? `${e(t.startsOn)}〜${e(t.endsOn ?? "")}` : "共有ボード";
 const roleNames = { owner: "オーナー", editor: "編集者", participant: "参加者", viewer: "閲覧のみ" };
 // The lines of the owner's history of invites and owner seats (GET history), by the host's event names.
 const historyNames: Record<string, string> = { publish: "旅行を作成", replay: "オーナー招待を再発行", "creator-owner": "オーナー招待を作り直し（作成者）", recover: "オーナー招待を差し替え（発行者）", sessions: "席を引換", grants: "招待を発行", rotate: "招待を交換", revoke: "招待を失効", "revoke-member": "メンバーを失効", freeze: "共有を終了" };
@@ -632,7 +640,7 @@ async function forgetTrip(trip: string) {
 }
 // The title opened is kept as plain text in this browser's storage only, never sent to the host (docs/ephemeral-trip-capsule.md §1.4): this browser
 // already holds the keys that open the trip. A sealed trip not opened here keeps the title last opened, else 「暗号化した旅行」 (listedRow).
-async function reload() { await load(); await takeLink(); if (id) remember(list => [...list.filter(t => t.id !== id), listedRow(list.find(t => t.id === id), { id, title: view.spec.title, startsOn: view.spec.trip.startsOn, endsOn: view.spec.trip.endsOn, purgeAt: view.spec.lifecycle.purgeAt }, !view.sealed || !locked)]); }
+async function reload() { await load(); await takeLink(); if (id) remember(list => [...list.filter(t => t.id !== id), listedRow(list.find(t => t.id === id), { id, title: view.spec.title, startsOn: isTrip() ? trip().spec.trip.startsOn : "", endsOn: isTrip() ? trip().spec.trip.endsOn : "", purgeAt: view.spec.lifecycle.purgeAt }, !view.sealed || !locked)]); }
 // The page a trip opens on is chosen once, on the first load: a press of a tab, a reload or the 20-second refresh keeps the one shown.
 async function load() {
   loads++;
@@ -697,7 +705,7 @@ async function openSealed() {
   locked = ""; view.unreadable = []; sealedNow = undefined;
   if (!view.sealed) return;
   if (!tripKey) { view.footprints = []; locked = keyRefused ? unverifiedKey : restorable() ? restoreHint : askLink; return; }
-  const t = await openTrip(tripKey, id!, view as unknown as { spec: SealedSpec; document: SealedDocument });
+  const t = await openCapsule(tripKey, id!, view as unknown as { spec: SealedSpec | SealedBoardSpec; document: SealedDocument | SealedBoardDocument });
   if (!t) { view.footprints = []; locked = "旅程を開けません（旅行の鍵が合いません）"; return; }
   // The ciphertext as the host sent it, kept for a revise or an undo: a record left as it was is sent back as it came (resealTrip).
   sealedNow = { spec: view.spec as unknown as SealedSpec, document: view.document as unknown as SealedDocument };
@@ -784,8 +792,8 @@ async function creationHome() {
   for (const trip of expiredIn(saved(), Date.now())) await forgetTrip(trip);
   const account = await api("/v1/account"); canCreate = account.canCreate ?? account.signedIn; localOnly = account.localOnly; creatorLabel = account.creator?.label ?? ""; const creator = account.creator as { delegated?: boolean; delegates?: Array<{ id: string; label: string; device: string; created: number }> } | null; assistKey = Boolean(account.assistKey);
   const today = new Date().toISOString().slice(0, 10);
-  const unowned: Array<{ id: string; title: string; startsOn: string; endsOn: string; purgeAt: string }> = creatorLabel ? await api("/v1/creators/trips", "POST", {}).catch(() => []) : [];
-  app.innerHTML = `<header class="topbar"><a class="brand" href="/">旅のカプセル</a></header><main><section class="content"><span class="eyebrow">YOUR PRIVATE TRIP</span><h1>旅ごとに、<br>小さなしおりを。</h1><p>公開ページには誰の旅行も載せません。作成した旅行は、招待した人とだけ共有できます。</p>${joined().length ? `<div class="card"><h2>この端末で参加中の旅行</h2><div class="grant-list">${joined().reverse().map(t => `<div class="grant"><div><strong>${e(t.title)}</strong><small>${e(t.startsOn)}〜${e(t.endsOn)}</small></div><a class="button secondary" href="/c/${t.id}">開く</a></div>`).join("")}</div></div>` : ""}${!canCreate ? `<div class="card"><p>旅行のしおりは、受け取った招待リンクから開いてください。アカウント登録は不要です。</p></div><div class="card"><h2>旅行を作る方へ</h2>${passkeys ? `<p>作成者として登録済みの方は、パスキーでサインインしてください。</p><div class="admin-actions">${button("作成者としてサインイン", "creator-login", "secondary")}</div>` : '<p class="muted">このブラウザではパスキーが使えないため、作成者としてサインインできません。</p>'}</div>` : `${creatorLabel ? `<div class="card"><p>作成者: <strong>${e(creatorLabel)}</strong></p><p class="muted">作った旅行は、保存したときに、この端末をオーナーにするか、オーナーのリンクを受け取って別の端末・別の人に渡すかを選びます。</p><div class="admin-actions">${button("別の端末を追加", "creator-add-device", "quiet")}${button("サインアウト", "creator-signout", "quiet")}</div>${creator?.delegated === false ? `<hr><h3>作成権限を分ける</h3><p class="muted">旅行のオーナーに、新しい旅行を作る権利を分けられます。分けた人はさらに分けられず、作成者の権利では誰の旅行の中身も読めません。委任リンクは画面に表示せず、コピーします。</p><label>作成権限を渡す旅行の URL<input data-delegate-trip inputmode="url" placeholder="その旅行のページの URL"></label><div class="admin-actions">${button("委任リンクをコピー", "creator-delegate", "quiet")}</div>` : ""}${creator?.delegates?.length ? `<h3>分けた作成者</h3><div class="grant-list">${creator.delegates.map(d => `<div class="grant"><div><strong>${e(d.label)}</strong><small>${e(d.device)} · ${e(new Date(d.created).toLocaleDateString("ja-JP"))}</small></div>${button("失効", "creator-revoke-delegate", "quiet danger-text", `data-id="${e(d.id)}" data-title="${e(d.label)}"`)}</div>`).join("")}</div>` : ""}</div>` : ""}${unowned.length ? `<div class="card"><h2>オーナーを決めていない旅行</h2><p class="muted">保存したあと、オーナーを選ばずに閉じた旅行です。オーナーを決めるまで誰も開けません。削除予定日を過ぎると自動で消えます。「オーナーを決める」を押すと、前に受け取ったオーナーリンクは使えなくなります。</p><div class="grant-list">${unowned.map(t => `<div class="grant"><div><strong>${e(t.title)}</strong><small>${e(t.startsOn)}〜${e(t.endsOn)} · 削除予定 ${e(t.purgeAt.slice(0, 10))}</small></div><div>${button("オーナーを決める", "unowned-owner", "secondary", `data-id="${t.id}"`)}${button("削除", "unowned-purge", "quiet danger-text", `data-id="${t.id}" data-title="${e(t.title)}"`)}</div></div>`).join("")}</div></div>` : ""}<form data-form="create" class="card"><h2>新しい旅行を作成</h2>${localOnly ? '<p class="warning">開発用のローカル環境です。外部公開はしていません。</p>' : ""}<label>旅行のタイトル<input name="title" required maxlength="160" placeholder="週末の旅行"></label><label>行き先<input name="destination" required maxlength="160" placeholder="行き先を入力"></label><div class="form-grid"><label>初日<input name="start" type="date" required value="${today}"></label><label>最終日<input name="end" type="date" required value="${today}"></label></div><button class="primary">空のしおりを確認</button></form>${assistCard()}<div class="card"><h2>チャットで作って、貼り付ける</h2><p>「作り方をコピー」を押して、ChatGPTなどの使い慣れたアプリに貼り、旅行の希望を伝えてください。返ってきた答えを、前後の文ごとそのまま下に貼れます。</p><div class="admin-actions">${button("作り方をコピー", "copy-recipe", "secondary")}</div><label>チャットの返事<textarea data-paste rows="5" placeholder="返事をそのまま貼ってください（前後の文が混ざっていても大丈夫です）"></textarea></label><div class="admin-actions">${button("内容を確認する", "check-paste", "primary")}</div><ul class="paste-problems" hidden></ul><p class="muted">貼った内容は、確かめるためにこのサーバーへ送りますが、確認して保存するまでは残しません。本名・予約番号が混ざっていないか、取り込み前に確かめてください。</p><hr><h3>ファイルから取り込む</h3><label>旅程ファイル<input type="file" accept="application/json,.json" data-import="trip"></label></div>`}</section></main>`;
+  const unowned: Array<{ id: string; title: string; startsOn?: string; endsOn?: string; purgeAt: string }> = creatorLabel ? await api("/v1/creators/trips", "POST", {}).catch(() => []) : [];
+  app.innerHTML = `<header class="topbar"><a class="brand" href="/">旅のカプセル</a></header><main><section class="content"><span class="eyebrow">YOUR PRIVATE TRIP</span><h1>旅ごとに、<br>小さなしおりを。</h1><p>公開ページには誰の旅行も載せません。作成した旅行は、招待した人とだけ共有できます。</p>${joined().length ? `<div class="card"><h2>この端末で参加中の旅行</h2><div class="grant-list">${joined().reverse().map(t => `<div class="grant"><div><strong>${e(t.title)}</strong><small>${period(t)}</small></div><a class="button secondary" href="/c/${t.id}">開く</a></div>`).join("")}</div></div>` : ""}${!canCreate ? `<div class="card"><p>旅行のしおりは、受け取った招待リンクから開いてください。アカウント登録は不要です。</p></div><div class="card"><h2>旅行を作る方へ</h2>${passkeys ? `<p>作成者として登録済みの方は、パスキーでサインインしてください。</p><div class="admin-actions">${button("作成者としてサインイン", "creator-login", "secondary")}</div>` : '<p class="muted">このブラウザではパスキーが使えないため、作成者としてサインインできません。</p>'}</div>` : `${creatorLabel ? `<div class="card"><p>作成者: <strong>${e(creatorLabel)}</strong></p><p class="muted">作った旅行は、保存したときに、この端末をオーナーにするか、オーナーのリンクを受け取って別の端末・別の人に渡すかを選びます。</p><div class="admin-actions">${button("別の端末を追加", "creator-add-device", "quiet")}${button("サインアウト", "creator-signout", "quiet")}</div>${creator?.delegated === false ? `<hr><h3>作成権限を分ける</h3><p class="muted">旅行のオーナーに、新しい旅行を作る権利を分けられます。分けた人はさらに分けられず、作成者の権利では誰の旅行の中身も読めません。委任リンクは画面に表示せず、コピーします。</p><label>作成権限を渡す旅行の URL<input data-delegate-trip inputmode="url" placeholder="その旅行のページの URL"></label><div class="admin-actions">${button("委任リンクをコピー", "creator-delegate", "quiet")}</div>` : ""}${creator?.delegates?.length ? `<h3>分けた作成者</h3><div class="grant-list">${creator.delegates.map(d => `<div class="grant"><div><strong>${e(d.label)}</strong><small>${e(d.device)} · ${e(new Date(d.created).toLocaleDateString("ja-JP"))}</small></div>${button("失効", "creator-revoke-delegate", "quiet danger-text", `data-id="${e(d.id)}" data-title="${e(d.label)}"`)}</div>`).join("")}</div>` : ""}</div>` : ""}${unowned.length ? `<div class="card"><h2>オーナーを決めていない旅行</h2><p class="muted">保存したあと、オーナーを選ばずに閉じた旅行です。オーナーを決めるまで誰も開けません。削除予定日を過ぎると自動で消えます。「オーナーを決める」を押すと、前に受け取ったオーナーリンクは使えなくなります。</p><div class="grant-list">${unowned.map(t => `<div class="grant"><div><strong>${e(t.title)}</strong><small>${period(t)} · 削除予定 ${e(t.purgeAt.slice(0, 10))}</small></div><div>${button("オーナーを決める", "unowned-owner", "secondary", `data-id="${t.id}"`)}${button("削除", "unowned-purge", "quiet danger-text", `data-id="${t.id}" data-title="${e(t.title)}"`)}</div></div>`).join("")}</div></div>` : ""}<form data-form="create" class="card"><h2>新しい旅行を作成</h2>${localOnly ? '<p class="warning">開発用のローカル環境です。外部公開はしていません。</p>' : ""}<label>旅行のタイトル<input name="title" required maxlength="160" placeholder="週末の旅行"></label><label>行き先<input name="destination" required maxlength="160" placeholder="行き先を入力"></label><div class="form-grid"><label>初日<input name="start" type="date" required value="${today}"></label><label>最終日<input name="end" type="date" required value="${today}"></label></div><button class="primary">空のしおりを確認</button></form>${assistCard()}<div class="card"><h2>チャットで作って、貼り付ける</h2><p>「作り方をコピー」を押して、ChatGPTなどの使い慣れたアプリに貼り、旅行の希望を伝えてください。返ってきた答えを、前後の文ごとそのまま下に貼れます。</p><label>作るもの<select data-recipe-kind><option value="trip">旅のしおり</option><option value="board">共有ボード（出欠・持ち物など、日付の無いもの）</option></select></label><div class="admin-actions">${button("作り方をコピー", "copy-recipe", "secondary")}</div><label>チャットの返事<textarea data-paste rows="5" placeholder="返事をそのまま貼ってください（前後の文が混ざっていても大丈夫です）"></textarea></label><div class="admin-actions">${button("内容を確認する", "check-paste", "primary")}</div><ul class="paste-problems" hidden></ul><p class="muted">貼った内容は、確かめるためにこのサーバーへ送りますが、確認して保存するまでは残しません。本名・予約番号が混ざっていないか、取り込み前に確かめてください。</p><hr><h3>ファイルから取り込む</h3><label>旅程ファイル<input type="file" accept="application/json,.json" data-import="trip"></label></div>`}</section></main>`;
 }
 const askLink = "この旅行を読むには鍵が要ります。オーナーから届くリンクを、このブラウザで開いてください";
 const unverifiedKey = "新しい鍵を確かめられません。オーナーかメンバーから鍵を受け取り直してください";
@@ -816,7 +824,7 @@ function allowed(type: "suggest" | "comment" | "check" | "reflect") {
 const map = (name: string) => `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(name)}`;
 const button = (label: string, action: string, cls = "", attrs = "") => `<button class="${cls}" data-action="${action}" ${attrs}>${e(label)}</button>`;
 const dateLabel = (s: string) => new Intl.DateTimeFormat("ja", { timeZone: "UTC", month: "numeric", day: "numeric", weekday: "short" }).format(new Date(s));
-function days() { const a = []; for (let d = new Date(view.spec.trip.startsOn); d.toISOString().slice(0, 10) <= view.spec.trip.endsOn && a.length < 181; d.setUTCDate(d.getUTCDate() + 1)) a.push(d.toISOString().slice(0, 10)); return a; }
+function days() { const a = []; for (let d = new Date(trip().spec.trip.startsOn); d.toISOString().slice(0, 10) <= trip().spec.trip.endsOn && a.length < 181; d.setUTCDate(d.getUTCDate() + 1)) a.push(d.toISOString().slice(0, 10)); return a; }
 const clock = (at: number | string, zone: string) => new Intl.DateTimeFormat("ja", { timeZone: zone, hour: "2-digit", minute: "2-digit" }).format(new Date(at));
 // A time the host placed, or one nobody has decided yet, reads "10:30 ごろ". Only an item nobody has timed since it was published has none.
 function time(i: Item) { return i.startsAt ? `${clock(i.startsAt, i.timezone ?? view.spec.timezone)}${i.timeTentative ? " ごろ" : ""}` : "時間未定"; }
@@ -838,15 +846,15 @@ const insert = (i: Item) => `<div class="insert-actions">${editor() && editable(
 const handle = (i: Item) => `<button class="drag-handle" data-drag aria-label="${e(i.title)}の順番を動かす" title="ドラッグ、または上下の矢印キーで動かす">⠿</button>`;
 function timeline() {
   const all = days(); if (!all.includes(selectedDay)) selectedDay = all[0]!;
-  const heading = view.spec.presentation?.dayHeadings.find(d => d.day === selectedDay)?.title ?? `${dateLabel(selectedDay)}の予定`;
-  const sortable = editor() && editable(), items = view.document.items.filter(i => i.day === selectedDay);
+  const heading = trip().spec.presentation?.dayHeadings.find(d => d.day === selectedDay)?.title ?? `${dateLabel(selectedDay)}の予定`;
+  const sortable = editor() && editable(), items = trip().document.items.filter(i => i.day === selectedDay);
   // This seat's own plans go among the shared items by time: each before the first shared one that starts later. They take no part
   // in the free time and overlaps, which are the group's (another member would see a gap that is not there), and are never dragged.
   const plans = own().filter(p => p.kind === "item" && p.day === selectedDay), at = (t?: string) => t === undefined ? Infinity : +new Date(t);
   const locked = own().filter(p => p.kind === "item" && !plain.get(p.id)).length;
   const slot = (p: PrivateEntry) => items.findIndex(i => at(i.startsAt) > at(p.startsAt)), before = (k: number) => plans.filter(p => slot(p) === k), rest = plans.filter(p => slot(p) < 0);
   // The photos go under the shared items by the time they were taken (src/moments.ts), worked out each time the day is drawn.
-  const linked = linkPhotos(view.document.items, view.media ?? [], view.spec), early = linked.beforeFirst.get(selectedDay);
+  const linked = linkPhotos(trip().document.items, view.media ?? [], trip().spec), early = linked.beforeFirst.get(selectedDay);
   const count = (i: Item) => { const n = linked.byItem.get(i.id)?.length; return n ? `<span class="row-photos" aria-label="写真 ${n} 枚">📷 ${n}</span>` : ""; };
   return `<div class="day-tabs">${all.map((d, i) => button(`DAY ${i + 1}　${dateLabel(d)}`, "day", d === selectedDay ? "selected" : "", `data-day="${d}" aria-pressed="${d === selectedDay}"`)).join("")}</div>
     <div class="section-heading"><div><span class="eyebrow">DAY ${all.indexOf(selectedDay) + 1}</span><h2>${e(heading)}</h2></div>${`<div class="admin-actions">${editor() && editable() ? button("＋ 共有の予定", "new-item", "secondary") : ""}${mine() ? button("＋ 自分だけの予定（試験機能）", "new-private-item", "secondary") : ""}</div>`}</div>
@@ -876,7 +884,7 @@ function diary(day: string) {
   if (!existing) editingDiaryId = "";
   const locked = own().filter(p => p.kind === "diary" && !plain.get(p.id)).length;
   if (!mine() && !own().length) return "";
-  return `<section class="card diary"><h3>自分の日記（試験機能）</h3>${privateNotice}<p class="muted">自分だけに保存します。${privateProtection}</p><label>日記の日付<select data-diary-day aria-label="日記の日付">${all.map(d => `<option value="${d}" ${d === day ? "selected" : ""}>${dateLabel(d)}</option>`).join("")}</select></label>${locked ? `<p class="private-locked">自分の日記のうち ${locked} 件は、この端末では読めません。</p>` : ""}${mine() ? `<form data-form="private" class="entry-form" data-id="${e(existing?.id ?? crypto.randomUUID())}"><input name="kind" type="hidden" value="diary"><label>日付<input name="day" type="date" required min="${view.spec.trip.startsOn}" max="${view.spec.trip.endsOn}" value="${existing?.day ?? day}"></label><label>本文<textarea name="body" required maxlength="4000" rows="3">${e(existing?.body ?? "")}</textarea></label><div class="admin-actions"><button class="primary">保存する</button>${existing ? button("編集をやめる", "cancel-diary", "quiet", 'type="button"') : ""}</div></form>` : ""}${written.map(p => { const x = plain.get(p.id); return `<article class="diary-entry${x ? "" : " locked"}">${!x ? `<strong>${unreadable}</strong>` : x.title ? `<strong>${e(x.title)}</strong>` : ""}${x ? `<p class="entry-body">${e(x.body)}</p>${privateLinks(x)}` : ""}${mine() || !x ? `<div class="admin-actions">${button(x ? "編集" : "開く", "edit-private", "quiet", `data-id="${e(p.id)}"`)}${mine() ? button("削除", "remove-private", "quiet danger-text", `data-id="${e(p.id)}"`) : ""}</div>` : ""}</article>`; }).join("") || '<p class="empty">この日の日記はまだありません。</p>'}${privateTools()}</section>`;
+  return `<section class="card diary"><h3>自分の日記（試験機能）</h3>${privateNotice}<p class="muted">自分だけに保存します。${privateProtection}</p><label>日記の日付<select data-diary-day aria-label="日記の日付">${all.map(d => `<option value="${d}" ${d === day ? "selected" : ""}>${dateLabel(d)}</option>`).join("")}</select></label>${locked ? `<p class="private-locked">自分の日記のうち ${locked} 件は、この端末では読めません。</p>` : ""}${mine() ? `<form data-form="private" class="entry-form" data-id="${e(existing?.id ?? crypto.randomUUID())}"><input name="kind" type="hidden" value="diary"><label>日付<input name="day" type="date" required min="${trip().spec.trip.startsOn}" max="${trip().spec.trip.endsOn}" value="${existing?.day ?? day}"></label><label>本文<textarea name="body" required maxlength="4000" rows="3">${e(existing?.body ?? "")}</textarea></label><div class="admin-actions"><button class="primary">保存する</button>${existing ? button("編集をやめる", "cancel-diary", "quiet", 'type="button"') : ""}</div></form>` : ""}${written.map(p => { const x = plain.get(p.id); return `<article class="diary-entry${x ? "" : " locked"}">${!x ? `<strong>${unreadable}</strong>` : x.title ? `<strong>${e(x.title)}</strong>` : ""}${x ? `<p class="entry-body">${e(x.body)}</p>${privateLinks(x)}` : ""}${mine() || !x ? `<div class="admin-actions">${button(x ? "編集" : "開く", "edit-private", "quiet", `data-id="${e(p.id)}"`)}${mine() ? button("削除", "remove-private", "quiet danger-text", `data-id="${e(p.id)}"`) : ""}</div>` : ""}</article>`; }).join("") || '<p class="empty">この日の日記はまだありません。</p>'}${privateTools()}</section>`;
 }
 function privateTools() {
   if (!mine() && !own().length) return "";
@@ -884,12 +892,12 @@ function privateTools() {
 }
 // Personal plans use the shared plan form's date/time suggestion, with the existing sealed save handler.
 function privatePlanForm(existing?: PlainEntry, place?: { day: string; after?: string }) {
-  const items = view.document.items, after = place?.after && items.some(i => i.id === place.after) ? place.after : undefined;
+  const items = trip().document.items, after = place?.after && items.some(i => i.id === place.after) ? place.after : undefined;
   const at = after ? items.findIndex(i => i.id === after) + 1 : items.length;
   const probe = place && [...items.slice(0, at), { id: "", title: "", day: place.day, kind: "activity", status: "proposed", revision: 1 } as Item, ...items.slice(at)];
   const offered = probe ? placeholder(probe, at, view.spec.timezone) : undefined;
   const start = existing?.startsAt ? clock(existing.startsAt, view.spec.timezone) : offered !== undefined ? clock(offered, view.spec.timezone) : "";
-  modal(existing ? "自分だけの予定を編集" : "自分だけの予定を追加", `<form data-form="private" data-id="${e(existing?.id ?? crypto.randomUUID())}"><input type="hidden" name="kind" value="item">${privateNotice}<p class="muted">${privateProtection}</p><label>タイトル<input name="title" required maxlength="160" value="${e(existing?.title ?? "")}"></label><div class="form-grid"><label>日付<input name="day" type="date" required min="${view.spec.trip.startsOn}" max="${view.spec.trip.endsOn}" value="${existing?.day ?? place?.day ?? selectedDay}"></label><label>開始時刻<input name="time" type="time" required value="${start}"></label></div><label>本文<textarea name="body" maxlength="4000" rows="5">${e(existing?.body ?? "")}</textarea></label><div class="admin-actions"><button class="primary">保存する</button>${existing ? button("削除", "remove-private", "quiet danger-text", `type="button" data-id="${e(existing.id)}"`) : ""}</div></form>`);
+  modal(existing ? "自分だけの予定を編集" : "自分だけの予定を追加", `<form data-form="private" data-id="${e(existing?.id ?? crypto.randomUUID())}"><input type="hidden" name="kind" value="item">${privateNotice}<p class="muted">${privateProtection}</p><label>タイトル<input name="title" required maxlength="160" value="${e(existing?.title ?? "")}"></label><div class="form-grid"><label>日付<input name="day" type="date" required min="${trip().spec.trip.startsOn}" max="${trip().spec.trip.endsOn}" value="${existing?.day ?? place?.day ?? selectedDay}"></label><label>開始時刻<input name="time" type="time" required value="${start}"></label></div><label>本文<textarea name="body" maxlength="4000" rows="5">${e(existing?.body ?? "")}</textarea></label><div class="admin-actions"><button class="primary">保存する</button>${existing ? button("削除", "remove-private", "quiet danger-text", `type="button" data-id="${e(existing.id)}"`) : ""}</div></form>`);
 }
 // An entry this browser cannot open offers the passkey that can, and removing it: sealed words cannot be edited (spec「5.6 自分だけの予定・日記の鍵」).
 // After sharing ends the host refuses every change to them, removing too, so 削除 is offered only while they can be written.
@@ -901,8 +909,8 @@ function lockedPrivate(p: PrivateEntry) {
 // The Markdown is made here from what this browser opened: the host keeps ciphertext only. The file is handed over as a download.
 function savePrivateMarkdown() {
   const opened = own().map(p => plain.get(p.id)).filter((x): x is PlainEntry => Boolean(x));
-  const text = privateMarkdown(view.spec, opened, own().length - opened.length, new Date().toISOString());
-  download(text, "text/markdown;charset=utf-8", `trip-${view.spec.trip.startsOn}-private.md`);
+  const text = privateMarkdown(trip().spec, opened, own().length - opened.length, new Date().toISOString());
+  download(text, "text/markdown;charset=utf-8", `trip-${trip().spec.trip.startsOn}-private.md`);
 }
 function download(text: BlobPart, type: string, name: string) {
   const link = document.createElement("a"); link.href = URL.createObjectURL(new Blob([text], { type })); link.download = name;
@@ -920,7 +928,7 @@ function privateRevise() {
 function checkPrivateRevise() {
   const field = dialog.querySelector<HTMLTextAreaElement>("[data-revise-paste]"), out = dialog.querySelector<HTMLElement>(".revise-diff"); if (!field || !out) return;
   out.hidden = true; revisingPrivate = undefined; problems([]);
-  const taken = takePrivate(field.value, view.spec);
+  const taken = takePrivate(field.value, trip().spec);
   if (!taken.ok) { problems(taken.messages); notice("貼った内容を確認してください。", true); return; }
   const d = privateDiff(readable(), taken.entries);
   // The entries this browser cannot read stay, so they count towards the hundred too.
@@ -947,8 +955,9 @@ function pageModules() {
   const pages: Array<{ id: string; kind: Spec["modules"][number]["kind"] | "footprints"; label: string }> = navigation.map(n => modules.find(m => m.id === n)!)
     // Without photos on (the operator's switch) and none put up, the page is not shown.
     .filter(m => m.kind !== "moments" || photosPageShown(view));
-  if (!pages.some(m => m.kind === "reflection")) pages.push(modules.find(m => m.kind === "reflection") ?? { id: ":memories", kind: "reflection", label: "旅の思い出" });
-  if (!pages.some(m => m.kind === "trip-map")) pages.push({ id: ":footprints", kind: "footprints", label: "足あと" });
+  // A board has no days: neither the diary (on the memories page) nor footprints.
+  if (isTrip() && !pages.some(m => m.kind === "reflection")) pages.push(modules.find(m => m.kind === "reflection") ?? { id: ":memories", kind: "reflection", label: "旅の思い出" });
+  if (isTrip() && !pages.some(m => m.kind === "trip-map")) pages.push({ id: ":footprints", kind: "footprints", label: "足あと" });
   return pages;
 }
 // The pages drawn from the footprints, redrawn when a point comes or goes (footprints move no revision).
@@ -956,7 +965,7 @@ const onFootprints = () => tab === ":footprints" || ["trip-map", "story"].includ
 // A footprint is left during the trip by all but a viewer, as the host allows (src/cloud-host.ts).
 function canStep() {
   const today = localDay(Date.now(), view.spec.timezone);
-  return Boolean(id) && view.role !== "viewer" && view.state === "active" && today >= view.spec.trip.startsOn && today <= view.spec.trip.endsOn;
+  return Boolean(id) && isTrip() && view.role !== "viewer" && view.state === "active" && today >= trip().spec.trip.startsOn && today <= trip().spec.trip.endsOn;
 }
 // The trip's story (src/story.ts), each day's plans with the time a footprint first came in their time and the points no plan covers.
 // A line to look back on, not to edit: the shape of the day tab's list, without its buttons.
@@ -966,7 +975,7 @@ function storyPage() {
     ? `<li class="row unplanned"><span class="row-time">${at(x.point)}</span><span class="row-title">予定になかったところ · ${e(x.point.by)}</span><a class="button quiet" href="${map(`${x.point.lat},${x.point.lng}`)}" target="_blank" rel="noopener noreferrer">地図 ↗</a></li>`
     : x.recorded ? `<li class="row"><span class="row-time">予定 ${e(time(x.item))} / 記録 ${at(x.recorded)}</span><span class="row-title">${e(x.item.title)}</span></li>`
     : `<li class="row plan-only"><span class="row-time">${e(time(x.item))}</span><span class="row-title">${e(x.item.title)}</span></li>`;
-  const days = [...story(view.document.items, points, view.spec)].map(([day, entries]) => `<section class="card story"><h3>${dateLabel(day)}</h3><ol class="timeline-list">${entries.map(row).join("")}</ol></section>`).join("");
+  const days = [...story(trip().document.items, points, trip().spec)].map(([day, entries]) => `<section class="card story"><h3>${dateLabel(day)}</h3><ol class="timeline-list">${entries.map(row).join("")}</ol></section>`).join("");
   return `<h2>旅の記録</h2><p class="muted">予定と、足あとから分かった実際の時刻を並べます。『記録』はその予定の時間帯の最初の足あとの時刻です。</p>${points.length ? "" : '<p class="muted">まだ足あとがありません。旅行期間中に足あとのページの『ここにいる』を押すと、予定の横に実際の時刻が出ます。</p>'}${days || '<p class="empty">まだ予定がありません。</p>'}`;
 }
 // One fix of this browser's position. Refused, it says why and how to allow it; nothing is sent.
@@ -1032,7 +1041,7 @@ function tripMap(track: boolean) {
   const zone = view.spec.timezone, all = footprints(view.footprints ?? []).points, dayOf = (p: Point) => localDay(+new Date(p.at), zone);
   const head = `<h2>足あと</h2><p class="muted">「ここにいる」を押した時刻と場所を、この旅行のメンバー全員に共有します。旅行期間中だけ残せます。</p>${canStep() ? `<div class="admin-actions">${canPlaceElement ? `<span data-geo-button>${button("ここにいる", "footprint-here", "primary")}</span><span data-geo-place hidden><span class="muted">ここにいる</span><geolocation data-action="footprint-element"></geolocation></span>` : button("ここにいる", "footprint-here", "primary")}</div>${canPlaceElement ? '<p class="muted" data-geo-denied hidden>位置の許可がありません。「ここにいる」の横の位置のボタンを押して、許可し直してください。</p>' : ""}<label class="check"><input type="checkbox" data-action="auto-footprint"${autoStep ? " checked" : ""}><span>開いたときに足あとを残す</span></label><p class="muted">この端末だけ。旅行のページを開いた時と画面に戻った時に、前の自分の足あとから 15 分以上たったか 300 m 以上動いていれば残します。画面を閉じている間は残りません。</p>` : ""}`;
   // The items with a position, cancelled ones not (#646); the host reads a place's coordinates as the chat gave them.
-  const plans = view.document.items.filter(i => i.status !== "cancelled" && i.place?.lat !== undefined && i.place.lng !== undefined);
+  const plans = trip().document.items.filter(i => i.status !== "cancelled" && i.place?.lat !== undefined && i.place.lng !== undefined);
   if (!all.length && !plans.length) return `${head}<p class="empty">まだ足あとはありません。</p>${canStep() ? "" : '<p class="muted">旅行期間中にメンバーが「ここにいる」を押すと、ここに地図と一覧が出ます。</p>'}`;
   const days = [...new Set([...all.map(dayOf), ...plans.map(i => i.day)])].sort(), people = [...new Set(all.map(p => p.by))];
   if (!days.includes(mapDay)) mapDay = ""; if (!people.includes(mapBy)) mapBy = "";
@@ -1068,13 +1077,13 @@ async function mountMap() {
 }
 // An item's mark on the map: its day and time, its title and place, and the map in a new tab.
 function planDialog(id: string) {
-  const i = view.document.items.find(x => x.id === id); if (!i) return;
+  const i = trip().document.items.find(x => x.id === id); if (!i) return;
   modal("予定", `<div class="grant-list"><div class="grant" data-plan-dialog="${e(i.id)}"><div><strong>${e(i.title)}</strong><small>${dateLabel(i.day)} ${time(i)}</small>${i.place ? `<small>${e(i.place.label)}</small>` : ""}</div>${links(i)}</div></div>`);
 }
 // The footprints of one dot: when, who, the item going on then (if any), and the map in a new tab.
 function spotDialog(ids: string[]) {
   const zone = view.spec.timezone;
-  modal("この地点の足あと", `<div class="grant-list">${(view.footprints ?? []).filter(p => ids.includes(p.id)).map(p => { const t = +new Date(p.at), item = itemAt(view.document.items, t, zone);
+  modal("この地点の足あと", `<div class="grant-list">${(view.footprints ?? []).filter(p => ids.includes(p.id)).map(p => { const t = +new Date(p.at), item = itemAt(trip().document.items, t, zone);
     return `<div class="grant" data-spot="${e(p.id)}"><div><strong>${e(p.by)}</strong><small>${dateLabel(localDay(t, zone))} ${clock(p.at, zone)}</small>${item ? `<small>予定: ${e(item.title)}</small>` : ""}</div><a class="button quiet" href="${map(`${p.lat},${p.lng}`)}" target="_blank" rel="noopener noreferrer">地図 ↗</a></div>`; }).join("")}</div>`);
 }
 // The photos page (docs/ephemeral-trip-capsule.md「5.2 暗号化するもの・平文に残すもの」, the photo rows). A photo is opened here and nowhere else: its sealed image is
@@ -1114,7 +1123,7 @@ function photosPage() {
   for (const key of [...shownPhotos.keys()]) if (!view.media?.some(p => key === `${p.id}/thumb`)) releasePhoto(key);
   // 「時刻の分からない写真」: those the day's tab has no place for (without a time, or taken outside the trip), and those without a
   // time that were put under an item by hand.
-  const unlinked = linkPhotos(view.document.items, view.media ?? [], view.spec).unlinked, dated = photoDays((view.media ?? []).filter(p => !unlinked.includes(p)), view.spec.timezone);
+  const unlinked = linkPhotos(trip().document.items, view.media ?? [], trip().spec).unlinked, dated = photoDays((view.media ?? []).filter(p => !unlinked.includes(p)), view.spec.timezone);
   const days = dated.days, unknown = [...unlinked, ...dated.unknown];
   const group = (title: string, list: Shown[], attr = "") => `<section class="photo-day" ${attr}><h3>${e(title)}</h3><div class="photo-grid">${list.map(photoFigure).join("")}</div></section>`;
   const upload = canUpload() ? `<div class="admin-actions"><label class="button primary photo-upload">写真を上げる<input type="file" accept="image/jpeg,image/heic,image/*" multiple data-upload="photos"></label></div>`
@@ -1141,7 +1150,7 @@ async function photoDialog(pid: string) {
   const place = photoPlace(p.location && tripKey ? await openPhotoLocation(tripKey, id!, p.id, p.location) : null, p.capturedAt, view.footprints ?? []);
   const caption = await captionOf(p), mayEdit = (p.mine || editor()) && editable();
   // The uploader, an owner or an editor chooses the item it goes under (or leaves it to its time) and writes its caption.
-  const items = view.document.items.map(i => `<option value="${e(i.id)}" ${i.id === p.itineraryItemId ? "selected" : ""}>${e(`${dateLabel(i.day)} ${i.startsAt ? `${clock(i.startsAt, zone)} ` : ""}${i.title}`)}</option>`).join("");
+  const items = trip().document.items.map(i => `<option value="${e(i.id)}" ${i.id === p.itineraryItemId ? "selected" : ""}>${e(`${dateLabel(i.day)} ${i.startsAt ? `${clock(i.startsAt, zone)} ` : ""}${i.title}`)}</option>`).join("");
   const edit = mayEdit ? `<form data-form="photo" data-id="${e(p.id)}" class="entry-form"><label>載せる予定<select name="item"><option value="">撮影時刻で自動</option>${items}</select></label>${tripKey ? `<label>一言（160 字まで）<input name="caption" maxlength="160" value="${e(caption)}"></label>` : ""}<button class="primary">保存する</button></form>` : "";
   modal("写真", `<div class="photo-view"><img data-display alt="" width="${p.width}" height="${p.height}"><small>${e(when)}</small>${place ? `<small><a href="${map(`${place.lat},${place.lng}`)}" target="_blank" rel="noopener noreferrer">撮影した場所を地図で見る${place.from === "footprint" ? "（近くの足あとから）" : ""}</a></small>` : ""}${caption ? `<p class="entry-body" data-photo-caption>${e(caption)}</p>` : ""}${edit}<div class="admin-actions">${p.mine || editor() ? button("消す", "photo-remove", "quiet danger-text", `data-id="${e(p.id)}"`) : ""}</div></div>`);
   const img = dialog.querySelector<HTMLImageElement>("img[data-display]")!, run = ++displayRun;
@@ -1217,8 +1226,8 @@ function content() {
   const kind = pageModules().find(m => m.id === tab)?.kind;
   switch (kind) {
     case "day-timeline": return timeline();
-    case "places": return `<div class="section-heading"><h2>行き先を、ひとまとめに。</h2></div><div class="grid">${view.document.items.filter(i => i.place).map(i => `<article class="card"><span class="eyebrow">${dateLabel(i.day)} · ${kindNames[i.kind]}</span><h3>${e(i.place!.label)}</h3><p>${e(i.description ?? "")}</p>${links(i)}</article>`).join("")}</div>`;
-    case "suggestion-board": return `<h2>行きたい、を持ち寄ろう。</h2><div class="two-columns"><section><h3>候補ボード</h3><p class="muted">行きたい場所・やりたいことを書く所です。オーナー・編集者が「旅程に追加」すると予定になります。旅行記にも候補として載ります。</p>${entries("suggest")}</section><section><h3>みんなの相談</h3><p class="muted">決めたいこと・質問・ひとことを書く所です。旅程にも旅行記にも入りません。</p>${entries("comment")}</section></div>`;
+    case "places": return `<div class="section-heading"><h2>行き先を、ひとまとめに。</h2></div><div class="grid">${trip().document.items.filter(i => i.place).map(i => `<article class="card"><span class="eyebrow">${dateLabel(i.day)} · ${kindNames[i.kind]}</span><h3>${e(i.place!.label)}</h3><p>${e(i.description ?? "")}</p>${links(i)}</article>`).join("")}</div>`;
+    case "suggestion-board": return `<h2>行きたい、を持ち寄ろう。</h2><div class="two-columns"><section><h3>候補ボード</h3><p class="muted">${isTrip() ? "行きたい場所・やりたいことを書く所です。オーナー・編集者が「旅程に追加」すると予定になります。旅行記にも候補として載ります。" : "案や希望を書く所です。保存するページにも載ります。"}</p>${entries("suggest")}</section><section><h3>みんなの相談</h3><p class="muted">決めたいこと・質問・ひとことを書く所です。旅程にも旅行記にも入りません。</p>${entries("comment")}</section></div>`;
     case "checklist": return `<h2>あとは、ここを確認。</h2><p class="muted">全員で使う準備リスト。変更はメンバーに共有されます。</p><div class="card checks">${view.document.checklist.map(c => `<label class="check ${c.done ? "done" : ""}"><input type="checkbox" data-check="${c.id}" ${c.done ? "checked" : ""} ${!allowed("check") ? "disabled" : ""}><span>${e(c.title)}</span></label>`).join("")}${editor() && editable() && whole("checklist") ? button("準備リストを編集", "edit-checklist", "secondary") : ""}</div>`;
     case "budget": return `<h2>旅のお金、いまの目安。</h2><div class="grid">${view.document.budget.map(b => `<article class="card"><span class="eyebrow">概算</span><h3>${e(b.title)}</h3><div class="amount">¥${b.amount.toLocaleString("ja")}</div><p>${e(b.description)}</p></article>`).join("")}</div>${editor() && editable() && whole("budget") ? button("費用メモを編集", "edit-budget", "secondary") : ""}<p class="muted">支払い・精算の記録ではありません。実費は旅行中に確認してください。</p>`;
     case "notes": return `<h2>覚えておきたいこと。</h2><div class="card"><p class="entry-body">${e(view.document.notes)}</p>${editor() && editable() && whole("notes") ? button("メモを編集", "notes", "secondary") : ""}</div>`;
@@ -1226,7 +1235,7 @@ function content() {
     case "story": return storyPage();
     case "moments": return photosPage();
     case "trip-map": { const m = view.spec.modules.find(m => m.id === tab); return tripMap(m?.kind === "trip-map" && m.showTrack); }
-    case "reflection": return `<h2>旅の思い出</h2>${view.spec.modules.some(m => m.kind === "reflection" && view.spec.navigation.includes(m.id)) ? `<p class="muted">旅行後も${view.spec.lifecycle.reflectionDays}日間、思い出を追記できます。オーナー・編集者が選んだ投稿を旅行記に載せます。JSONには全投稿が含まれます。</p><section class="shared-memories"><h3>みんなの思い出</h3><p class="muted">この旅行のメンバーに共有します。</p>${entries("reflect")}</section>` : ""}${diary(diaryDay)}`;
+    case "reflection": return `<h2>${isTrip() ? "旅の思い出" : "ふりかえり"}</h2>${view.spec.modules.some(m => m.kind === "reflection" && view.spec.navigation.includes(m.id)) ? `<p class="muted">${isTrip() ? `旅行後も${trip().spec.lifecycle.reflectionDays}日間、思い出を追記できます。` : "いつでも書けます。"}オーナー・編集者が選んだ投稿を旅行記に載せます。JSONには全投稿が含まれます。</p><section class="shared-memories"><h3>みんなの思い出</h3><p class="muted">この旅行のメンバーに共有します。</p>${entries("reflect")}</section>` : ""}${isTrip() ? diary(diaryDay) : ""}`;
     default: return "";
   }
 }
@@ -1289,15 +1298,15 @@ function render() {
   if (!pages.some(m => m.id === tab)) tab = pages[0]!.id;
   const s = view.spec, d = view.document;
   const remaining = Math.max(0, Math.ceil((+new Date(s.lifecycle.purgeAt) - Date.now()) / 86400000));
-  app.innerHTML = `<header class="topbar"><a class="brand" href="/" aria-label="ホーム（旅のカプセル）"><span class="brand-icon">旅</span> <span class="brand-name">旅のカプセル</span> <span class="brand-en">TRIP CAPSULE</span></a><div class="top-actions">${id ? '<a class="button quiet" href="/">ホーム</a>' : ""}<span class="role">${roleNames[view.role]}</span>${id ? button("再読込", "reload", "quiet") : ""}${id ? button("旅を保存", "save", "secondary") : ""}${id && revisable() && view.role === "editor" && editable() ? button("チャットで直す", "revise", "secondary") : ""}${id && (view.role === "owner" || view.role === "editor") ? button("共有・管理", "manage", "primary") : ""}</div></header>
+  app.innerHTML = `<header class="topbar"><a class="brand" href="/" aria-label="ホーム（旅のカプセル）"><span class="brand-icon">旅</span> <span class="brand-name">旅のカプセル</span> <span class="brand-en">TRIP CAPSULE</span></a><div class="top-actions">${id ? '<a class="button quiet" href="/">ホーム</a>' : ""}<span class="role">${roleNames[view.role]}</span>${id ? button("再読込", "reload", "quiet") : ""}${id ? button(saveLabel(), "save", "secondary") : ""}${id && isTrip() && revisable() && view.role === "editor" && editable() ? button("チャットで直す", "revise", "secondary") : ""}${id && (view.role === "owner" || view.role === "editor") ? button("共有・管理", "manage", "primary") : ""}</div></header>
     <div class="lifecycle ${remaining <= 7 ? "urgent" : ""}"><span>● ${stateNames[view.state]}</span><span>${dateLabel(s.lifecycle.purgeAt.slice(0, 10))} に自動削除 · あと${remaining}日${remaining <= 7 && editor() ? " — 削除前に「旅を保存」で書き出してください" : ""}</span></div>
     ${keyBanner()}
     ${view.unreadable?.length ? `<p class="warning" data-unreadable="${view.unreadable.length}">この端末で開けない記録が ${view.unreadable.length} 件あります</p>` : ""}
     ${view.state === "draft" ? `<div class="preview-banner"><div><strong>このしおりは公開前のプレビューです。</strong><p>内容・表示名・削除期限を確認して保存します。保存しただけでは招待リンクは配られません。</p></div>${button("内容を確認して作成", "publish", "primary")}</div>` : ""}
-    <main><section class="hero"><div class="hero-copy"><span class="eyebrow">${e(s.presentation?.kicker ?? "A LITTLE GETAWAY")}</span><h1>${e(s.title)}</h1><p>${e(s.summary ?? "")}</p><div class="trip-meta"><span>${dateLabel(s.trip.startsOn)} — ${dateLabel(s.trip.endsOn)}</span><span>${e(s.timezone)}</span></div><div class="people">${(s.presentation?.travelers ?? []).map(t => `<span>${e(t.name.slice(0, 1))}</span>`).join("")}<small>${(s.presentation?.travelers ?? []).map(t => e(t.name) + (t.note ? `（${e(t.note)}）` : "")).join("・")}</small></div></div><div class="postcard" aria-hidden="true"><div class="postcard-top">POSTCARD <span>${e(s.presentation?.postcardLabel ?? s.trip.destinations[0]!)}</span></div><div class="landscape"><div class="sun"></div><div class="island one"></div><div class="island two"></div><div class="sea"></div><div class="boat">⛵</div></div><div class="postcard-bottom">${e(s.presentation?.postcardCaption ?? "旅に、出かけよう。").replace(/\n/g, "<br>")}<span>TRIP<br>CAPSULE</span></div></div></section>
-    <section class="overview"><div><small>旅のルート</small><strong>${s.trip.destinations.map(e).join(" → ")}</strong></div><div><small>準備チェック</small><strong>${d.checklist.filter(c => c.done).length} / ${d.checklist.length} 完了</strong></div><div><small>まず決めたいこと</small><strong>${e(d.checklist.find(c => !c.done)?.title ?? "準備が整いました")}</strong></div></section>
+    <main>${isTrip() ? `<section class="hero"><div class="hero-copy"><span class="eyebrow">${e(trip().spec.presentation?.kicker ?? "A LITTLE GETAWAY")}</span><h1>${e(s.title)}</h1><p>${e(s.summary ?? "")}</p><div class="trip-meta"><span>${dateLabel(trip().spec.trip.startsOn)} — ${dateLabel(trip().spec.trip.endsOn)}</span><span>${e(s.timezone)}</span></div><div class="people">${(trip().spec.presentation?.travelers ?? []).map(t => `<span>${e(t.name.slice(0, 1))}</span>`).join("")}<small>${(trip().spec.presentation?.travelers ?? []).map(t => e(t.name) + (t.note ? `（${e(t.note)}）` : "")).join("・")}</small></div></div><div class="postcard" aria-hidden="true"><div class="postcard-top">POSTCARD <span>${e(trip().spec.presentation?.postcardLabel ?? trip().spec.trip.destinations[0]!)}</span></div><div class="landscape"><div class="sun"></div><div class="island one"></div><div class="island two"></div><div class="sea"></div><div class="boat">⛵</div></div><div class="postcard-bottom">${e(trip().spec.presentation?.postcardCaption ?? "旅に、出かけよう。").replace(/\n/g, "<br>")}<span>TRIP<br>CAPSULE</span></div></div></section>` : `<section class="hero board"><div class="hero-copy"><span class="eyebrow">SHARED BOARD</span><h1>${e(s.title)}</h1><p>${e(s.summary ?? "")}</p></div></section>`}
+    <section class="overview">${isTrip() ? `<div><small>旅のルート</small><strong>${trip().spec.trip.destinations.map(e).join(" → ")}</strong></div>` : ""}<div><small>準備チェック</small><strong>${d.checklist.filter(c => c.done).length} / ${d.checklist.length} 完了</strong></div><div><small>まず決めたいこと</small><strong>${e(d.checklist.find(c => !c.done)?.title ?? "準備が整いました")}</strong></div></section>
     <nav class="navigation" aria-label="しおりのページ">${pages.map(m => button(m.label, "tab", m.id === tab ? "active" : "", `data-tab="${e(m.id)}" aria-current="${m.id === tab ? "page" : "false"}"`)).join("")}</nav><section class="content">${content()}</section>
-    <footer>この旅のための、小さなしおり。${id && passkeys ? button(view.passkey ? "パスキーを登録し直す" : "パスキーで戻れるようにする", "passkey-register", "quiet") : ""}${id ? button("この端末からログアウト", "signout", "quiet") : ""}${keyStatus()}${handoffWaiting()}<span>招待された人との共有 · revision ${d.revision}</span></footer></main>`;
+    <footer>${isTrip() ? "この旅のための、小さなしおり。" : "みんなで使う、小さなボード。"}${id && passkeys ? button(view.passkey ? "パスキーを登録し直す" : "パスキーで戻れるようにする", "passkey-register", "quiet") : ""}${id ? button("この端末からログアウト", "signout", "quiet") : ""}${keyStatus()}${handoffWaiting()}<span>招待された人との共有 · revision ${d.revision}</span></footer></main>`;
   boundaryRows();
   void mountMap();
   void mountPlaceElement();
@@ -1365,7 +1374,7 @@ async function saveMove(id: string, before: string | null) {
   ordering = true;
   try {
     const r = await sendOperation({ type: "move", id, before }) as { moved?: { id: string } }; await reload();
-    const item = r.moved && view.document.items.find(i => i.id === r.moved!.id);
+    const item = r.moved && trip().document.items.find(i => i.id === r.moved!.id);
     notice(item ? `${item.title}を ${time(item)} に変えました。` : "保存しました。");
   }
   // A refusal (409: someone else saved first) puts the rows back as the trip has them; the message asks for a reload.
@@ -1420,12 +1429,12 @@ function formValues(form: HTMLFormElement) { return Object.fromEntries(new FormD
 // yet), marked a placeholder. Saved on that day with that time, it goes right there; the host, not this form, settles the time.
 // A time typed over it is the user's own, and the item goes where that time fits, as any edit does.
 function itemForm(existing?: Item, place?: { day: string; after?: string }) {
-  const zone = existing?.timezone ?? view.spec.timezone, index = existing ? view.document.items.indexOf(existing) : -1, items = view.document.items;
+  const zone = existing?.timezone ?? view.spec.timezone, index = existing ? trip().document.items.indexOf(existing) : -1, items = trip().document.items;
   const after = place?.after && items.some(i => i.id === place.after) ? place.after : undefined, at = after ? items.findIndex(i => i.id === after) + 1 : items.length, probe = place && [...items.slice(0, at), { id: "", title: "", day: place.day, kind: "activity", status: "proposed", revision: 1 } as Item, ...items.slice(at)];
   const offered = existing && !existing.startsAt ? placeholder(items, index, view.spec.timezone) : probe ? placeholder(probe, at, view.spec.timezone) : undefined;
   const start = existing?.startsAt ? clock(existing.startsAt, zone) : offered !== undefined ? clock(offered, zone) : "", tentative = existing?.timeTentative ?? offered !== undefined;
   const ends = existing?.endsAt, later = ends ? Math.max(0, Math.round((Date.parse(localDay(+new Date(ends), zone)) - Date.parse(existing!.day)) / 86400000)) : 0;
-  modal(existing ? "予定を編集" : "予定を追加", `<form data-form="item" data-id="${existing?.id ?? crypto.randomUUID()}" ${place && after ? `data-after="${e(after)}" data-after-day="${place.day}" data-offered="${start}"` : ""}><label>タイトル<input name="title" required maxlength="160" value="${e(existing?.title ?? "")}"></label><div class="form-grid"><label>日付<input name="day" type="date" required min="${view.spec.trip.startsOn}" max="${view.spec.trip.endsOn}" value="${existing?.day ?? place?.day ?? selectedDay ?? view.spec.trip.startsOn}"></label><label>開始時刻<input name="time" type="time" required value="${start}"></label><label>終了時刻（任意）<input name="end" type="time" value="${ends ? clock(ends, zone) : ""}" data-days="${later}"></label><label class="check"><input type="checkbox" name="tentative" ${tentative ? "checked" : ""}><span>時刻は仮置き（決定ではない）</span></label><label>種類<select name="kind">${Object.entries(kindNames).map(([v, l]) => `<option value="${v}" ${v === existing?.kind ? "selected" : ""}>${l}</option>`).join("")}</select></label><label>状態<select name="status">${Object.entries(statusNames).map(([v, l]) => `<option value="${v}" ${v === (existing?.status ?? "proposed") ? "selected" : ""}>${l}</option>`).join("")}</select></label></div><label>メモ<textarea name="description" maxlength="4000" rows="4">${e(existing?.description ?? "")}</textarea></label><label>場所<input name="place" maxlength="160" value="${e(existing?.place?.label ?? "")}"></label><label>公開URL（HTTPS）<input name="url" type="url" value="${e(existing?.place?.publicUrl ?? "")}"></label><p class="muted">時刻は${e(view.spec.timezone)}。予約番号・秘密URL・チケットQRは入力しないでください。</p><button class="primary">保存する</button></form>`);
+  modal(existing ? "予定を編集" : "予定を追加", `<form data-form="item" data-id="${existing?.id ?? crypto.randomUUID()}" ${place && after ? `data-after="${e(after)}" data-after-day="${place.day}" data-offered="${start}"` : ""}><label>タイトル<input name="title" required maxlength="160" value="${e(existing?.title ?? "")}"></label><div class="form-grid"><label>日付<input name="day" type="date" required min="${trip().spec.trip.startsOn}" max="${trip().spec.trip.endsOn}" value="${existing?.day ?? place?.day ?? selectedDay ?? trip().spec.trip.startsOn}"></label><label>開始時刻<input name="time" type="time" required value="${start}"></label><label>終了時刻（任意）<input name="end" type="time" value="${ends ? clock(ends, zone) : ""}" data-days="${later}"></label><label class="check"><input type="checkbox" name="tentative" ${tentative ? "checked" : ""}><span>時刻は仮置き（決定ではない）</span></label><label>種類<select name="kind">${Object.entries(kindNames).map(([v, l]) => `<option value="${v}" ${v === existing?.kind ? "selected" : ""}>${l}</option>`).join("")}</select></label><label>状態<select name="status">${Object.entries(statusNames).map(([v, l]) => `<option value="${v}" ${v === (existing?.status ?? "proposed") ? "selected" : ""}>${l}</option>`).join("")}</select></label></div><label>メモ<textarea name="description" maxlength="4000" rows="4">${e(existing?.description ?? "")}</textarea></label><label>場所<input name="place" maxlength="160" value="${e(existing?.place?.label ?? "")}"></label><label>公開URL（HTTPS）<input name="url" type="url" value="${e(existing?.place?.publicUrl ?? "")}"></label><p class="muted">時刻は${e(view.spec.timezone)}。予約番号・秘密URL・チケットQRは入力しないでください。</p><button class="primary">保存する</button></form>`);
   const box = dialog.querySelector<HTMLInputElement>("input[name=tentative]")!, field = dialog.querySelector<HTMLInputElement>("input[name=time]")!, end = dialog.querySelector<HTMLInputElement>("input[name=end]")!;
   const minutes = (v: string) => +v.slice(0, 2) * 60 + +v.slice(3, 5);
   let last = field.value;
@@ -1454,8 +1463,12 @@ const saveNotes: Record<"markdown" | "json" | "ics" | "html", string> = {
 // kept at hand for the tap. A fetch that failed is forgotten, so the tap asks again.
 // A sealed trip's exports are made here from the trip this browser opened, with the host's own functions (src/export.ts,
 // docs/ephemeral-trip-capsule.md「5.3 暗号化した旅行で Host にできないこと」); a plain trip's come from the host as before.
-const exported = async (kind: "html" | "md") => (kind === "html" ? tripHtml : tripMarkdown)(view.spec, view.document);
+const exported = async (kind: "html" | "md") => isTrip() ? (kind === "html" ? tripHtml : tripMarkdown)(trip().spec, trip().document) : (kind === "html" ? pageHtml : pageMarkdown)({ spec: view.spec, doc: view.document as BoardDocument });
 let savedPage: Promise<string> | undefined, pageText: string | undefined;
+// The save button: a board's says what it does without a trip's word (#214).
+const saveLabel = () => isTrip() ? "旅を保存" : "保存 ↓";
+// A trip's files are named by its first day; a board's, which has none, by its id.
+const saveName = () => isTrip() ? `trip-${trip().spec.trip.startsOn}` : `board-${(id ?? "").slice(0, 8)}`;
 function fetchPage() {
   const fetched = savedPage = exported("html");
   fetched.then(t => { if (savedPage === fetched) pageText = t; }, () => { if (savedPage === fetched) savedPage = undefined; });
@@ -1463,7 +1476,7 @@ function fetchPage() {
 }
 function saveModal() {
   pageText = undefined; fetchPage();
-  modal("旅を保存", `<h3>旅程のページを保存</h3><p>日ごとの旅程・準備・候補などを、ブラウザで開ける 1 つのファイル（HTML）で保存します。アプリが無くても開けます。スマホでは共有から「ファイルに保存」や LINE・メールに送って残せます。</p><div class="admin-actions">${button("旅程のページを保存", "save-page", "primary")}</div><hr><h3>Markdown をコピー</h3><p>旅程・準備・候補・費用メモ・メモ・思い出をテキストでコピーします。軽く、メモアプリなどに貼ればアプリ無しで読めます。</p><div class="admin-actions">${button("Markdown をコピー", "copy-markdown", "secondary")}</div>${editor() ? `<hr><h3>ZIP を保存</h3><p>旅行のファイルをまとめて保存します。スマホでは「ファイル」アプリ（iPhone）やファイルマネージャ（Android）で ZIP をタップすると展開されます。</p><ul>${view.spec.exports.map(x => `<li>${e(saveNotes[x])}</li>`).join("")}</ul><div class="admin-actions">${view.sealed ? button("ZIP を保存", "save-zip", "secondary") : `<a class="button secondary" href="/v1/c/${id}/export">ZIP を保存</a>`}</div>` : ""}${view.unreadable?.length ? `<p class="warning" data-unreadable-save>この端末で開けない記録 ${view.unreadable.length} 件は、保存する内容に入りません</p>` : ""}`);
+  modal(isTrip() ? "旅を保存" : "保存", `<h3>${isTrip() ? "旅程のページを保存" : "ページを保存"}</h3><p>${isTrip() ? "日ごとの旅程・準備・候補など" : "チェックリスト・候補・メモなど"}を、ブラウザで開ける 1 つのファイル（HTML）で保存します。アプリが無くても開けます。スマホでは共有から「ファイルに保存」や LINE・メールに送って残せます。</p><div class="admin-actions">${button(isTrip() ? "旅程のページを保存" : "ページを保存", "save-page", "primary")}</div><hr><h3>Markdown をコピー</h3><p>${isTrip() ? "旅程・" : ""}準備・候補・費用メモ・メモ・思い出をテキストでコピーします。軽く、メモアプリなどに貼ればアプリ無しで読めます。</p><div class="admin-actions">${button("Markdown をコピー", "copy-markdown", "secondary")}</div>${editor() ? `<hr><h3>ZIP を保存</h3><p>${isTrip() ? "旅行の" : ""}ファイルをまとめて保存します。スマホでは「ファイル」アプリ（iPhone）やファイルマネージャ（Android）で ZIP をタップすると展開されます。</p><ul>${view.spec.exports.map(x => `<li>${e(isTrip() ? saveNotes[x] : saveNotes[x].replace("trip.json", "board.json").replace("旅程の", ""))}</li>`).join("")}</ul><div class="admin-actions">${view.sealed ? button("ZIP を保存", "save-zip", "secondary") : `<a class="button secondary" href="/v1/c/${id}/export">ZIP を保存</a>`}</div>` : ""}${view.unreadable?.length ? `<p class="warning" data-unreadable-save>この端末で開けない記録 ${view.unreadable.length} 件は、保存する内容に入りません</p>` : ""}`);
 }
 // The invites as 共有・管理 last listed them, names opened: an invite's 失効 asks with the seats it shuts out.
 let listedGrants = new Map<string, ListedGrant>();
@@ -1493,12 +1506,12 @@ async function manage() {
   const sealed = Boolean(view.sealed), waiting = waitingSeats(grants.filter(g => !g.revoked));
   const tags = (m: Parameters<typeof memberTags>[0]) => memberTags(m, sealed).map(t => ` <span class="tag ${t.kind}" ${t.kind === "seen" ? "data-seen" : `data-seat-key="${t.kind}"`}>${e(t.text)}</span>`).join("");
   const notes = (g: typeof grants[number]) => { const link = linkNote(g, sealed, waiting); return g.revoked ? "" : `${g.role !== "owner" ? `<small data-revoke-note>${e(revokeNote(g, sealed))}</small>` : ""}${link ? `<small data-link-note>${e(link)}</small>` : ""}`; };
-  const undo = owner && revisable() && view.state !== "frozen" && await api("undo").then(() => true, () => false);
+  const undo = owner && isTrip() && revisable() && view.state !== "frozen" && await api("undo").then(() => true, () => false);
   // While the lists were read, another dialog was drawn (完全に削除 pressed) or the one this was asked from was closed: drawing now
   // would replace that one or open it again. Not the close event's count: it comes after close() returns, so after a 共有・管理 pressed at once.
   if (run !== manageRun || shown && !dialog.open) return;
   listedGrants = new Map(grants.map(g => [g.id, g]));
-  modal(owner ? "招待とメンバー、旅の終わり" : "閲覧者の招待", `${owner ? "" : "<p>あなたが出した閲覧者の招待です。失効できるのは自分が出した招待だけです。</p>"}<p>招待リンクは人数分の席を持ち、開いたブラウザを1席ずつ登録します。定員に達するか受付期限を過ぎたリンクは使えなくなり、登録済みのブラウザだけが入れます。登録したブラウザの鍵（Cookie）が他人に渡ると、その人も入れます。</p><p>招待の発行・失効${owner ? "、共有終了、削除、期限の変更" : ""}の前に、この端末のパスキーで本人確認します（5 分間有効）。</p>${location.protocol === "http:" ? '<p class="warning">現在はこのPC内のローカル版です。別の端末から使うには、HTTPSの公開ホストへ配置してください。</p>' : ""}<form data-form="grant"><div class="form-grid"><label>権限<select name="role">${owner ? '<option value="participant">参加者：候補・チェック・思い出</option><option value="viewer">閲覧者：見るだけ</option><option value="editor">編集者：旅程も編集</option>' : '<option value="viewer">閲覧者：見るだけ</option>'}</select></label><label>リンク名（任意）<input name="label" maxlength="80" placeholder="空欄なら自動で付けます"></label><label>人数（席）<input name="seats" type="number" required min="1" max="50" value="1"></label><label>受付期限（日）<input name="claimDays" type="number" required min="1" max="30" value="3"></label>${owner ? '<label>参加の承認<select name="approval"><option value="auto">自動で参加（既定）</option><option value="owner">オーナーが確認コードで承認</option></select></label>' : ""}</div>${owner ? '<p class="muted">機密度の高い旅行向け。参加者の画面に出る 6 桁のコードを LINE などで聞いて照合します。</p>' : ""}<button class="primary" ${view.state === "frozen" ? "disabled" : ""}>招待リンクを発行</button></form><div class="grant-list">${grants.map(g => `<div class="grant"><div><strong>${e(g.label)}</strong><small>${roleNames[g.role]} · ${g.revoked ? "失効済み" : `登録 ${g.claimed}/${g.seats}席 · ${g.claimed >= g.seats ? "定員に達し受付終了" : g.claimBy <= Date.now() ? "受付期限切れ" : "受付 " + day(g.claimBy) + "まで"}`}</small>${owner ? `<small>発行: ${e(g.issuedBy?.label ?? "オーナー（発行時）")}</small>` : ""}${g.revoked ? "" : g.members.map(m => `<small class="member">${e(m.label)}${m.self ? "（この端末）" : ""} · ${e(m.device)} · ${day(m.created)}登録${tags(m)} ${m.pending ? `<strong>承認待ち · コード <span class="code">${e(m.code ?? "")}</span></strong> ${owner ? button("承認", "approve-member", "quiet", `data-id="${m.id}"`) + button("拒否", "reject-member", "quiet danger-text", `data-id="${m.id}"`) : ""}` : ""}${owner ? button("名前", "rename-member", "quiet", `data-id="${m.id}" data-label="${e(m.label)}"`) : ""}${g.role !== "owner" ? button("失効", "revoke-member", "quiet danger-text", `data-id="${m.id}"`) : ""}</small>`).join("")}${notes(g)}</div>${!g.revoked && view.state !== "frozen" ? `<div>${button("交換", "rotate", "quiet", `data-id="${g.id}" data-role="${g.role}" data-label="${e(g.label)}"`)}${g.role !== "owner" ? button("失効", "revoke", "quiet danger-text", `data-id="${g.id}"`) : ""}</div>` : ""}</div>`).join("")}</div>${owner ? `<details class="history"><summary>招待とオーナーの履歴（${history.length} 件）</summary>${history.length ? `<ol>${history.map(a => `<li>${[`${day(a.at)} ${new Date(a.at).toLocaleTimeString("ja", { hour: "2-digit", minute: "2-digit" })}`, e(historyNames[a.event] ?? a.event), a.role ? roleNames[a.role] : "", a.label ? e(a.label) : "", a.by ? `${e(a.by)}${a.device ? `（${e(a.device)}）` : ""}` : ""].filter(Boolean).join(" · ")}</li>`).join("")}</ol>` : "<p>まだありません</p>"}</details><hr><p>自動削除：${e(new Date(view.spec.lifecycle.purgeAt).toLocaleString("ja"))}<br>削除前に『旅を保存』で書き出してください。</p>${revisable() ? "" : `<p class="muted" data-sealed="manage">${notRevisable}</p>`}<div class="admin-actions">${button("旅を保存", "save", "secondary")}${revisable() ? button("チャットで直す", "revise", "secondary", view.state === "frozen" ? "disabled" : "") : ""}${undo ? button("1 つ前に戻す", "undo", "secondary") : ""}${button("設定・期限の変更", "settings", "secondary", view.state === "frozen" ? "disabled" : "")}${button("共有を終了", "freeze", "secondary", view.state === "frozen" ? "disabled" : "")}${button("完全に削除", "purge", "danger")}</div><p class="muted">共有終了はオーナー以外のリンクを失効させます。完全削除すると元に戻せません。</p>` : ""}`);
+  modal(owner ? "招待とメンバー、旅の終わり" : "閲覧者の招待", `${owner ? "" : "<p>あなたが出した閲覧者の招待です。失効できるのは自分が出した招待だけです。</p>"}<p>招待リンクは人数分の席を持ち、開いたブラウザを1席ずつ登録します。定員に達するか受付期限を過ぎたリンクは使えなくなり、登録済みのブラウザだけが入れます。登録したブラウザの鍵（Cookie）が他人に渡ると、その人も入れます。</p><p>招待の発行・失効${owner ? "、共有終了、削除、期限の変更" : ""}の前に、この端末のパスキーで本人確認します（5 分間有効）。</p>${location.protocol === "http:" ? '<p class="warning">現在はこのPC内のローカル版です。別の端末から使うには、HTTPSの公開ホストへ配置してください。</p>' : ""}<form data-form="grant"><div class="form-grid"><label>権限<select name="role">${owner ? '<option value="participant">参加者：候補・チェック・思い出</option><option value="viewer">閲覧者：見るだけ</option><option value="editor">編集者：旅程も編集</option>' : '<option value="viewer">閲覧者：見るだけ</option>'}</select></label><label>リンク名（任意）<input name="label" maxlength="80" placeholder="空欄なら自動で付けます"></label><label>人数（席）<input name="seats" type="number" required min="1" max="50" value="1"></label><label>受付期限（日）<input name="claimDays" type="number" required min="1" max="30" value="3"></label>${owner ? '<label>参加の承認<select name="approval"><option value="auto">自動で参加（既定）</option><option value="owner">オーナーが確認コードで承認</option></select></label>' : ""}</div>${owner ? '<p class="muted">機密度の高い旅行向け。参加者の画面に出る 6 桁のコードを LINE などで聞いて照合します。</p>' : ""}<button class="primary" ${view.state === "frozen" ? "disabled" : ""}>招待リンクを発行</button></form><div class="grant-list">${grants.map(g => `<div class="grant"><div><strong>${e(g.label)}</strong><small>${roleNames[g.role]} · ${g.revoked ? "失効済み" : `登録 ${g.claimed}/${g.seats}席 · ${g.claimed >= g.seats ? "定員に達し受付終了" : g.claimBy <= Date.now() ? "受付期限切れ" : "受付 " + day(g.claimBy) + "まで"}`}</small>${owner ? `<small>発行: ${e(g.issuedBy?.label ?? "オーナー（発行時）")}</small>` : ""}${g.revoked ? "" : g.members.map(m => `<small class="member">${e(m.label)}${m.self ? "（この端末）" : ""} · ${e(m.device)} · ${day(m.created)}登録${tags(m)} ${m.pending ? `<strong>承認待ち · コード <span class="code">${e(m.code ?? "")}</span></strong> ${owner ? button("承認", "approve-member", "quiet", `data-id="${m.id}"`) + button("拒否", "reject-member", "quiet danger-text", `data-id="${m.id}"`) : ""}` : ""}${owner ? button("名前", "rename-member", "quiet", `data-id="${m.id}" data-label="${e(m.label)}"`) : ""}${g.role !== "owner" ? button("失効", "revoke-member", "quiet danger-text", `data-id="${m.id}"`) : ""}</small>`).join("")}${notes(g)}</div>${!g.revoked && view.state !== "frozen" ? `<div>${button("交換", "rotate", "quiet", `data-id="${g.id}" data-role="${g.role}" data-label="${e(g.label)}"`)}${g.role !== "owner" ? button("失効", "revoke", "quiet danger-text", `data-id="${g.id}"`) : ""}</div>` : ""}</div>`).join("")}</div>${owner ? `<details class="history"><summary>招待とオーナーの履歴（${history.length} 件）</summary>${history.length ? `<ol>${history.map(a => `<li>${[`${day(a.at)} ${new Date(a.at).toLocaleTimeString("ja", { hour: "2-digit", minute: "2-digit" })}`, e(historyNames[a.event] ?? a.event), a.role ? roleNames[a.role] : "", a.label ? e(a.label) : "", a.by ? `${e(a.by)}${a.device ? `（${e(a.device)}）` : ""}` : ""].filter(Boolean).join(" · ")}</li>`).join("")}</ol>` : "<p>まだありません</p>"}</details><hr><p>自動削除：${e(new Date(view.spec.lifecycle.purgeAt).toLocaleString("ja"))}<br>削除前に『旅を保存』で書き出してください。</p>${!isTrip() || revisable() ? "" : `<p class="muted" data-sealed="manage">${notRevisable}</p>`}<div class="admin-actions">${button(saveLabel(), "save", "secondary")}${isTrip() && revisable() ? button("チャットで直す", "revise", "secondary", view.state === "frozen" ? "disabled" : "") : ""}${undo ? button("1 つ前に戻す", "undo", "secondary") : ""}${isTrip() ? button("設定・期限の変更", "settings", "secondary", view.state === "frozen" ? "disabled" : "") : ""}${button("共有を終了", "freeze", "secondary", view.state === "frozen" ? "disabled" : "")}${button("完全に削除", "purge", "danger")}</div><p class="muted">共有終了はオーナー以外のリンクを失効させます。完全削除すると元に戻せません。</p>` : ""}`);
 }
 function showLink(url: string, owner = false, openHere = owner) { modal(owner ? "オーナーとして使う端末で開いてください" : "招待リンクができました", `<p>${owner ? "このリンクは最初に開いて登録した1つのブラウザだけをオーナーにします。後から再表示できません。3日以内に、普段使う端末のブラウザで開いてください。" : "メンバーに送ってください。開いたブラウザが1席ずつ登録され、定員に達するか受付期限を過ぎると使えなくなります。"}</p><label>リンク<input id="issued-link" readonly value="${e(url)}"></label><div class="admin-actions">${button("コピー", "copy", "primary")}${openHere ? `<a class="button secondary" href="${e(url)}">カプセルを開く</a>` : ""}</div>`); }
 document.addEventListener("click", async event => {
@@ -1520,10 +1533,10 @@ document.addEventListener("click", async event => {
     if (action === "close" && leaveOwnerless()) dialog.close();
     if (action === "reload") { await reload(); notice("最新の内容を読み込みました。"); }
     // The heading's button adds after the day's last item, as its last "＋" does.
-    if (action === "new-item") itemForm(undefined, { day: selectedDay, after: view.document.items.filter(i => i.day === selectedDay).at(-1)?.id });
+    if (action === "new-item") itemForm(undefined, { day: selectedDay, after: trip().document.items.filter(i => i.day === selectedDay).at(-1)?.id });
     if (action === "insert-item") itemForm(undefined, { day: selectedDay, after: b.dataset.after });
-    if (action === "edit-item") itemForm(view.document.items.find(i => i.id === b.dataset.id));
-    if (action === "new-private-item") privatePlanForm(undefined, { day: selectedDay, after: view.document.items.filter(i => i.day === selectedDay).at(-1)?.id });
+    if (action === "edit-item") itemForm(trip().document.items.find(i => i.id === b.dataset.id));
+    if (action === "new-private-item") privatePlanForm(undefined, { day: selectedDay, after: trip().document.items.filter(i => i.day === selectedDay).at(-1)?.id });
     if (action === "insert-private-item") privatePlanForm(undefined, { day: selectedDay, after: b.dataset.after });
     if (action === "edit-private") { const p = own().find(p => p.id === b.dataset.id), x = p && plain.get(p.id); if (x) { if (x.kind === "item") privatePlanForm(x); else { tab = pageModules().find(m => m.kind === "reflection")!.id; diaryDay = x.day; editingDiaryId = x.id; render(); app.querySelector<HTMLTextAreaElement>(".diary [name=body]")?.focus(); } } else if (p) lockedPrivate(p); }
     if (action === "cancel-diary") { editingDiaryId = ""; render(); }
@@ -1562,7 +1575,8 @@ document.addEventListener("click", async event => {
     if (action === "copy") { const field = document.querySelector<HTMLInputElement>("#issued-link")!; try { await navigator.clipboard.writeText(field.value); notice("リンクをコピーしました。"); } catch { field.select(); notice("リンクを選択しました。コピーして保存してください。"); } }
     if (action === "join") { const joined = await api("sessions", "POST", { secret: joinSecret }); joinSecret = ""; history.replaceState(null, "", location.pathname); if (joined.pending) return pendingScreen(joined.code); await reload(); modal("この端末を登録しました", `<p>次からは <strong>${e(location.host)}</strong> を開くと「この端末で参加中の旅行」から入れます。このページをブックマークするか、ホーム画面に追加しておくと確実です。</p><p class="muted">受け取った招待リンクも、このブラウザでなら開き直せます。ブラウザのデータ（Cookie）を消すと登録が消え、${passkeys ? "パスキーを登録していなければ" : ""}オーナーからの再招待が必要になります。</p>${passkeys ? `<div class="admin-actions">${button("Face ID / 指紋で戻れるようにする（任意）", "passkey-register", "secondary")}</div><p class="muted">Cookie を消したときに同じ席に戻れます。${view.role === "owner" ? "オーナーは、招待の発行や削除などの前の本人確認にも使います。" : view.role === "editor" ? "編集者は、招待の発行・失効の前の本人確認にも使います。" : ""}閲覧の盗み見を防ぐものではありません。</p>` : ""}`); }
     if (action === "copy-recipe") {
-      const { text } = await api("/v1/recipe") as { text: string };
+      const kind = document.querySelector<HTMLSelectElement>("[data-recipe-kind]")?.value ?? "trip";
+      const { text } = await api(`/v1/recipe?kind=${encodeURIComponent(kind)}`) as { text: string };
       try { await navigator.clipboard.writeText(text); notice("作り方をコピーしました。チャットに貼って、旅行の希望を書いてください。"); }
       catch {
         modal("作り方", `<p>下の文をすべて選んでコピーし、チャットに貼ってください。</p><label><textarea id="recipe-text" rows="10" readonly>${e(text)}</textarea></label>`);
@@ -1579,7 +1593,7 @@ document.addEventListener("click", async event => {
       const request = document.querySelector<HTMLTextAreaElement>("[data-revise-request]")?.value.trim() ?? "";
       // The request goes first: were the text cut short where it is pasted, the request would be the part lost (#306).
       // A sealed trip's text is made here from the trip this browser opened, as the host makes a plain one's (spec「5.3 暗号化した旅行で Host にできないこと」).
-      const made: Promise<string> = Promise.resolve(reviseText(view.spec, view.document, view.role !== "owner"));
+      const made: Promise<string> = Promise.resolve(reviseText(trip().spec, trip().document, view.role !== "owner"));
       const text = made.then(t => request ? `## 直してほしいこと\n\n${request}\n\n---\n\n${t}` : t);
       try { await navigator.clipboard.write([new ClipboardItem({ "text/plain": text.then(t => new Blob([t], { type: "text/plain" })) })]); notice(request ? "今の旅程と直し方に、直してほしいことを付けてコピーしました。チャットに貼って、そのまま送ってください。" : "今の旅程と直し方をコピーしました。チャットに貼って、直してほしいことを書いてください。"); }
       catch {
@@ -1591,18 +1605,19 @@ document.addEventListener("click", async event => {
     // One HTML file: to the share sheet where the browser can hand it a file, else downloaded. Closing the sheet saves nothing.
     // A tap that waited for the page may have lost the sheet's permission: one more tap, with the page at hand, opens it.
     if (action === "save-page") {
-      const waited = pageText === undefined, name = `trip-${view.spec.trip.startsOn}.html`, text = pageText ?? await (savedPage ?? fetchPage()), file = new File([text], name, { type: "text/html" });
+      const waited = pageText === undefined, name = `${saveName()}.html`, text = pageText ?? await (savedPage ?? fetchPage()), file = new File([text], name, { type: "text/html" });
       let shared = false;
       if (navigator.canShare?.({ files: [file] })) try { await navigator.share({ files: [file], title: view.spec.title }); shared = true; } catch (err) {
         if ((err as Error).name === "AbortError") return;
-        if ((err as Error).name === "NotAllowedError" && waited) { notice("旅程のページの用意ができました。もう一度押すと共有できます。"); return; }
+        if ((err as Error).name === "NotAllowedError" && waited) { notice(`${isTrip() ? "旅程の" : ""}ページの用意ができました。もう一度押すと共有できます。`); return; }
       }
       if (!shared) download(text, "text/html;charset=utf-8", name);
-      notice("旅程のページを保存しました。ブラウザで開くと旅のしおりとして読めます。");
+      notice(isTrip() ? "旅程のページを保存しました。ブラウザで開くと旅のしおりとして読めます。" : "ページを保存しました。ブラウザで開くと読めます。");
     }
     // A sealed trip's ZIP: the same files the host makes, made here from the opened trip.
     if (action === "save-zip") {
-      download(new Uint8Array(zip(await exportFiles(id!, view.spec, view.document, view.updated ?? new Date().toISOString()))), "application/zip", `trip-${view.spec.trip.startsOn}.zip`);
+      const updated = view.updated ?? new Date().toISOString();
+      download(new Uint8Array(zip(isTrip() ? await exportFiles(id!, trip().spec, trip().document, updated) : await boardFiles(id!, view.spec as BoardSpec, view.document as BoardDocument, updated))), "application/zip", `${saveName()}.zip`);
       notice("ZIP を保存しました。");
     }
     if (action === "copy-markdown") {
@@ -1619,7 +1634,7 @@ document.addEventListener("click", async event => {
     // The memo key first, from this browser or the seat's passkey: what cannot be opened cannot be copied, nor an answer sealed.
     if (action === "revise-private") try { if (!await ensureMemoKey()) return; await openAll(); render(); privateRevise(); } catch (err) { passkeyError(err); }
     if (action === "copy-revise-private") {
-      const request = dialog.querySelector<HTMLTextAreaElement>("[data-revise-request]")?.value.trim() ?? "", made = privateReviseText(view.spec, view.document, readable());
+      const request = dialog.querySelector<HTMLTextAreaElement>("[data-revise-request]")?.value.trim() ?? "", made = privateReviseText(trip().spec, trip().document, readable());
       const text = request ? `## 直してほしいこと\n\n${request}\n\n---\n\n${made}` : made;
       try { await navigator.clipboard.writeText(text); notice(request ? "自分の予定・日記と直し方に、直してほしいことを付けてコピーしました。チャットに貼って、そのまま送ってください。" : "自分の予定・日記と直し方をコピーしました。チャットに貼って、直してほしいことを書いてください。"); }
       catch {
@@ -1679,8 +1694,10 @@ document.addEventListener("click", async event => {
     }
     if (action === "freeze" && confirm("共有を終了し、オーナー以外のリンクをすべて失効させますか？以降は読み取り専用です。")) { await api("freeze", "POST", { confirm: true }); dialog.close(); await reload(); }
     if (action === "purge") modal("完全に削除", `<form data-form="purge"><p>旅程・投稿・すべてのリンクを削除します。取り消せません。必要なZIPは先に保存してください。</p><label>確認のため「${e(view.spec.title)}」を入力<input name="title" required autocomplete="off"></label><button class="danger">完全に削除する</button></form>`);
-    if (action === "settings") modal("設定・期限の変更", `<form data-form="settings"><label>タイトル<input name="title" value="${e(view.spec.title)}" required maxlength="160"></label><label>行き先<input name="destination" value="${e(view.spec.trip.destinations.join("、"))}" required maxlength="160"></label><div class="form-grid"><label>初日<input name="start" type="date" required value="${view.spec.trip.startsOn}"></label><label>最終日<input name="end" type="date" required value="${view.spec.trip.endsOn}"></label></div><label>テーマ<select name="theme">${["paper", "postcard", "minimal", "night"].map(x => `<option ${x === view.spec.theme.preset ? "selected" : ""}>${x}</option>`).join("")}</select></label><label>自動削除日（日本時間0時）<input name="purge" type="date" required value="${view.spec.lifecycle.purgeAt.slice(0, 10)}"></label><p>旅行後の追記期間：${view.spec.lifecycle.reflectionDays}日。期限は作成から最大180日で、最終日より後にしてください。登録済みの予定は新しい日程の範囲内に収まっている必要があります。</p><button class="primary">変更内容を確認</button></form>`);
-    if (action === "publish") modal("旅程を確認して、作成", `<form data-form="publish"><p>旅程は${e(view.spec.trip.startsOn)}〜${e(view.spec.trip.endsOn)}、削除予定は${e(view.spec.lifecycle.purgeAt.slice(0, 10))}です。予定と表示名に共有したくない情報が残っていないか確認してください。</p><label>旅行の初日<input name="start" type="date" value="${view.spec.trip.startsOn}" required></label><label class="check"><input type="checkbox" required><span>日付・旅程・削除期限を確認しました</span></label><p class="muted">日付を変更すると全予定と削除日も同じ日数だけ移動します。</p><button class="primary">この内容でカプセルを作成</button></form>`);
+    if (action === "settings") modal("設定・期限の変更", `<form data-form="settings"><label>タイトル<input name="title" value="${e(view.spec.title)}" required maxlength="160"></label><label>行き先<input name="destination" value="${e(trip().spec.trip.destinations.join("、"))}" required maxlength="160"></label><div class="form-grid"><label>初日<input name="start" type="date" required value="${trip().spec.trip.startsOn}"></label><label>最終日<input name="end" type="date" required value="${trip().spec.trip.endsOn}"></label></div><label>テーマ<select name="theme">${["paper", "postcard", "minimal", "night"].map(x => `<option ${x === view.spec.theme.preset ? "selected" : ""}>${x}</option>`).join("")}</select></label><label>自動削除日（日本時間0時）<input name="purge" type="date" required value="${view.spec.lifecycle.purgeAt.slice(0, 10)}"></label><p>旅行後の追記期間：${trip().spec.lifecycle.reflectionDays}日。期限は作成から最大180日で、最終日より後にしてください。登録済みの予定は新しい日程の範囲内に収まっている必要があります。</p><button class="primary">変更内容を確認</button></form>`);
+    // A board has no days to move: what is checked is its deadline and its words.
+    if (action === "publish" && !isTrip()) modal("内容を確認して、作成", `<form data-form="publish"><p>削除予定は${e(view.spec.lifecycle.purgeAt.slice(0, 10))}です。表示名とメモに共有したくない情報が残っていないか確認してください。</p><label class="check"><input type="checkbox" required><span>内容と削除期限を確認しました</span></label><button class="primary">この内容でカプセルを作成</button></form>`);
+    else if (action === "publish") modal("旅程を確認して、作成", `<form data-form="publish"><p>旅程は${e(trip().spec.trip.startsOn)}〜${e(trip().spec.trip.endsOn)}、削除予定は${e(view.spec.lifecycle.purgeAt.slice(0, 10))}です。予定と表示名に共有したくない情報が残っていないか確認してください。</p><label>旅行の初日<input name="start" type="date" value="${trip().spec.trip.startsOn}" required></label><label class="check"><input type="checkbox" required><span>日付・旅程・削除期限を確認しました</span></label><p class="muted">日付を変更すると全予定と削除日も同じ日数だけ移動します。</p><button class="primary">この内容でカプセルを作成</button></form>`);
   } catch (err) { notice((err as Error).message, true); }
 });
 document.addEventListener("change", async event => { const t = event.target as HTMLInputElement; if (t.matches("[data-diary-day]")) { diaryDay = t.value; editingDiaryId = ""; render(); } if (t.dataset.check) try { await mutate({ type: "check", id: t.dataset.check, done: t.checked }); } catch (err) { t.checked = !t.checked; notice((err as Error).message, true); } });
@@ -1726,7 +1743,7 @@ document.addEventListener("submit", async event => {
     }
     if (form.dataset.form === "promote") await mutate({ type: "promote", id: form.dataset.id, day: f.day });
     if (form.dataset.form === "item") {
-      const old = view.document.items.find(i => i.id === form.dataset.id);
+      const old = trip().document.items.find(i => i.id === form.dataset.id);
       // An item kept in another zone would come back shifted: the form reads and writes Tokyo time only.
       if (view.spec.timezone !== "Asia/Tokyo" || (old?.timezone ?? "Asia/Tokyo") !== "Asia/Tokyo") throw new Error("時刻の編集UIは現在Asia/Tokyoのみ対応しています。");
       // Refused here as the host would refuse it; an end left as it was keeps the way it was written.
@@ -1738,7 +1755,7 @@ document.addEventListener("submit", async event => {
       // Moved to another day in the form, or given a time of the user's own, it goes where its time fits instead.
       const after = form.dataset.after && f.day === form.dataset.afterDay && f.time === form.dataset.offered ? form.dataset.after : undefined;
       await mutate({ type: "item", item, ...(after ? { after } : {}) });
-      const placed = after && view.document.items.find(i => i.id === item.id); if (placed) notice(`${placed.title}を ${time(placed)} に置きました。`);
+      const placed = after && trip().document.items.find(i => i.id === item.id); if (placed) notice(`${placed.title}を ${time(placed)} に置きました。`);
     }
     if (form.dataset.form === "private") {
       const item = f.kind === "item";
@@ -1794,18 +1811,20 @@ document.addEventListener("submit", async event => {
     // A sealed trip's title is compared here: the host cannot read it (spec「5.3 暗号化した旅行で Host にできないこと」).
     if (form.dataset.form === "purge") { if (view.sealed && !sameTitle(f.title, view.spec.title)) throw new Error("確認用のタイトルが一致しません"); await api("purge", "POST", { title: view.sealed ? "" : f.title }); await forgetTrip(id!); dialog.close(); unmountMap?.(); unmountMap = undefined; app.innerHTML = '<main class="empty"><h1>カプセルを削除しました。</h1><p>すべてのリンクが失効しました。</p><a href="/">プレビューに戻る</a></main>'; }
     if (form.dataset.form === "settings") {
-      if (confirm(`タイトル：${view.spec.title} → ${f.title}\n日程：${view.spec.trip.startsOn}〜${view.spec.trip.endsOn} → ${f.start}〜${f.end}\nテーマ：${view.spec.theme.preset} → ${f.theme}\n削除日：${view.spec.lifecycle.purgeAt.slice(0, 10)} → ${f.purge}\nこの変更を反映しますか？`)) { const spec = structuredClone(view.spec); spec.title = f.title!; spec.trip = { startsOn: f.start!, endsOn: f.end!, destinations: f.destination!.split(/[、,]/).map(x => x.trim()).filter(Boolean) }; spec.theme.preset = f.theme as Spec["theme"]["preset"]; spec.lifecycle.purgeAt = `${f.purge}T00:00:00+09:00`;
+      if (confirm(`タイトル：${view.spec.title} → ${f.title}\n日程：${trip().spec.trip.startsOn}〜${trip().spec.trip.endsOn} → ${f.start}〜${f.end}\nテーマ：${view.spec.theme.preset} → ${f.theme}\n削除日：${view.spec.lifecycle.purgeAt.slice(0, 10)} → ${f.purge}\nこの変更を反映しますか？`)) { const spec = structuredClone(trip().spec); spec.title = f.title!; spec.trip = { startsOn: f.start!, endsOn: f.end!, destinations: f.destination!.split(/[、,]/).map(x => x.trim()).filter(Boolean) }; spec.theme.preset = f.theme as Spec["theme"]["preset"]; spec.lifecycle.purgeAt = `${f.purge}T00:00:00+09:00`;
         // The settings go sealed: the words checked as a plain Spec first, then its title, destinations and labels sealed.
         if (!view.sealed || !tripKey) throw new Error("この端末には旅行の鍵がありません");
         let sealedSpec: unknown; try { sealedSpec = await sealSpec(tripKey, id!, view.sealed.generation, specSchema.parse(spec)); } catch (err) { throw plainError(err); }
         await api("spec", "PATCH", { spec: sealedSpec, confirm: true }); dialog.close(); await reload(); }
     }
     if (form.dataset.form === "publish") {
-      const spec = structuredClone(view.spec), doc = structuredClone(view.document), delta = +new Date(f.start!) - +new Date(spec.trip.startsOn);
-      const shiftDay = (s: string) => new Date(+new Date(s) + delta).toISOString().slice(0, 10);
-      spec.presentation?.dayHeadings.forEach(h => { h.day = shiftDay(h.day); });
-      spec.trip.startsOn = shiftDay(spec.trip.startsOn); spec.trip.endsOn = shiftDay(spec.trip.endsOn); spec.lifecycle.purgeAt = new Date(+new Date(spec.lifecycle.purgeAt) + delta).toISOString();
-      doc.items.forEach(i => { i.day = shiftDay(i.day); if (i.startsAt) i.startsAt = new Date(+new Date(i.startsAt) + delta).toISOString(); if (i.endsAt) i.endsAt = new Date(+new Date(i.endsAt) + delta).toISOString(); });
+      const spec = structuredClone(view.spec), doc = structuredClone(view.document);
+      if (spec.kind === "trip") {
+        const delta = +new Date(f.start!) - +new Date(spec.trip.startsOn), shiftDay = (s: string) => new Date(+new Date(s) + delta).toISOString().slice(0, 10);
+        spec.presentation?.dayHeadings.forEach(h => { h.day = shiftDay(h.day); });
+        spec.trip.startsOn = shiftDay(spec.trip.startsOn); spec.trip.endsOn = shiftDay(spec.trip.endsOn); spec.lifecycle.purgeAt = new Date(+new Date(spec.lifecycle.purgeAt) + delta).toISOString();
+        (doc as Document).items.forEach(i => { i.day = shiftDay(i.day); if (i.startsAt) i.startsAt = new Date(+new Date(i.startsAt) + delta).toISOString(); if (i.endsAt) i.endsAt = new Date(+new Date(i.endsAt) + delta).toISOString(); });
+      }
       const operationId = operationFor(JSON.stringify({ spec, document: doc }));
       let result: { id: string; url?: string; replayed?: true };
       try { result = await api("/v1/publish", "POST", { spec, document: doc, confirm: true, operationId }); }
@@ -1843,8 +1862,9 @@ function showChecked(result: Checked, source: "paste" | "assist") {
   const reasons = source === "assist" ? { ...pasteReasons, "cut-off": "生成が途中で切れました。希望を短くしてもう一度試してください。" } : pasteReasons;
   if (!result.ok) { problems(result.reason ? [reasons[result.reason]] : result.messages ?? [], source); notice(source === "assist" ? "できた旅程を確認してください。" : "貼った内容を確認してください。", true); return; }
   problems([], source);
-  view = { ...validate(result.trip!.spec, result.trip!.document, Date.now()), role: "owner", state: "draft" }; render();
-  notice(`${result.title}（${result.items} 件の予定、${result.purgeAt?.slice(0, 10)} に自動削除）を読み込みました。まだ保存していません。`);
+  const board = (result.trip!.spec as { kind?: unknown }).kind === "board";
+  view = { ...(board ? validateBoard : validate)(result.trip!.spec, result.trip!.document, Date.now()), role: "owner", state: "draft" }; render();
+  notice(`${result.title}（${board ? "共有ボード" : `${result.items} 件の予定`}、${result.purgeAt?.slice(0, 10)} に自動削除）を読み込みました。まだ保存していません。`);
 }
 // The host writes the trip as a job; this asks every 3 seconds, and gives up after 150 seconds with the host's own wording.
 async function runAssist() {
@@ -1907,7 +1927,7 @@ async function sealedUndo(): Promise<{ diff: Diff; revision: number; next: Next;
   if (!opened || opened.unreadable.length) throw new Error("1 つ前の旅程をこの端末で開けません");
   const { items, checklist, notes, budget, suggestions, comments } = opened.document, has = got.previous.document;
   const previous: Previous<Spec, Document> = { spec: opened.spec, document: { items, checklist, notes, budget, ...(has.suggestions ? { suggestions } : {}), ...(has.comments ? { comments } : {}) }, ...(got.previous.revisedIds ? { revisedIds: got.previous.revisedIds } : {}) };
-  const r = undoTrip({ spec: view.spec, document: view.document }, previous, { created: view.created!, keepSpec: view.role !== "owner" });
+  const r = undoTrip(trip(), previous, { created: view.created!, keepSpec: view.role !== "owner" });
   if (!r.ok) throw new Error(r.reason === "spec" ? "設定も戻るため、オーナーだけが戻せます" : r.reason === "none" ? "戻せる旅程がありません" : "1 つ前の旅程に戻せません");
   return { diff: r.diff, revision: got.revision, next: r.next, step: got.previous };
 }
@@ -1958,7 +1978,7 @@ async function wrapAssistKey(key: string) {
 // The answer's text, or no text when it was cut off; a failure throws the words the host's runAssist says.
 async function sealedAssist(request: string): Promise<{ text?: string }> {
   // Built as the host builds a plain trip's (revise/assist): today's date first, in the trip's time zone (#658).
-  const text = `${todayLine(localDay(Date.now(), view.spec.timezone))}${reviseText(view.spec, view.document, view.role !== "owner")}${request.trim() ? `\n## 直してほしいこと\n\n${request.trim()}\n` : ""}`;
+  const text = `${todayLine(localDay(Date.now(), view.spec.timezone))}${reviseText(trip().spec, trip().document, view.role !== "owner")}${request.trim() ? `\n## 直してほしいこと\n\n${request.trim()}\n` : ""}`;
   if (new TextEncoder().encode(text).length > REVISE_LIMIT) throw new Error("旅程が長すぎて、ここでは直せません。「チャットで直す」でコピーして使ってください");
   if (!view.assistWrapped) throw new Error("Anthropic の API キーを登録してください");
   if (assistKeyOpened?.wrapped !== view.assistWrapped) assistKeyOpened = { wrapped: view.assistWrapped, key: await openWords(await assistPrf(), view.assistWrapped, `${id}/assist`) };
@@ -1999,7 +2019,7 @@ async function sealedCheck(text: string) {
   if (stale || view.document.revision !== (await api() as View).document.revision) await reload();
   // A reload may have brought a record this browser cannot open: an answer applied now would drop it.
   if (!revisable()) return { ok: false, messages: [notRevisable] };
-  const now = Date.now(), r = reviseTrip({ spec: view.spec, document: view.document }, text, { author: view.label ?? "", at: new Date(now).toISOString(), created: view.created!, now, keepSpec: view.role !== "owner" });
+  const now = Date.now(), r = reviseTrip(trip(), text, { author: view.label ?? "", at: new Date(now).toISOString(), created: view.created!, now, keepSpec: view.role !== "owner" });
   if (!r.ok) return "tooLong" in r ? { ok: false, messages: ["貼り付けが長すぎます。旅程の部分だけを貼ってください"] } : { ok: false, reason: r.reason, messages: r.messages };
   return { ok: true, diff: r.diff, revision: view.document.revision, next: r.next };
 }

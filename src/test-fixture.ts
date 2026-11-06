@@ -1,6 +1,7 @@
 import { createHash, generateKeyPairSync, randomBytes, sign, type KeyObject } from "node:crypto";
 import { emptyTrip } from "./template";
-import { newAttempt, newHandoffKeys, newSeatKeys, newTripKey, openName, openPoint, openTrip, sealMove, sealName, sealOperation, sealPoint, sealSpec, seatPublic, wrapTripKey } from "./trip-keys";
+import type { BoardSpec, BoardDocument } from "./board-schema";
+import { newAttempt, newHandoffKeys, newSeatKeys, newTripKey, openCapsule, openName, openPoint, sealMove, sealName, sealOperation, sealPoint, sealSpec, seatPublic, wrapTripKey } from "./trip-keys";
 // Fictional test data only. Not imported by client or production entrypoints.
 // The day n days after `start` (YYYY-MM-DD), counted in UTC like `emptyTrip`.
 export function tripDay(start: string, n: number) {
@@ -17,6 +18,22 @@ export function testTrip(start = "2026-09-24") {
   ];
   return seed;
 }
+// An attendance check: no dates, no places, the pages a trip has that need none (src/board-schema.ts).
+export const testBoard = (): { spec: BoardSpec; document: BoardDocument } => ({
+  spec: {
+    schemaVersion: 1, kind: "board", title: "テストの出欠", summary: "来られるかどうか", locale: "ja", timezone: "Asia/Tokyo",
+    modules: [
+      { id: "ideas", kind: "suggestion-board", label: "候補" }, { id: "who", kind: "checklist", label: "出欠", mode: "shared" },
+      { id: "memo", kind: "notes", label: "メモ" }, { id: "after", kind: "reflection", label: "ふりかえり" }, { id: "cost", kind: "budget", label: "会費", currency: "JPY" },
+    ],
+    navigation: ["ideas", "who", "memo", "after", "cost"],
+    theme: { preset: "paper", accent: "#335c4a" },
+    collaboration: { participantSuggestions: true, participantComments: true, participantChecklist: true },
+    lifecycle: { purgeAt: "2026-11-01T00:00:00Z" },
+    exports: ["markdown", "json", "html"],
+  },
+  document: { revision: 1, suggestions: [], checklist: [{ id: "a", title: "Aさん", done: false }], comments: [], reflections: [], notes: "", budget: [] },
+});
 
 // Stands in for a platform authenticator: builds the two byte strings a browser hands to the server.
 export function fakeAuthenticator(options: { rsa?: boolean; origin?: string } = {}) {
@@ -114,7 +131,7 @@ export async function handKey(request: CapsuleRequest, capsuleId: string, giver:
   await keys(giver.cookie, { type: "wrap", seat: waiting.id, attempt: att, wrapped: wrap.wrapped });
 }
 // `request` for a sealed trip, as a member's browser holding the trip key talks to the host: what it writes is sealed
-// (src/trip-keys.ts sealOperation, sealSpec, sealPoint, sealName) and what it reads is opened (openTrip, openPoint, openName),
+// (src/trip-keys.ts sealOperation, sealSpec, sealPoint, sealName) and what it reads is opened (openCapsule, openPoint, openName),
 // so a test reads and writes the trip's words as it would a plain trip's. Words the browser itself refuses do not seal: the
 // call throws, as the screen shows the message before sending (the host's own checks of plain words are a plain trip's). A test counts revisions from the trip as
 // published: the `revisions` the seal took are added to what it sends (If-Match) and taken off what it reads.
@@ -125,7 +142,7 @@ export function sealedRequests(request: CapsuleRequest, capsuleId: string, { tri
   const seal = async (path: string, method: string, body: Record<string, any>, cookie?: string): Promise<unknown> => {
     // An operation with no words is sent as it is: there is nothing to seal, and the host's own checks are what a test looks at.
     if (path === "/document" && method === "PATCH" && !WORDS.includes(body.type)) return body;
-    if (path === "/document" && method === "PATCH") return sealOperation(trip, capsuleId, generation, body, body.type === "promote" ? (await openTrip(trip, capsuleId, await read(cookie)))!.document : { suggestions: [] } as never);
+    if (path === "/document" && method === "PATCH") return sealOperation(trip, capsuleId, generation, body, body.type === "promote" ? (await openCapsule(trip, capsuleId, await read(cookie)))!.document : { suggestions: [] } as never);
     if (path === "/spec" && method === "PATCH" && body.spec) return { ...body, spec: await sealSpec(trip, capsuleId, generation, body.spec) };
     if (path === "/footprints" && method === "PATCH" && body.type === "add") {
       // The point carries its member's name as the browser read it; a trip gone (410) has none to read, and the host answers for it.
@@ -143,7 +160,7 @@ export function sealedRequests(request: CapsuleRequest, capsuleId: string, { tri
     if (Array.isArray(json)) return json;
     const out = { ...json };
     if (typeof json.revision === "number") out.revision = json.revision - revisions;
-    if (json.spec && json.document && typeof json.spec.title === "string" && json.spec.title.startsWith("v1.")) { const opened = (await openTrip(trip, capsuleId, json))!; out.spec = opened.spec; out.document = opened.document; }
+    if (json.spec && json.document && typeof json.spec.title === "string" && json.spec.title.startsWith("v1.")) { const opened = (await openCapsule(trip, capsuleId, json))!; out.spec = opened.spec; out.document = opened.document; }
     if (typeof out.document?.revision === "number") out.document = { ...out.document, revision: out.document.revision - revisions };
     if (json.self) out.self = await named("member", json.self);
     if (typeof json.label === "string" && json.self) out.label = out.self.label;

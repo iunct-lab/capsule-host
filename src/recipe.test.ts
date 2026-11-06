@@ -3,6 +3,8 @@ import { readFile } from "node:fs/promises";
 import { specSchema } from "./schema";
 import { extract } from "./paste";
 import { check } from "./validate";
+import { boardSpecSchema, checkBoard } from "./board-schema";
+import { boardRecipe } from "./recipe";
 
 // docs/recipes/trip.md is what a generating agent is given. It must not drift from the schema it describes.
 const recipe = await readFile(`${import.meta.dir}/../docs/recipes/trip.md`, "utf8");
@@ -65,4 +67,33 @@ test("the recipe tells how to give a place its latitude and longitude, and its e
   expect(recipe).toContain("推測で付けない");
   const items = JSON.parse(section("例").match(/```json\n([\s\S]*?)\n```/)![1]!).document.items as Array<{ place?: { lat?: number; lng?: number } }>;
   expect(items.filter(i => i.place?.lat !== undefined && i.place.lng !== undefined).length).toBeGreaterThanOrEqual(3);
+});
+
+// docs/recipes/board.md and the two boards made from a Spec alone (docs/examples/): no code, no deployment, only these files.
+const boardSection = (title: string) => boardRecipe.split(/^## /m).find(s => s.startsWith(title)) ?? "";
+const boards = await Promise.all(["board-attendance", "board-packing"].map(async name => [name, await readFile(`${import.meta.dir}/../docs/examples/${name}.json`, "utf8")] as const));
+const before = (json: string) => +new Date(JSON.parse(json).spec.lifecycle.purgeAt) - 60 * 86400000;
+
+test("the board recipe's example and the two example boards pass the check that publishing makes", () => {
+  const example = boardSection("例").match(/```json\n([\s\S]*?)\n```/)?.[1];
+  expect(example).toBeDefined();
+  for (const [name, json] of [["recipe", example!] as const, ...boards]) {
+    const result = check(json, before(json));
+    expect([name, result.ok, result.ok && result.items]).toEqual([name, true, undefined]);
+    expect(checkBoard(json, before(json)).ok).toBe(true);
+    // Each fills its pages with what the board holds, and names only the pages a board has.
+    const { spec } = JSON.parse(json);
+    expect(spec.kind).toBe("board");
+    expect(spec.navigation.every((id: string) => spec.modules.some((m: { id: string }) => m.id === id))).toBe(true);
+  }
+  // The deadline is checked as publishing checks it: within 180 days of the making.
+  expect(check(boards[0]![1], +new Date(JSON.parse(boards[0]![1]).spec.lifecycle.purgeAt) - 181 * 86400000).ok).toBe(false);
+});
+
+test("the board recipe names every page kind, theme preset and export a board accepts, and what it has not", () => {
+  const shape = boardSpecSchema.shape;
+  const words = [...shape.modules.element.options.map(o => o.shape.kind.value), ...shape.theme.shape.preset.options, ...shape.exports.element.options];
+  expect(words.filter(w => !boardSection("構造").includes(`\`${w}\``))).toEqual([]);
+  for (const missing of ["`spec.trip`", "`document.items`", "`promoted`"]) expect(boardSection("構造")).toContain(missing);
+  for (const word of ["パスポート", "クレジットカード", "予約", "QR", "住所", "パスワード"]) expect(boardSection("入れてはいけない情報")).toContain(word);
 });

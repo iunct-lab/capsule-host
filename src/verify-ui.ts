@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { testTrip, tripDay } from "./test-fixture";
+import { testBoard, testTrip, tripDay } from "./test-fixture";
 import { localDay } from "./schema";
 import { revisable, reviseText } from "./revise";
 import { exportFiles, tripHtml, tripMarkdown } from "./export";
@@ -28,13 +28,14 @@ import { photosPageShown } from "./moments";
 // Then, on trips of their own, the first seal (#694) and the trip key replaced by the owner's page after a member
 // left (#695): revoked, reached only through the revoked one, or past an invite's end; and the new owner after the owner invite was
 // handed over asked whether to replace it, the hand-over stopped while no other seat holds the key, and a seat made again kept.
+// A board (#214): a capsule without dates or places, drawn at a phone's width without a trip's hero, a participant's post, the key replaced.
 // Apart from any trip's own screens, the creator's (#995): enrolled from a link the loopback host hands out, another device, the
 // right to create handed to an owner by a delegation link (redeemed in the owner's trip tab) and revoked.
 // A disposable fictional capsule, purged at the end; no link or cookie is printed. No dependency: Bun has WebSocket and fetch, and Chrome is found on this machine (or named in CHROME_PATH).
 // The scenes come in groups, each on a disposable trip of its own that it opens with what it needs (`openTrip()` and, in the
 // group, the invites, passkeys, handoffs and the seal) and removes when it ends or fails (`closeTrip()`): `bun run verify:ui
 // <group>` runs one, and with no name every group runs in this order. A group prints its seconds when it passes.
-const groups: Record<string, () => Promise<void>> = { plan, members, seat, linked, passkey, sealed, creator };
+const groups: Record<string, () => Promise<void>> = { plan, members, seat, linked, passkey, sealed, creator, board };
 const chosen = process.argv.slice(2);
 if (chosen.some(name => !Object.hasOwn(groups, name))) { console.error(`知らない群です: ${chosen.filter(name => !Object.hasOwn(groups, name)).join(", ")}。使える群: ${Object.keys(groups).join(", ")}`); process.exit(1); }
 const origin = process.env.CAPSULE_ORIGIN ?? "http://localhost:47840";
@@ -133,11 +134,12 @@ const message = `document.querySelector("#message").textContent`;
 const shownTab = `document.querySelector('.navigation [aria-current="page"]').dataset.tab`;
 // A trip's page drawn: the plan; or, in a sealed trip without the key, the ask for it; or, for an owner whose trip is not sealed
 // yet, the banner to seal it (all the host lets that owner do).
-const drawn = `!!document.querySelector(".timeline, .timeline-list, [data-sealed='locked'], [data-seal='owner'] [data-action='seal-trip'], [data-seal='no-passkey']")`;
+const drawn = `!!document.querySelector(".timeline, .timeline-list, .hero.board, [data-sealed='locked'], [data-seal='owner'] [data-action='seal-trip'], [data-seal='no-passkey']")`;
 const timeOf = (id: string) => `document.querySelector('[data-item="${id}"] .event-time, [data-item="${id}"] .row-time').firstChild.textContent`;
 const heading = `document.querySelector(".section-heading").scrollIntoView({ block: "start" })`;
 
 let capsuleId = "", owner: Awaited<ReturnType<typeof page>> | undefined, checkedAt = 0;  // checkedAt: the host's time
+const setOwner = (p: NonNullable<typeof owner>) => { owner = p; };
 // The page talks to the host with its own cookie; the script never sees it. An owner's important action sent this way past the
 // passkey check's five minutes is answered 428: like the screen, it checks the passkey (the authenticator answers) and sends the
 // action once more, so a slow run does not fail a scene that is not about the check (#759). The check's time is kept for (i).
@@ -148,7 +150,7 @@ const sealing = async (action: string, body: object) => ["document", "spec"].inc
     if (!v.sealed) return JSON.stringify(body);
     const kept = await new Promise((ok, no) => { const q = indexedDB.open("capsule", 1); q.onerror = () => no(q.error); q.onsuccess = () => { const r = q.result.transaction("private-keys").objectStore("private-keys").get("seat:" + id); r.onsuccess = () => { q.result.close(); ok(r.result); }; r.onerror = () => no(r.error); }; });
     const s = v.seatKey, g = v.sealed.generation, trip = await k.unwrapTripKey(s.wrapped, s.ephemeral, kept.secret.x25519, id, s.generation);
-    return JSON.stringify("${action}" === "spec" ? { ...body, spec: await k.sealSpec(trip, id, g, body.spec) } : await k.sealOperation(trip, id, g, body, (await k.openTrip(trip, id, v)).document));
+    return JSON.stringify("${action}" === "spec" ? { ...body, spec: await k.sealSpec(trip, id, g, body.spec) } : await k.sealOperation(trip, id, g, body, (await k.openCapsule(trip, id, v)).document));
   })();` : `const sent = ${JSON.stringify(JSON.stringify(body))};`;
 const sendFromPage = async (action: string, body: object, method: string) => owner!.evaluate(`(async () => { const v = await (await vfetch("/v1/c/${capsuleId}")).json(); ${await sealing(action, body)} const revision = v.document.revision; const r = await vfetch("/v1/c/${capsuleId}/${action}", { method: "${method}", headers: { "Content-Type": "application/json", "If-Match": '"' + revision + '"' }, body: sent }); return { status: r.status, body: await r.json() }; })()`) as Promise<{ status: number; body: any }>;
 const checkFromPage = () => owner!.evaluate(`(async () => {
@@ -266,7 +268,7 @@ async function opened(p: NonNullable<typeof owner>, id = capsuleId) {
     const k = globalThis.tripKeys, id = "${id}", v = await (await vfetch("/v1/c/" + id)).json(), s = v.seatKey;
     if (!v.sealed) return v;
     const kept = await new Promise((ok, no) => { const q = indexedDB.open("capsule", 1); q.onerror = () => no(q.error); q.onsuccess = () => { const r = q.result.transaction("private-keys").objectStore("private-keys").get("seat:" + id); r.onsuccess = () => { q.result.close(); ok(r.result); }; r.onerror = () => no(r.error); }; });
-    const trip = await k.unwrapTripKey(s.wrapped, s.ephemeral, kept.secret.x25519, id, s.generation), o = await k.openTrip(trip, id, v);
+    const trip = await k.unwrapTripKey(s.wrapped, s.ephemeral, kept.secret.x25519, id, s.generation), o = await k.openCapsule(trip, id, v);
     if (!o) throw new Error("the trip did not open: " + JSON.stringify(v.spec).slice(0, 300));
     const footprints = await Promise.all(v.footprints.map(async ({ point, by, ...f }) => ({ ...f, ...await k.openPoint(trip, id, f.id, point), by: await k.openName(trip, id, "footprint", f.id, by) })));
     return { ...v, spec: o.spec, document: o.document, footprints };
@@ -295,10 +297,10 @@ async function handOver(giver: NonNullable<typeof owner>, member: NonNullable<ty
 // A group's trip: published from the seed, opened by the owner's page (what the dialog after joining said is returned), and
 // sealed there (sealFromBanner), the owner's passkey (Chrome's virtual authenticator, with PRF) registered as the check before
 // the owner's important actions.
-async function openTrip(seal = true) {
+async function openTrip(seal = true, published: object = seed) {
   // A fresh minute of the host's clock: the counts per minute (logins, an owner's requests) are not the group's before.
   await nextMinute();
-  const created = await fetch(origin + "/v1/publish", { method: "POST", headers: { Origin: origin, "Content-Type": "application/json" }, body: JSON.stringify({ ...seed, confirm: true }) });
+  const created = await fetch(origin + "/v1/publish", { method: "POST", headers: { Origin: origin, "Content-Type": "application/json" }, body: JSON.stringify({ ...published, confirm: true }) });
   assert.equal(created.status, 201); const c = await created.json() as { id: string; url: string }; capsuleId = c.id;
   const p = await page(390, 844, true); owner = p;
   const joined = await p.join(c.url); await p.until(`!!document.querySelector('[data-trip-key="held"]')`);
@@ -2588,4 +2590,68 @@ try {
   console.log(`Pages open at once, at most: ${peak}`);
   try { await send("Browser.close"); } catch { /* already gone */ }
   chrome.kill(); await sleep(300); rmSync(profile, { recursive: true, force: true });
+}
+
+// A board (#214, src/board-kit.ts): published and sealed by its owner's page as a trip is. At a phone's width it shows its title,
+// summary and pages, and none of a trip's: no days or places tab, no dates, destinations, travelers or postcard, no promoting a
+// suggestion to the plan. A participant given the key by the codes posts a suggestion the owner then reads; the owner revokes
+// them and the page replaces the key (#695), after which the board still opens. Removed from the owner's screen.
+async function board() {
+  const published = testBoard(); published.spec.title = title;
+  published.spec.lifecycle.purgeAt = new Date(+new Date(await hostNow()) + 30 * 86400000).toISOString();
+  // Made from the top page as a creator makes one (#215; the loopback host lets the screen publish): 共有ボード chosen, its recipe
+  // copied, the answer pasted and checked, the preview drawn without a trip's hero, published without days to move, this browser
+  // made its owner, and sealed from the banner as every capsule is.
+  await nextMinute();
+  const owner = await page(390, 844, true); setOwner(owner);
+  await send("Browser.grantPermissions", { origin, permissions: ["clipboardReadWrite", "clipboardSanitizedWrite"] });
+  await owner.cdp("Emulation.setFocusEmulationEnabled", { enabled: true });
+  await owner.cdp("WebAuthn.enable"); await owner.cdp("WebAuthn.addVirtualAuthenticator", { options: { protocol: "ctap2", transport: "internal", hasResidentKey: true, hasUserVerification: true, isUserVerified: true, hasPrf: true } });
+  await owner.cdp("Page.navigate", { url: origin + "/" }); await owner.until(`!!document.querySelector("[data-recipe-kind]")`, 20000);
+  await owner.evaluate(`(() => { document.querySelector("[data-recipe-kind]").value = "board"; document.querySelector('[data-action="copy-recipe"]').click(); return true; })()`);
+  await owner.until(`(${message} ?? "").startsWith("作り方をコピーしました")`);
+  assert.equal(await owner.evaluate(`navigator.clipboard.readText().then(t => t.split("\\n")[0])`), "# Recipe: 共有ボード（kind: board）");
+  await owner.evaluate(`(() => { document.querySelector("[data-paste]").value = ${JSON.stringify("はい、どうぞ。\n```json\n" + JSON.stringify({ schemaVersion: 1, ...published }) + "\n```")}; document.querySelector('[data-action="check-paste"]').click(); return true; })()`);
+  await owner.until(`!!document.querySelector(".hero.board") && !!document.querySelector('[data-action="publish"]')`);
+  assert.ok((await owner.evaluate(message) as string).includes("共有ボード"), "the preview's notice counts a board's plans");
+  await owner.evaluate(`document.querySelector('[data-action="publish"]').click()`); await owner.until(`!!document.querySelector('#dialog form[data-form="publish"]')`);
+  assert.equal(await owner.evaluate(`!!document.querySelector('#dialog form[data-form="publish"] input[name="start"]')`), false, "a board's publication asks for a first day");
+  await owner.evaluate(`(() => { const f = document.querySelector('#dialog form[data-form="publish"]'); f.querySelector('input[type="checkbox"]').checked = true; f.requestSubmit(); return true; })()`);
+  await owner.until(`!!document.querySelector('#dialog [data-action="claim-owner"]')`, 20000);
+  await owner.evaluate(answerYes); await owner.evaluate(`document.querySelector('#dialog [data-action="claim-owner"]').click()`);
+  await owner.until(`/^\\/c\\/[a-f0-9]{32}$/.test(location.pathname)`, 20000); capsuleId = (await owner.evaluate(`location.pathname`) as string).slice(3);
+  await owner.evaluate(answerYes); await sealFromBanner(owner); checkedAt = await hostNow();
+  const shape = `({ hero: !!document.querySelector(".hero.board"), trip: ["postcard", "trip-meta", "people", "timeline", "timeline-list"].filter(c => document.querySelector("." + c)),
+    overview: [...document.querySelectorAll(".overview small")].map(x => x.textContent), tabs: [...document.querySelectorAll('.navigation [data-action="tab"]')].map(b => b.textContent),
+    fits: document.documentElement.scrollWidth <= innerWidth, footer: document.querySelector("footer").textContent.startsWith("みんなで使う、小さなボード。") })`;
+  assert.deepEqual(await owner.evaluate(shape), { hero: true, trip: [], overview: ["準備チェック", "まず決めたいこと"], tabs: ["候補", "出欠", "メモ", "ふりかえり", "会費"], fits: true, footer: true });
+  // Every page draws, at the phone's width, with no trip's words in it.
+  for (const tab of ["ideas", "who", "memo", "after", "cost"]) {
+    await tabTo(owner, tab, ".content h2");
+    assert.equal(await owner.evaluate(`document.documentElement.scrollWidth <= innerWidth && !/旅程に追加|旅行後も|自分の日記/.test(document.querySelector(".content").textContent)`), true, `the board's page ${tab}`);
+  }
+  // Saving says what it saves, without a trip's words: 保存 ↓, ページを保存, a file named board-<id>.
+  await owner.evaluate(`document.querySelector('header [data-action="save"]').click()`); await owner.until(`!!document.querySelector('#dialog [data-action="save-page"]')`);
+  assert.deepEqual(await owner.evaluate(`[document.querySelector('header [data-action="save"]').textContent, document.querySelector('#dialog [data-action="save-page"]').textContent, /旅程/.test(document.querySelector("#dialog").textContent)]`), ["保存 ↓", "ページを保存", false]);
+  await owner.evaluate(`document.querySelector('#dialog [data-action="close"]').click()`);
+  // The owner's 共有・管理 has neither チャットで直す nor 設定・期限の変更 (a board has no revise, and no settings in this screen).
+  await manageOpen();
+  assert.deepEqual(await owner.evaluate(`["revise", "undo", "settings"].filter(a => document.querySelector('#dialog [data-action="' + a + '"]'))`), []);
+  await owner.evaluate(`document.querySelector('#dialog [data-action="close"]').click()`);
+  // A participant posts; the owner reads it, with nothing to promote it to.
+  const { page: member } = await joinAs("participant");
+  await tabTo(member, "ideas", 'form[data-form="entry"][data-type="suggest"]');
+  await member.evaluate(`(() => { const f = document.querySelector('form[data-form="entry"][data-type="suggest"]'); f.elements.namedItem("author").value = "ボードの人"; f.elements.namedItem("body").value = "土曜の夜にしたい"; f.requestSubmit(); return true; })()`);
+  await member.until(`[...document.querySelectorAll(".entry-body")].some(p => p.textContent === "土曜の夜にしたい")`);
+  await owner.reload(); await owner.evaluate(answerYes); await tabTo(owner, "ideas", ".entry-body");
+  assert.deepEqual(await owner.evaluate(`[[...document.querySelectorAll(".entry-body")].map(p => p.textContent), !!document.querySelector('[data-action="promote"]')]`), [["土曜の夜にしたい"], false]);
+  // The participant revoked: the owner's page replaces the key, and the board opens with the new one.
+  await owner.evaluate(`document.querySelector("#message").textContent = ""`); await manageOpen();
+  await owner.evaluate(`document.querySelector('#dialog [data-action="revoke-member"]').click()`);
+  await owner.until(`${message} === "旅行の鍵を替えました。"`, 30000);
+  await owner.reload(); await owner.evaluate(answerYes); await tabTo(owner, "ideas", ".entry-body");
+  assert.deepEqual([(await opened(owner)).spec.title, await owner.evaluate(`document.querySelector(".hero h1").textContent`), await owner.evaluate(`[...document.querySelectorAll(".entry-body")].map(p => p.textContent)`)], [title, title, ["土曜の夜にしたい"]]);
+  assert.equal(await owner.evaluate(`(async () => (await (await vfetch("/v1/c/${capsuleId}")).json()).sealed.generation)()`), 2);
+  await member.close();
+  await closeTrip(true);
 }

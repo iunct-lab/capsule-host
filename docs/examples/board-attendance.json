@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "spec": {
+    "schemaVersion": 1,
+    "kind": "board",
+    "title": "春の同窓会 出欠と日程",
+    "summary": "出られるかどうかにチェックを付けて、都合のよい日を候補に書いてください。",
+    "locale": "ja",
+    "timezone": "Asia/Tokyo",
+    "modules": [
+      { "id": "who", "kind": "checklist", "label": "出欠", "mode": "shared" },
+      { "id": "dates", "kind": "suggestion-board", "label": "日程の候補" },
+      { "id": "memo", "kind": "notes", "label": "幹事から" },
+      { "id": "after", "kind": "reflection", "label": "ふりかえり" }
+    ],
+    "navigation": ["who", "dates", "memo", "after"],
+    "theme": { "preset": "postcard", "accent": "#8a3f5c" },
+    "collaboration": { "participantSuggestions": true, "participantComments": true, "participantChecklist": true },
+    "lifecycle": { "purgeAt": "2027-04-15T00:00:00+09:00" },
+    "exports": ["markdown", "json", "html"]
+  },
+  "document": {
+    "revision": 1,
+    "suggestions": [
+      { "id": "d1", "author": "かんじ", "body": "3月の最初の土曜の夜", "createdAt": "2026-11-05T20:00:00+09:00" },
+      { "id": "d2", "author": "かんじ", "body": "3月の2つ目の日曜の昼", "createdAt": "2026-11-05T20:00:00+09:00" }
+    ],
+    "comments": [
+      { "id": "q1", "author": "かんじ", "body": "子ども連れで来る人がいたら教えてください。", "createdAt": "2026-11-05T20:05:00+09:00" }
+    ],
+    "checklist": [
+      { "id": "a", "title": "かんじ", "done": true },
+      { "id": "b", "title": "そら", "done": false },
+      { "id": "c", "title": "うみ", "done": false },
+      { "id": "d", "title": "やま", "done": false }
+    ],
+    "reflections": [],
+    "notes": "場所は人数が決まってから相談します。表示名はニックネームで。",
+    "budget": []
+  }
+}

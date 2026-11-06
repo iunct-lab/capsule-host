@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "spec": {
+    "schemaVersion": 1,
+    "kind": "board",
+    "title": "キャンプの持ち物リスト",
+    "summary": "持っていくものを分担して、用意できたらチェックを付けてください。",
+    "locale": "ja",
+    "timezone": "Asia/Tokyo",
+    "modules": [
+      { "id": "bring", "kind": "checklist", "label": "持ち物", "mode": "shared" },
+      { "id": "meet", "kind": "notes", "label": "集合の連絡" },
+      { "id": "talk", "kind": "suggestion-board", "label": "相談" },
+      { "id": "cost", "kind": "budget", "label": "費用の目安", "currency": "JPY" }
+    ],
+    "navigation": ["bring", "meet", "talk", "cost"],
+    "theme": { "preset": "minimal", "accent": "#2f6f4f" },
+    "collaboration": { "participantSuggestions": true, "participantComments": true, "participantChecklist": true },
+    "lifecycle": { "purgeAt": "2027-02-01T00:00:00+09:00" },
+    "exports": ["markdown", "json", "html"]
+  },
+  "document": {
+    "revision": 1,
+    "suggestions": [],
+    "comments": [
+      { "id": "q1", "author": "そら", "body": "ランタンは2つあれば足りそう？", "createdAt": "2026-11-05T19:00:00+09:00" }
+    ],
+    "checklist": [
+      { "id": "tent", "title": "テント（そら）", "done": false },
+      { "id": "stove", "title": "バーナーとガス（うみ）", "done": false },
+      { "id": "lantern", "title": "ランタン（やま）", "done": false },
+      { "id": "water", "title": "水 10 L（全員で分担）", "done": false },
+      { "id": "trash", "title": "ごみ袋", "done": false }
+    ],
+    "reflections": [],
+    "notes": "集合は朝 8 時。車の乗り合わせは前日までに決めます。",
+    "budget": [
+      { "id": "site", "title": "サイト代（一人あたり）", "amount": 1500, "description": "一泊分の目安。" },
+      { "id": "food", "title": "食材（一人あたり）", "amount": 2500, "description": "二食分の目安。" }
+    ]
+  }
+}

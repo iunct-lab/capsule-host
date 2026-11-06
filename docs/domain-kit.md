@@ -45,6 +45,8 @@ Host が Kit の外で読むのは、Spec の `kind`・`title`・`lifecycle.purg
 5. Host を通した流れを 1 つ通す: `src/cloud-host.test.ts` の `describe("a second domain kit")` と同じく、発行 → owner の引換 → 操作 → viewer の 403 → 持たない機能の 404 → 出力 → 期限の後の 410。テスト用の Kit（`test-note`）はこのテストファイルの中にあり、Kit の最小の例として読める
 6. 画面（`src/client.ts`）は `spec.kind` で出し分ける。作り方（Recipe）は `docs/recipes/<kind>.md` に置く
 
+足した例: 共有ボード（`kind: "board"`。`src/board-schema.ts`・`src/board-kit.ts`・`docs/recipes/board.md`）。旅程のモジュールと操作（`applyShared`）・出力（`pageMarkdown` / `pageHtml`）・暗号化（`src/trip-keys.ts` の同じ関数が kind で旅程の部分を飛ばす）を写さずに使い、Host を通した流れは `src/cloud-host.test.ts` の `describe("a board capsule")`。
+
 ## 形を変えるとき
 
 動いているカプセルがあるので、`schemaVersion` の破壊変更をしない。形を変えるときは、新しい形を古い形と併存させ（両方を `validate` が読む）、画面を切り替え、古い形を使うカプセルが無くなってから古い形を外す。Host の API は直前の画面と互換にする（Host と画面の配置は同時ではない）。

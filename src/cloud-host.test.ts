@@ -12,12 +12,12 @@ import { exportFiles, zip } from "./export";
 import { LocalD1 } from "./local-d1";
 import { LocalMediaStore, type MediaStore } from "./media-store";
 import { validate, stateOf } from "./schema";
-import { devices, fakeAuthenticator, handKey as fixtureHandKey, sealedRequests, sealedTrip, stepUp, testTrip, type CapsuleRequest, type Send } from "./test-fixture";
-import { recipe } from "./recipe";
+import { devices, fakeAuthenticator, handKey as fixtureHandKey, sealedRequests, sealedTrip, stepUp, testBoard, testTrip, type CapsuleRequest, type Send } from "./test-fixture";
+import { recipe, boardRecipe } from "./recipe";
 import { revisable, reviseTrip, undoTrip } from "./revise";
 import { emptyTrip } from "./template";
 import { b64 } from "./private-entries";
-import { newLinkSecret, openLinkKey, sealLinkKey, confirmationCodes, matchesCommitment, openName, openPoint, sealName, sealPoint, sealTrip, sealMove, sealSpec, openField, openTrip, sealOperation, newAttempt, newHandoffKeys, newSeatKeys, newTripKey, seatPublic, signEdge, unwrapSeatSecret, unwrapTripKey, verifyEdge, wrapSeatSecret, wrapTripKey, acceptRekey, reachableSeats, resealAll, sealField, signRekey, signSuccession, type SeatKeys } from "./trip-keys";
+import { newLinkSecret, openLinkKey, sealLinkKey, confirmationCodes, matchesCommitment, openName, openPoint, sealName, sealPoint, sealTrip, sealMove, sealSpec, openField, openTrip, sealOperation, newAttempt, newHandoffKeys, newSeatKeys, newTripKey, seatPublic, signEdge, unwrapSeatSecret, unwrapTripKey, verifyEdge, wrapSeatSecret, wrapTripKey, acceptRekey, reachableSeats, resealAll, sealField, signRekey, signSuccession, openCapsule, type SeatKeys } from "./trip-keys";
 
 // Exercises actual SQLite statements through D1's asynchronous shape, without claiming remote D1 QA.
 
@@ -211,7 +211,7 @@ async function sealAt(req: Req, id: string, owner: string): Promise<Req> {
   const sealed = sealedRequests(under, id, await sealedTrip(under, id, owner));
   return (path, method = "GET", body?, cookie?, revision = 1) => path === base || path.startsWith(base + "/") ? sealed(path.slice(base.length), method, body, cookie, revision) : req(path, method, body, cookie, revision);
 }
-async function setup(path?: string, env: { MEDIA?: MediaStore; CAPSULE_PHOTOS?: string } = {}, seed = testTrip()) {
+async function setup<T extends { spec: { lifecycle: { purgeAt: string } } } = ReturnType<typeof testTrip>>(path?: string, env: { MEDIA?: MediaStore; CAPSULE_PHOTOS?: string } = {}, seed: T = testTrip() as unknown as T) {
   const db = new LocalD1(path); dbs.push(db);
   const host = new CloudHost({ DB: db, CAPSULE_HMAC_KEY: key, CAPSULE_ORIGIN: origin, ...env }, () => now, async () => "test");
   const publish = async () => { const r = await host.fetch(new Request(origin + "/v1/publish", { method: "POST", headers: { Origin: origin, "Content-Type": "application/json" }, body: JSON.stringify({ ...seed, confirm: true }) })); expect(r.status).toBe(201); return await r.json() as { id: string; url: string; grantId: string }; };
@@ -2373,6 +2373,22 @@ describe("pasting an answer from a chat assistant", () => {
     expect(recipe.text).toContain("bun run validate");
   });
 
+  test("a board's instructions are asked for by its kind; a kind not registered is 404, and none is the trip's", async () => {
+    const t = await setup(), get = (q: string) => t.host.fetch(new Request(origin + "/v1/recipe" + q, { headers: { Origin: origin } }));
+    expect(await (await get("?kind=board")).json()).toEqual({ kind: "board", text: boardRecipe });
+    expect(await (await get("?kind=trip")).json()).toEqual({ kind: "trip", text: recipe.text });
+    for (const q of ["?kind=x", "?kind=constructor", "?kind="]) expect((await get(q)).status).toBe(404);
+  });
+
+  test("a pasted board is checked as a board, by the kind it names: summarised without a count of plans, or what is wrong", async () => {
+    const t = await setup(), board = { schemaVersion: 1, ...testBoard() };
+    expect(await (await post(t, "/v1/check", { text: paste(board) })).json()).toEqual({ ok: true, title: "テストの出欠", purgeAt: board.spec.lifecycle.purgeAt, sha256: expect.any(String), trip: { spec: board.spec, document: board.document } });
+    const broken = structuredClone(board) as any; broken.document.items = []; broken.spec.theme.accent = "red";
+    const body = await (await post(t, "/v1/check", { text: paste(broken) })).json() as { ok: boolean; errors: Array<{ path: string }>; messages: string[] };
+    expect([body.ok, body.errors.map(e => e.path)]).toEqual([false, ["spec.theme.accent", "document"]]);
+    expect(body.messages.length).toBe(2);
+  });
+
   test("a pasted answer is checked and summarised, without a cookie", async () => {
     const t = await setup(), trip = { schemaVersion: 1, ...testTrip() };
     const response = await post(t, "/v1/check", { text: paste(trip) });
@@ -4218,4 +4234,90 @@ describe("plain trips are refused", () => {
 test("the host itself knows no domain: it imports none of the trip's modules", () => {
   const source = readFileSync(join(import.meta.dir, "cloud-host.ts"), "utf8");
   for (const module of ["./schema", "./export", "./revise", "./recipe", "./paste", "./validate", "./timing", "./trip-kit"]) expect(source).not.toContain(`from "${module}"`);
+});
+
+// A board (src/board-kit.ts): a capsule without dates or places, kept by the same host code as a trip, sealed by its owner's browser.
+describe("a board capsule", () => {
+  const words = ["テストの出欠", "来られるかどうか", "候補", "出欠", "メモ", "ふりかえり", "会費", "Aさん", "土曜の夜", "日曜", "集合は駅", "楽しかった"];
+  const payload = (t: { db: LocalD1 }) => JSON.stringify(t.db.db.query("SELECT payload FROM trip_capsules").all());
+  async function board() {
+    const t = await setup(undefined, {}, testBoard()), owner = await stepUp(t.request, await t.login(t.created.url)), sealed = await t.sealByOwner(owner);
+    // As the host answers, unopened: a request a browser holding the key never sends, and what the host keeps.
+    const raw = capsuleAt(t.host, t.created.id);
+    const invite = async (role: string) => t.login((await (await t.request("/grants", "POST", { role, label: role, expiresAt: t.seed.spec.lifecycle.purgeAt, confirm: true }, owner)).json()).url);
+    return { ...t, owner, sealed, raw, invite };
+  }
+  test("is published, sealed by its owner's browser and written by role as a trip, the host keeping no plain word", async () => {
+    const t = await board(), participant = await t.invite("participant"), viewer = await t.invite("viewer");
+    const view = await (await t.request("", "GET", undefined, t.owner)).json();
+    expect([view.sealed, view.state, view.spec]).toEqual([{ generation: 1 }, "active", t.seed.spec]);
+    const write = (op: object, cookie: string, revision: number) => t.request("/document", "PATCH", op, cookie, revision).then(r => r.status);
+    expect(await write({ type: "suggest", author: "B", body: "土曜の夜" }, participant, 1)).toBe(200);
+    expect(await write({ type: "check", id: "a", done: true }, participant, 2)).toBe(200);
+    expect(await write({ type: "reflect", author: "B", body: "楽しかった" }, participant, 3)).toBe(200);
+    expect(await write({ type: "notes", body: "集合は駅" }, participant, 4)).toBe(403);
+    expect(await write({ type: "notes", body: "集合は駅" }, t.owner, 4)).toBe(200);
+    expect(await write({ type: "suggest", author: "V", body: "日曜" }, viewer, 5)).toBe(403);
+    const after = await (await t.request("", "GET", undefined, participant)).json();
+    expect(after.document).toMatchObject({ revision: 5, checklist: [{ id: "a", done: true }], notes: "集合は駅", suggestions: [{ author: "B", body: "土曜の夜" }], reflections: [{ body: "楽しかった" }] });
+    expect(after.document.suggestions[0]).not.toHaveProperty("promoted");
+    const kept = payload(t);
+    for (const w of words) expect(kept).not.toContain(w);
+    // No items: adding, moving or promoting one is not a board's request, even sealed as a trip's; there is no revise or step back.
+    const sid = after.document.suggestions[0].id, cipher = (await (await t.raw("", "GET", undefined, t.owner)).json()).document.notes;
+    for (const op of [{ type: "promote", id: sid, day: "2026-09-24", item: { id: "i".repeat(32), sealed: cipher } }, { type: "move", id: "x", before: null }, { type: "item", item: { id: "x", day: "2026-09-24", revision: 1, sealed: cipher } }])
+      expect((await t.raw("/document", "PATCH", op, t.owner, 6)).status).toBe(400);
+    expect((await t.raw("/undo", "GET", undefined, t.owner)).status).toBe(404);
+    expect((await t.raw("/revise", "GET", undefined, t.owner)).status).toBe(404);
+    expect((await t.raw("/revise", "POST", { spec: {}, document: {}, confirm: true }, t.owner, 6)).status).toBe(404);
+    expect((await t.raw("/seal", "GET", undefined, t.owner)).status).toBe(409);
+  });
+  test("the owner replaces its key: the board opens with the new key only; ended, it is read-only; at its deadline it is gone (410)", async () => {
+    const t = await board(), participant = await t.invite("participant"), id = t.created.id;
+    expect((await t.request("/document", "PATCH", { type: "suggest", author: "B", body: "土曜の夜" }, participant)).status).toBe(200);
+    const v = await (await t.raw("", "GET", undefined, t.owner)).json(), grants = await (await t.raw("/grants", "GET", undefined, t.owner)).json() as any[], key = await newTripKey();
+    const body = await resealAll(t.sealed.trip, key, id, 2, { spec: v.spec, document: v.document, footprints: [], media: v.media, members: grants.flatMap(g => g.members).map((m: any) => ({ id: m.id, label: m.label })), grants: grants.map(g => ({ id: g.id, label: g.label })) });
+    const w = await wrapTripKey(key, t.sealed.owner.pub.x25519, id, 2);
+    const seats = [{ seat: v.self.id, ...w, signature: await signRekey(t.sealed.owner.seat.ed25519.privateKey, { capsuleId: id, generation: 2, seat: v.self.id, x25519: t.sealed.owner.pub.x25519, ...w }) }];
+    // A post's seat or time changed in the new form is refused, as in a trip.
+    const moved = structuredClone(body); moved.document.suggestions[0]!.seat = "someone";
+    expect((await t.raw("/rekey", "POST", { generation: 2, ...moved, seats, confirm: true }, t.owner, v.document.revision)).status).toBe(400);
+    expect((await t.raw("/rekey", "POST", { generation: 2, ...body, seats, confirm: true }, t.owner, v.document.revision)).status).toBe(200);
+    const v2 = await (await t.raw("", "GET", undefined, t.owner)).json();
+    expect(v2.sealed).toEqual({ generation: 2 });
+    expect(await openCapsule(key, id, v2)).toMatchObject({ spec: t.seed.spec, document: { suggestions: [{ body: "土曜の夜" }] }, unreadable: [] });
+    expect(await openCapsule(t.sealed.trip, id, v2)).toBeNull();
+    for (const w of words) expect(payload(t)).not.toContain(w);
+    // Writing goes on under the new generation; the old one is refused.
+    const next = sealedRequests(t.raw, id, { trip: key, revisions: 1 }, 2), old = sealedRequests(t.raw, id, t.sealed);
+    expect((await old("/document", "PATCH", { type: "suggest", author: "B", body: "日曜" }, participant, v2.document.revision - 1)).status).toBe(409);
+    expect((await next("/document", "PATCH", { type: "suggest", author: "B", body: "日曜" }, participant, v2.document.revision - 1)).status).toBe(200);
+    // The owner ends the sharing: the other seats go and the board is read-only, then gone at its deadline.
+    const r = (await (await t.raw("", "GET", undefined, t.owner)).json()).document.revision;
+    expect((await t.raw("/freeze", "POST", { confirm: true }, t.owner, r)).status).toBe(200);
+    expect((await t.raw("", "GET", undefined, participant)).status).toBe(401);
+    expect((await (await t.raw("", "GET", undefined, t.owner)).json()).state).toBe("frozen");
+    expect((await next("/document", "PATCH", { type: "notes", body: "集合は駅" }, t.owner, r - 1)).status).toBe(403);
+    now = +new Date(t.seed.spec.lifecycle.purgeAt);
+    expect((await t.raw("", "GET", undefined, t.owner)).status).toBe(410);
+  });
+  test("an invite seats as many as it says; the owner deletes it, after a passkey check, as a trip; a revoked member is shut out", async () => {
+    const t = await board(), participant = await t.invite("participant");
+    // One seat: the first browser takes it, the next is refused.
+    const one = await (await t.request("/grants", "POST", { role: "participant", label: "ひとり", seats: 1, expiresAt: t.seed.spec.lifecycle.purgeAt, confirm: true }, t.owner)).json();
+    const secret = new URLSearchParams(new URL(one.url).hash.slice(1)).get("k");
+    expect((await t.raw("/sessions", "POST", { secret })).status).toBe(200);
+    expect((await t.raw("/sessions", "POST", { secret })).status).not.toBe(200);
+    const member = (await (await t.raw("/grants", "GET", undefined, t.owner)).json() as any[]).flatMap(g => g.members).find((m: any) => !m.self);
+    expect((await t.request("/revoke", "POST", { member: member.id, confirm: true }, t.owner)).status).toBe(200);
+    expect((await t.raw("", "GET", undefined, participant)).status).toBe(401);
+    // The deletion is an important action: past the passkey check's five minutes it is refused until the owner checks again.
+    now += 6 * 60000;
+    expect((await t.raw("/purge", "POST", { title: "画面が確かめた題" }, t.owner)).status).toBe(428);
+    expect((await t.raw("", "GET", undefined, t.owner)).status).toBe(200);
+    await stepUp(t.request, t.owner);
+    expect((await t.raw("/purge", "POST", { title: "画面が確かめた題" }, t.owner)).status).toBe(200);
+    expect((await t.raw("", "GET", undefined, t.owner)).status).not.toBe(200);
+    expect((t.db.db.query("SELECT payload FROM trip_capsules").get() as any).payload).toBeNull();
+  });
 });

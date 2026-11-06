@@ -107,7 +107,7 @@ export function diff(before: Trip, after: Trip): Diff {
 
 // The rules every change of a trip's settings obeys: a page already there stays (its posts must stay readable), and the
 // deadline stays in the future. Only the pages' id and kind and the deadline are read, so a sealed Spec is checked the same.
-export function refusal(current: Pick<Spec, "modules">, updated: Pick<Spec, "modules" | "lifecycle">, now: number) {
+export function refusal(current: Pick<Spec, "modules">, updated: Pick<Spec, "modules"> & { lifecycle: { purgeAt: string } }, now: number) {
   if (current.modules.some(m => !updated.modules.some(n => n.id === m.id && n.kind === m.kind))) return "今あるページは消せません";
   if (+new Date(updated.lifecycle.purgeAt) <= now) return "削除期限は今より後にしてください";
 }

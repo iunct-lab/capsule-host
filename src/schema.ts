@@ -6,16 +6,16 @@ import type { State } from "./kit";
 export { instant, cipher, CIPHER, author, pointSchema, localDay, seen, sameTitle, type PlainPoint } from "./fields";
 
 
-const short = z.string().trim().min(1).max(160);
-const identifier = short.regex(/^[a-zA-Z0-9_-]+$/);
-const text = z.string().trim().max(4000);
+export const short = z.string().trim().min(1).max(160);
+export const identifier = short.regex(/^[a-zA-Z0-9_-]+$/);
+export const text = z.string().trim().max(4000);
 const day = z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine(v => {
   const n = new Date(v); return !isNaN(+n) && n.toISOString().slice(0, 10) === v;
 }, "実在する日付を指定してください");
-const zone = z.string().max(80).refine(v => { try { new Intl.DateTimeFormat("en", { timeZone: v }); return true; } catch { return false; } });
+export const zone = z.string().max(80).refine(v => { try { new Intl.DateTimeFormat("en", { timeZone: v }); return true; } catch { return false; } });
 const url = z.string().url().max(2000).refine(v => { try { const u = new URL(v); return u.protocol === "https:" && !u.username && !u.password; } catch { return false; } }, "公開HTTPS URLのみ使用できます");
 // The page kinds, with the label's type as the argument: plain words, or ciphertext in a sealed trip (spec「5.2 暗号化するもの・平文に残すもの」).
-const modulesOf = <L extends z.ZodTypeAny>(label: L) => z.discriminatedUnion("kind", [
+export const modulesOf = <L extends z.ZodTypeAny>(label: L) => z.discriminatedUnion("kind", [
   z.object({ id: identifier, kind: z.literal("day-timeline"), label }).strict(),
   z.object({ id: identifier, kind: z.literal("places"), label, groupBy: z.enum(["area", "category"]).optional() }).strict(),
   z.object({ id: identifier, kind: z.literal("suggestion-board"), label }).strict(),
@@ -27,11 +27,14 @@ const modulesOf = <L extends z.ZodTypeAny>(label: L) => z.discriminatedUnion("ki
   z.object({ id: identifier, kind: z.literal("story"), label }).strict(),
   z.object({ id: identifier, kind: z.literal("moments"), label }).strict(),
 ]);
-// The rules on a Spec's plain parts, the same for a plain and a sealed trip.
+// The rules on a Spec's plain parts, the same for a plain and a sealed trip. The pages' part is every kind's (src/board-schema.ts).
 type SpecPlain = { modules: Array<{ id: string }>; navigation: string[]; trip: { startsOn: string; endsOn: string }; lifecycle: { purgeAt: string } };
-function specRules(s: SpecPlain, ctx: z.RefinementCtx) {
+export function pagesRule(s: Pick<SpecPlain, "modules" | "navigation">, ctx: z.RefinementCtx) {
   const ids = s.modules.map(m => m.id);
   if (new Set(ids).size !== ids.length || new Set(s.navigation).size !== s.navigation.length || s.navigation.some(id => !ids.includes(id))) ctx.addIssue({ code: "custom", message: "モジュールID・navigationが不正です" });
+}
+function specRules(s: SpecPlain, ctx: z.RefinementCtx) {
+  pagesRule(s, ctx);
   if (+new Date(s.trip.endsOn) - +new Date(s.trip.startsOn) > 180 * 86400000) ctx.addIssue({ code: "custom", message: "旅行期間は180日以内です" });
   if (s.trip.endsOn < s.trip.startsOn || s.lifecycle.purgeAt.slice(0, 10) <= s.trip.endsOn) ctx.addIssue({ code: "custom", message: "旅行期間と削除期限の順序が不正です" });
 }
@@ -57,7 +60,7 @@ export const itemSchema = z.object({
     .refine(p => (p.lat === undefined) === (p.lng === undefined), "緯度と経度は両方そろえてください").optional(),
   description: text.optional(), tags: z.array(short).max(10).optional(), revision: z.number().int().min(1),
 }).strict().refine(v => !v.startsAt || !v.endsAt || +new Date(v.endsAt) >= +new Date(v.startsAt), "終了時刻が開始時刻より前です");
-const entry = { id: identifier, author: short, body: text.min(1), createdAt: instant };
+export const entry = { id: identifier, author: short, body: text.min(1), createdAt: instant };
 export const documentSchema = z.object({
   revision: z.number().int().min(1), items: z.array(itemSchema).max(300),
   suggestions: z.array(z.object({ ...entry, promoted: z.boolean(), itemId: identifier.optional() }).strict()).max(300),
@@ -71,11 +74,18 @@ export type Document = z.infer<typeof documentSchema>;
 export type Item = z.infer<typeof itemSchema>;
 export type { Role, State } from "./kit";
 // The rules on the parts the host can read: the purge date, each item's day and time within the trip, unique ids, the size.
+// The deletion date and the ids and size are every kind's rules (src/board-schema.ts uses them too).
+export function purgeWithin(purgeAt: string, createdAt: number) {
+  if (+new Date(purgeAt) > createdAt + 180 * 86400000) throw new Error("削除期限は作成から180日以内です");
+}
+export function bounded(lists: Array<Array<{ id: string }>>, capsule: { spec: unknown; document: unknown }) {
+  for (const list of lists) if (new Set(list.map(x => x.id)).size !== list.length) throw new Error("IDが重複しています");
+  if (new TextEncoder().encode(JSON.stringify(capsule)).length > 2 * 1024 * 1024) throw new Error("カプセルは2 MiB以内です");
+}
 function rules<S extends SpecPlain & { timezone: string }, D extends { items: Array<{ id: string; day: string; startsAt?: string; timezone?: string }> } & Record<"suggestions" | "checklist" | "comments" | "reflections" | "budget", Array<{ id: string }>>>(s: S, d: D, createdAt: number) {
-  if (+new Date(s.lifecycle.purgeAt) > createdAt + 180 * 86400000) throw new Error("削除期限は作成から180日以内です");
+  purgeWithin(s.lifecycle.purgeAt, createdAt);
   if (d.items.some(i => i.day < s.trip.startsOn || i.day > s.trip.endsOn || (i.startsAt && localDay(+new Date(i.startsAt), i.timezone ?? s.timezone) !== i.day))) throw new Error("旅程の日付・時刻が旅行期間と一致しません");
-  for (const list of [d.items, d.suggestions, d.checklist, d.comments, d.reflections, d.budget]) if (new Set(list.map(x => x.id)).size !== list.length) throw new Error("IDが重複しています");
-  if (new TextEncoder().encode(JSON.stringify({ spec: s, document: d })).length > 2 * 1024 * 1024) throw new Error("カプセルは2 MiB以内です");
+  bounded([d.items, d.suggestions, d.checklist, d.comments, d.reflections, d.budget], { spec: s, document: d });
   return { spec: s, document: d };
 }
 export function validate(spec: unknown, document: unknown, createdAt: number) {

@@ -1,5 +1,6 @@
 // Runs in the host and the browser (no node: modules, no Buffer): a sealed trip's exports are made in the browser from the opened trip.
 import type { Spec, Document } from "./schema";
+import type { BoardSpec, BoardDocument } from "./board-schema";
 import { md } from "./private-entries";
 
 export const escapeHtml = (s: string) => s.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
@@ -32,13 +33,20 @@ export function zip(files: Record<string, string>): Uint8Array {
   parts.reduce((at, b) => (out.set(b, at), at + b.length), 0);
   return out;
 }
+// What every kind's page shows besides its own sections: the board (src/board-kit.ts) has only these.
+export type Page = { spec: { title: string; summary?: string }; doc: Pick<Document, "revision" | "checklist" | "budget" | "notes" | "reflections"> & { suggestions: Array<{ body: string; author: string }> } };
 // The trip as Markdown: the ZIP's README.md, and the text a member copies without the ZIP.
 export function tripMarkdown(spec: Spec, doc: Document) {
-  const lines = ["---", `title: ${JSON.stringify(spec.title)}`, `startsOn: ${spec.trip.startsOn}`, `endsOn: ${spec.trip.endsOn}`, `revision: ${doc.revision}`, "---", "", `# ${md(spec.title)}`, "", md(spec.summary ?? "")];
+  const lines: string[] = [];
   for (const day of [...new Set(doc.items.map(i => i.day))].sort()) {
     lines.push("", `## ${day}`, "");
     for (const i of doc.items.filter(i => i.day === day)) lines.push(`- **${md(i.title)}** (${i.status})${i.startsAt ? ` ${i.startsAt}${i.endsAt ? ` – ${i.endsAt}` : ""}${i.timeTentative ? " ごろ" : ""}` : ""}`, `  ${md(i.description ?? "")}`, ...(i.place?.publicUrl ? [`  [${md(i.place.label)}](<${i.place.publicUrl.replace(/[<>\s]/g, c => encodeURIComponent(c))}>)`] : []));
   }
+  return pageMarkdown({ spec, doc }, [`startsOn: ${spec.trip.startsOn}`, `endsOn: ${spec.trip.endsOn}`], lines);
+}
+// A page as Markdown, `front` in its front matter and `sections` (a trip's days) before the shared ones.
+export function pageMarkdown({ spec, doc }: Page, front: string[] = [], sections: string[] = []) {
+  const lines = ["---", `title: ${JSON.stringify(spec.title)}`, ...front, `revision: ${doc.revision}`, "---", "", `# ${md(spec.title)}`, "", md(spec.summary ?? ""), ...sections];
   lines.push("", "## 準備", ...doc.checklist.map(c => `- [${c.done ? "x" : " "}] ${md(c.title)}`), "", "## 候補", ...doc.suggestions.map(s => `- ${md(s.body)} (${md(s.author)})`), "", "## 費用メモ", ...doc.budget.map(b => `- ${md(b.title)}: ¥${b.amount} / ${md(b.description)}`), "", "## メモ", md(doc.notes), "", "## 思い出", ...doc.reflections.filter(r => r.included).map(r => `- ${md(r.body)} (${md(r.author)})`));
   return lines.join("\n") + "\n";
 }
@@ -47,7 +55,12 @@ export function tripHtml(spec: Spec, doc: Document) {
   const h = escapeHtml;
   const status = { confirmed: "決定", proposed: "候補・要確認", cancelled: "中止" };
   const sections = [...new Set(doc.items.map(i => i.day))].sort().map(day => `<section><h2>${h(day)}</h2>${doc.items.filter(i => i.day === day).map(i => `<article><small>${status[i.status]}${i.startsAt ? ` · ${[i.startsAt, i.endsAt].filter(t => t !== undefined).map(t => h(new Intl.DateTimeFormat("ja", { timeZone: i.timezone ?? spec.timezone, hour: "2-digit", minute: "2-digit" }).format(new Date(t!)))).join(" – ")}${i.timeTentative ? " ごろ" : ""}` : ""}</small><h3>${h(i.title)}</h3><p>${h(i.description ?? "")}</p>${i.place?.publicUrl ? `<a href="${h(i.place.publicUrl)}" rel="noopener noreferrer">${h(i.place.label)} ↗</a>` : ""}</article>`).join("")}</section>`).join("");
-  return `<!doctype html><html lang="ja"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'"><title>${h(spec.title)}</title><style>body{max-width:760px;margin:40px auto;padding:24px;background:#f7f5ef;color:#26362e;font:16px/1.9 system-ui}p{white-space:pre-wrap;overflow-wrap:anywhere}article{background:#fffefa;border:1px solid #ddd;padding:20px;margin:16px 0;border-radius:8px}h2{margin-top:40px}h3{margin:8px 0}small{color:#6b766a}a{color:#355a47}@media print{article{break-inside:avoid}body{background:white}}</style><h1>${h(spec.title)}</h1><p>${h(spec.trip.startsOn)} — ${h(spec.trip.endsOn)} · revision ${doc.revision}</p><p>${h(spec.summary ?? "")}</p>${sections}<h2>準備</h2><ul>${doc.checklist.map(c => `<li>${c.done ? "☑" : "☐"} ${h(c.title)}</li>`).join("")}</ul><h2>候補</h2>${doc.suggestions.map(s => `<p>${h(s.body)} — ${h(s.author)}</p>`).join("")}<h2>費用メモ</h2>${doc.budget.map(b => `<p>${h(b.title)}: ¥${b.amount.toLocaleString("ja")}<br>${h(b.description)}</p>`).join("")}<h2>メモ</h2><p>${h(doc.notes)}</p><h2>思い出</h2>${doc.reflections.filter(r => r.included).map(r => `<p>${h(r.body)} — ${h(r.author)}</p>`).join("")}</html>`;
+  return pageHtml({ spec, doc }, `${h(spec.trip.startsOn)} — ${h(spec.trip.endsOn)} · `, sections);
+}
+// A page as HTML: `period` before its revision, `sections` (a trip's days) before the shared ones. Both are HTML already escaped.
+export function pageHtml({ spec, doc }: Page, period = "", sections = "") {
+  const h = escapeHtml;
+  return `<!doctype html><html lang="ja"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'"><title>${h(spec.title)}</title><style>body{max-width:760px;margin:40px auto;padding:24px;background:#f7f5ef;color:#26362e;font:16px/1.9 system-ui}p{white-space:pre-wrap;overflow-wrap:anywhere}article{background:#fffefa;border:1px solid #ddd;padding:20px;margin:16px 0;border-radius:8px}h2{margin-top:40px}h3{margin:8px 0}small{color:#6b766a}a{color:#355a47}@media print{article{break-inside:avoid}body{background:white}}</style><h1>${h(spec.title)}</h1><p>${period}revision ${doc.revision}</p><p>${h(spec.summary ?? "")}</p>${sections}<h2>準備</h2><ul>${doc.checklist.map(c => `<li>${c.done ? "☑" : "☐"} ${h(c.title)}</li>`).join("")}</ul><h2>候補</h2>${doc.suggestions.map(s => `<p>${h(s.body)} — ${h(s.author)}</p>`).join("")}<h2>費用メモ</h2>${doc.budget.map(b => `<p>${h(b.title)}: ¥${b.amount.toLocaleString("ja")}<br>${h(b.description)}</p>`).join("")}<h2>メモ</h2><p>${h(doc.notes)}</p><h2>思い出</h2>${doc.reflections.filter(r => r.included).map(r => `<p>${h(r.body)} — ${h(r.author)}</p>`).join("")}</html>`;
 }
 const sha256 = async (s: string) => [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s)))].map(b => b.toString(16).padStart(2, "0")).join("");
 export async function exportFiles(id: string, spec: Spec, doc: Document, updatedAt: string) {
@@ -59,7 +72,19 @@ export async function exportFiles(id: string, spec: Spec, doc: Document, updated
   if (spec.exports.includes("json")) files["trip.json"] = JSON.stringify({ schemaVersion: 1, spec, document: doc }, null, 2) + "\n";
   if (spec.exports.includes("ics")) files["calendar.ics"] = calendar.map(fold).join("\r\n") + "\r\n";
   if (spec.exports.includes("html")) files["index.html"] = tripHtml(spec, doc);
+  return manifested(id, doc.revision, updatedAt, files);
+}
+// The files with their manifest (each one's hash), as every kind's ZIP holds them.
+export async function manifested(id: string, revision: number, updatedAt: string, files: Record<string, string>) {
   const hashes = Object.fromEntries(await Promise.all(Object.entries(files).map(async ([name, content]) => [name, await sha256(content)])));
-  files["manifest.json"] = JSON.stringify({ schemaVersion: 1, capsuleId: id, revision: doc.revision, createdAt: updatedAt, files: hashes }, null, 2);
+  files["manifest.json"] = JSON.stringify({ schemaVersion: 1, capsuleId: id, revision, createdAt: updatedAt, files: hashes }, null, 2);
   return files;
+}
+// A board's ZIP (src/board-kit.ts; a sealed board's, made in the browser): the trip's files without the days and the calendar.
+export async function boardFiles(id: string, spec: BoardSpec, doc: BoardDocument, updatedAt: string) {
+  const files: Record<string, string> = {};
+  if (spec.exports.includes("markdown")) files["README.md"] = pageMarkdown({ spec, doc });
+  if (spec.exports.includes("json")) files["board.json"] = JSON.stringify({ schemaVersion: 1, spec, document: doc }, null, 2) + "\n";
+  if (spec.exports.includes("html")) files["index.html"] = pageHtml({ spec, doc });
+  return manifested(id, doc.revision, updatedAt, files);
 }

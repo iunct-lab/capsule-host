@@ -3,7 +3,7 @@ import { randomBytes, randomInt } from "node:crypto";
 import { invoke } from "./invoke";
 import { challengeOf, fakeAuthenticator, handKey, refusals, sealedRequests, testTrip, type CapsuleRequest } from "../src/test-fixture";
 import { regionsOf } from "../src/mapdata";
-import { openName, openPoint, sealName, sealPoint, openTrip, resealTrip, sealOperation, sealMove, confirmationCodes, matchesCommitment, newAttempt, newHandoffKeys, newSeatKeys, newTripKey, seatPublic, signEdge, unwrapSeatSecret, unwrapTripKey, wrapSeatSecret, wrapTripKey, acceptRekey, openField, sealField, sealPhoto, openPhotoImage, reachableSeats, resealAll, signRekey, type SeatKeys } from "../src/trip-keys";
+import { openName, openPoint, sealName, sealPoint, openTrip, openCapsule, resealTrip, sealOperation, sealMove, confirmationCodes, matchesCommitment, newAttempt, newHandoffKeys, newSeatKeys, newTripKey, seatPublic, signEdge, unwrapSeatSecret, unwrapTripKey, wrapSeatSecret, wrapTripKey, acceptRekey, openField, sealField, sealPhoto, openPhotoImage, reachableSeats, resealAll, signRekey, type SeatKeys } from "../src/trip-keys";
 import { assistSealingKey, newMemoKey, open as openEntryText, openEntry, seal as sealText, sealEntry, unwrapMemoKey, wrapMemoKey, wrappingKey, type SealedEntry } from "../src/private-entries";
 
 // Publishes a disposable fictional capsule through IAM Lambda Invoke, verifies it through CloudFront, then purges it.
@@ -573,6 +573,69 @@ try {
   } else console.log("trip sealed by its owner right after claiming (the table's scan: dev だけで行う)");
   assert.equal((await request(sAt("/purge"), "POST", { title: "" }, sealedOwner)).status, 200);
   assert.equal((await request(sAt(""), "GET", undefined, sealedOwner)).status, 410); sealedId = "";
+  // Boards (#1120, src/board-kit.ts): each example of docs/examples/ is published as it is (its title marked and its deadline
+  // brought within this run), and its owner seals it right after claiming the seat, as a trip's does. The host returns and keeps
+  // none of its words; a participant suggests and checks; a board has no items (promote 400) and no step back (GET undo 404); the
+  // owner replaces the key (the old key opens nothing), ends the sharing (writes 403) and purges it (410). The same steps for each
+  // example: nothing here is an example's own. Each starts in a fresh minute of the login limit. On dev only: the examples are
+  // fictional, published nowhere else.
+  if (stackName === "capsule-host-dev") for (const name of ["board-attendance", "board-packing"]) {
+    await new Promise(r => setTimeout(r, 61000 - Date.now() % 60000));
+    const example = await Bun.file(new URL(`../docs/examples/${name}.json`, import.meta.url)).json(), boardMarker = `board-marker-${randomBytes(8).toString("hex")}`;
+    example.spec.title = `${title} ${boardMarker}`; example.spec.lifecycle.purgeAt = seed.spec.lifecycle.purgeAt;
+    const words = [boardMarker, example.document.notes as string, ...example.document.checklist.map((c: { title: string }) => c.title)];
+    const made = await invoke(functionName, profile, region, { payload: { spec: example.spec, document: example.document, confirm: true } }); assert.equal(made.statusCode, 201, `${name} was not published`); sealedId = made.body.id;
+    sealedOwner = await enter(made.body.url);
+    const device = fakeAuthenticator({ origin }), check = async (register = false) => {
+      const challenge = await challengeOf(request(sAt("/passkey/challenge"), "POST", {}, ""));
+      assert.equal((await request(sAt(register ? "/passkey" : "/passkey/verify"), "POST", register ? { challenge, ...device.register(challenge) } : { challenge, id: device.id, ...device.assert(challenge) }, sealedOwner)).status, 200);
+    };
+    await check(true);
+    const bSeat = await newSeatKeys(), bPub = await seatPublic(bSeat), bTrip = await newTripKey(), bWrap = await wrapTripKey(bTrip, bPub.x25519, sealedId, 1);
+    assert.equal((await request(sAt("/keys"), "PATCH", { type: "seat", ...bPub, ephemeral: bWrap.ephemeral, generation: 1, wrapped: bWrap.wrapped }, sealedOwner)).status, 200);
+    const from = await (await request(sAt(""), "GET", undefined, sealedOwner)).json(), { previous: bPrevious } = await (await request(sAt("/seal"), "GET", undefined, sealedOwner)).json();
+    assert.equal(bPrevious, null);
+    const bMove = await sealMove(bTrip, sealedId, 1, { spec: from.spec, document: from.document, previous: null, footprints: from.footprints, grants: await (await request(sAt("/grants"), "GET", undefined, sealedOwner)).json() });
+    assert.equal((await request(sAt("/seal"), "POST", bMove, sealedOwner, from.document.revision)).status, 200);
+    const bView = await (await request(sAt(""), "GET", undefined, sealedOwner)).json();
+    assert.equal(bView.sealed.generation, 1); assert.ok(words.every(w => !JSON.stringify(bView).includes(w)), "the host returns a plain word of a sealed board");
+    assert.deepEqual(await openCapsule(bTrip, sealedId, bView), { spec: example.spec, document: { ...example.document, revision: example.document.revision + 1 }, unreadable: [] });
+    // A participant's suggestion and check, as the screen sends them.
+    const pGrant = gid(), pMade = await request(sAt("/grants"), "POST", { role: "participant", id: pGrant, label: await sealName(bTrip, sealedId, 1, "grant", pGrant, "AWS確認用"), seats: 1, expiresAt: example.spec.lifecycle.purgeAt, confirm: true }, sealedOwner);
+    assert.equal(pMade.status, 201); const participant = await enter((await pMade.json()).url);
+    const at = () => request(sAt(""), "GET", undefined, sealedOwner).then(r => r.json()).then(v => v.document.revision as number);
+    assert.equal((await request(sAt("/document"), "PATCH", await sealOperation(bTrip, sealedId, 1, { type: "suggest", author: "AWS確認", body: boardMarker }, example.document), participant, await at())).status, 200);
+    assert.equal((await request(sAt("/document"), "PATCH", { type: "check", id: example.document.checklist[0].id, done: true }, participant, await at())).status, 200);
+    // The participant's suggestion, as it stands, is not promoted: a board takes no such request at all (its form, not the suggestion, refuses it).
+    const posted = (await openCapsule(bTrip, sealedId, await (await request(sAt(""), "GET", undefined, sealedOwner)).json()))!.document.suggestions.find(p => p.body === boardMarker)!;
+    const cipherText = (await sealOperation(bTrip, sealedId, 1, { type: "notes", body: "x" }, example.document) as { body: string }).body;
+    const promoted = await request(sAt("/document"), "PATCH", { type: "promote", id: posted.id, day: "2026-01-01", item: { id: gid(), sealed: cipherText } }, sealedOwner, await at());
+    assert.deepEqual([promoted.status, (await promoted.json()).error], [400, "入力内容を確認してください"]);
+    for (const action of ["/undo", "/revise"]) assert.equal((await request(sAt(action), "GET", undefined, sealedOwner)).status, 404, `GET ${action}`);
+    if (stackName === "capsule-host-dev") {
+      const mine = (await storedPayloads()).filter(p => p.includes(`"id":"${sealedId}"`));
+      assert.equal(mine.length, 1, "the scan did not find the sealed board's payload: the decoding is wrong");
+      assert.ok(words.every(w => !mine[0]!.includes(w)), "a sealed board's words are readable in DynamoDB");
+    }
+    // The owner replaces the key: sealed again under generation 2 and wrapped to the owner's seat, which alone holds one.
+    await check();
+    const toReplace = await (await request(sAt(""), "GET", undefined, sealedOwner)).json(), bGrants = await (await request(sAt("/grants"), "GET", undefined, sealedOwner)).json() as Array<{ id: string; label: string; members: Array<{ id: string; label: string }> }>;
+    const bNext = await newTripKey(), bResealed = await resealAll(bTrip, bNext, sealedId, 2, { spec: toReplace.spec, document: toReplace.document, footprints: [], media: toReplace.media, members: bGrants.flatMap(g => g.members).map(m => ({ id: m.id, label: m.label })), grants: bGrants.map(g => ({ id: g.id, label: g.label })) });
+    const ownerId = toReplace.self.id as string, bw = await wrapTripKey(bNext, bPub.x25519, sealedId, 2);
+    const bSeats = [{ seat: ownerId, ...bw, signature: await signRekey(bSeat.ed25519.privateKey, { capsuleId: sealedId, generation: 2, seat: ownerId, x25519: bPub.x25519, ...bw }) }];
+    assert.equal((await request(sAt("/rekey"), "POST", { generation: 2, ...bResealed, seats: bSeats, confirm: true }, sealedOwner, toReplace.document.revision)).status, 200);
+    const rekeyedBoard = await (await request(sAt(""), "GET", undefined, sealedOwner)).json();
+    assert.equal(rekeyedBoard.sealed.generation, 2);
+    assert.equal((await openCapsule(bNext, sealedId, rekeyedBoard))?.document.suggestions.at(-1)?.body, boardMarker, "the board does not open under the new key");
+    assert.equal(await openCapsule(bTrip, sealedId, rekeyedBoard), null, "the old key opens the board of the next generation");
+    // Ended: the participant's seat goes and the board is read-only; then purged.
+    assert.equal((await request(sAt("/freeze"), "POST", { confirm: true }, sealedOwner, rekeyedBoard.document.revision)).status, 200);
+    assert.equal((await request(sAt(""), "GET", undefined, participant)).status, 401);
+    assert.equal((await request(sAt("/document"), "PATCH", { type: "check", id: example.document.checklist[0].id, done: false }, sealedOwner, await at())).status, 403);
+    assert.equal((await request(sAt("/purge"), "POST", { title: "" }, sealedOwner)).status, 200);
+    assert.equal((await request(sAt(""), "GET", undefined, sealedOwner)).status, 410); sealedId = "";
+  }
+  console.log(stackName !== "capsule-host-dev" ? "boards: dev だけで行う" : `boards: the two examples of docs/examples/ published as they are and sealed by their owners (no plain word returned or in the table), a participant's suggestion and check, promote 400 and GET undo / revise 404, the key replaced (the old key opens nothing), sharing ended (403) and purged (410)`);
   // Revising with a chat and going back are the browser's (src/client.ts): the host neither copies the trip's words nor reads an
   // answer (404). The participant's 候補 is the one the owner changes below.
   assert.equal((await request(api("/document"), "PATCH", { type: "suggest", author: "AWS確認", body: "星を見に行きたい" }, participant, 2)).status, 200);
@@ -792,7 +855,7 @@ try {
   })();
   assert.ok(edge !== true, "the access log holds a CloudFront edge's address, not the viewer's");
   console.log(`access log address: ${edge === undefined ? "unknown" : "not an edge (viewer)"}`);
-  console.log("AWS verification passed, on trips sealed by their owners right after claiming the seat: the first seal (409 画面を更新してください without ui=2 and 409 オーナーがこの旅行を暗号化するまで開けません for an invite, an edit and a footprint before the seal, opened back the same, listed as sealed), the trip key replaced after a member's revocation (every ciphertext of the next generation in the stored payload, the remaining member reading it, the revoked member's old key not opening it), the new owner asked after recover and keeping the key, a trip sealed under the owner's trip key (opened back the same, a participant's sealed post taken and item refused, theme.css and the operator's list as before, export 404, purged without a title), function URL direct 403 (always), generation and key registration closed without a creator, no CORS, OPTIONS refused, a cookie moved to another capsule refused, viewer/editor owner-only actions refused; CloudFront's access log and the Host's refused lines (401 / 403 / 429 with IP, path and status; no cookie, invite secret, #k= or title), owner approval, assets (app.js carrying its packages' notices), IAM-only publish, idempotent publish (a fresh owner link while the seat is free), edge-only API, seat binding, per-member revoke (its 401 saying the seat is gone, a signed-out copy's not), permissions, the owner's history of invites (not the editor's), an editor's own viewer invites (another role refused, issued, listed, named in the owner's list, revoked by it and not by a viewer), Origin, revision conflicts, no export, export.md or export.html on the host (404: the browser makes them), owner recovery, passkey endpoints, paste endpoints closed without a creator, creator endpoints (a delegation link closed without a creator, taken under the trip by its owner seat alone), the build read by the publisher only, operator list and terminate (IAM only, no title, 410 after), no revise text or check on the host (404: the browser revises a sealed trip), reordering a day (the host's time a placeholder, the end carried along; an item without a time given one), an item's end (saved, refused before its start), an item added after another (placed there, its time fitted; another day refused), the 準備 list and 費用メモ changed by the owner (not by a participant), a participant's 候補 rewritten and removed by the owner (not by the participant), a passkey check before the owner's important actions (428 on the cookie alone; reading and editing not asked), no passkey swapped in on the cookie alone, a member signing out (a copy of the cookie refused), creator sign-out closed without a cookie, trip keys put by the owner's browser (wrapped only; not in the table's stored payloads on dev; a participant refused), trip key handed over by confirmation codes (wrapped only), a member's own entry sealed as the screen seals it and read back by that member only (not in the owner's trip; on dev, not in the table's stored payloads either), the page's Permissions-Policy (the position open, the camera and microphone closed), the page files compressed (br / gzip), the footprint map's parts and both map files by range (206), a footprint left by a participant and an automatic one by the owner, read by the owner (no revision moved; the automatic one marked), refused to a viewer, who reads both after the participant's seat was revoked.");
+  console.log("AWS verification passed, on trips sealed by their owners right after claiming the seat: the boards of docs/examples/, the first seal (409 画面を更新してください without ui=2 and 409 オーナーがこの旅行を暗号化するまで開けません for an invite, an edit and a footprint before the seal, opened back the same, listed as sealed), the trip key replaced after a member's revocation (every ciphertext of the next generation in the stored payload, the remaining member reading it, the revoked member's old key not opening it), the new owner asked after recover and keeping the key, a trip sealed under the owner's trip key (opened back the same, a participant's sealed post taken and item refused, theme.css and the operator's list as before, export 404, purged without a title), function URL direct 403 (always), generation and key registration closed without a creator, no CORS, OPTIONS refused, a cookie moved to another capsule refused, viewer/editor owner-only actions refused; CloudFront's access log and the Host's refused lines (401 / 403 / 429 with IP, path and status; no cookie, invite secret, #k= or title), owner approval, assets (app.js carrying its packages' notices), IAM-only publish, idempotent publish (a fresh owner link while the seat is free), edge-only API, seat binding, per-member revoke (its 401 saying the seat is gone, a signed-out copy's not), permissions, the owner's history of invites (not the editor's), an editor's own viewer invites (another role refused, issued, listed, named in the owner's list, revoked by it and not by a viewer), Origin, revision conflicts, no export, export.md or export.html on the host (404: the browser makes them), owner recovery, passkey endpoints, paste endpoints closed without a creator, creator endpoints (a delegation link closed without a creator, taken under the trip by its owner seat alone), the build read by the publisher only, operator list and terminate (IAM only, no title, 410 after), no revise text or check on the host (404: the browser revises a sealed trip), reordering a day (the host's time a placeholder, the end carried along; an item without a time given one), an item's end (saved, refused before its start), an item added after another (placed there, its time fitted; another day refused), the 準備 list and 費用メモ changed by the owner (not by a participant), a participant's 候補 rewritten and removed by the owner (not by the participant), a passkey check before the owner's important actions (428 on the cookie alone; reading and editing not asked), no passkey swapped in on the cookie alone, a member signing out (a copy of the cookie refused), creator sign-out closed without a cookie, trip keys put by the owner's browser (wrapped only; not in the table's stored payloads on dev; a participant refused), trip key handed over by confirmation codes (wrapped only), a member's own entry sealed as the screen seals it and read back by that member only (not in the owner's trip; on dev, not in the table's stored payloads either), the page's Permissions-Policy (the position open, the camera and microphone closed), the page files compressed (br / gzip), the footprint map's parts and both map files by range (206), a footprint left by a participant and an automatic one by the owner, read by the owner (no revision moved; the automatic one marked), refused to a viewer, who reads both after the participant's seat was revoked.");
 } catch (err) {
   console.error(refusedByHost.report());   // before the cleanup below, whose own refusals would push out the ones that failed the run
   throw err;

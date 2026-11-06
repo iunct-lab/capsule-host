@@ -4,6 +4,7 @@
 import { b64, pack, unb64, unpack } from "./private-entries";
 import { canon } from "./revise";
 import { author, documentSchema, itemSchema, operationSchema, pointSchema, specSchema, type Document, type PlainPoint, type Item, type SealedDocument, type SealedItem, type SealedOperation, type SealedSpec, type Spec, type Role } from "./schema";
+import { boardDocumentSchema, boardSpecSchema, type BoardDocument, type BoardSpec, type SealedBoardDocument, type SealedBoardSpec } from "./board-schema";
 const text = (s: string) => new TextEncoder().encode(s);
 const aes = { name: "AES-GCM", length: 256 } as const;
 export type SeatKeys = { x25519: CryptoKeyPair; ed25519: CryptoKeyPair };
@@ -226,12 +227,19 @@ export type Previous = { spec: Spec; document: Partial<Document>; revisedIds?: {
 type Sealer = (kind: RecordKind, id: string, field: string, plain: string) => Promise<string>;
 const POSTS = { suggestions: "suggestion", comments: "comment", reflections: "reflection" } as const;
 const ITEM_PLAIN = ["id", "day", "startsAt", "timeTentative", "endsAt", "timezone", "revision"] as const;
+// A capsule of either kind (src/kits.ts) as the browser seals and opens it: a trip, or a board (src/board-schema.ts), which
+// has no destinations, presentation or items and seals the rest the same way, under the same record names.
+// Each function takes either kind and gives back the same kind (the overloads); a trip's are as they were.
+type SealedPrevious = Omit<Previous, "spec" | "document"> & { spec: SealedSpec; document: Record<string, unknown> };
 // The Spec's words: its title, summary, destinations, page labels and presentation. The rest stays plain for the host.
-export async function sealSpec(key: CryptoKey, capsuleId: string, generation: number, spec: Spec, f: Sealer = (kind, id, field, plain) => sealField(key, capsuleId, generation, kind, id, field, plain)): Promise<SealedSpec> {
-  const { title, summary, trip, modules, presentation, ...rest } = spec;
+export function sealSpec(key: CryptoKey, capsuleId: string, generation: number, spec: Spec, f?: Sealer): Promise<SealedSpec>;
+export function sealSpec(key: CryptoKey, capsuleId: string, generation: number, spec: BoardSpec, f?: Sealer): Promise<SealedBoardSpec>;
+export function sealSpec(key: CryptoKey, capsuleId: string, generation: number, spec: Spec | BoardSpec, f?: Sealer): Promise<SealedSpec | SealedBoardSpec>;
+export async function sealSpec(key: CryptoKey, capsuleId: string, generation: number, spec: Spec | BoardSpec, f: Sealer = (kind, id, field, plain) => sealField(key, capsuleId, generation, kind, id, field, plain)): Promise<SealedSpec | SealedBoardSpec> {
+  const { title, summary, trip, modules, presentation, ...rest } = spec as Partial<Spec> & Pick<Spec, "title" | "modules">;
   return {
     ...rest, title: await f("spec", "spec", "title", title), ...(summary !== undefined ? { summary: await f("spec", "spec", "summary", summary) } : {}),
-    trip: { ...trip, destinations: await f("spec", "spec", "destinations", JSON.stringify(trip.destinations)) },
+    ...(trip ? { trip: { ...trip, destinations: await f("spec", "spec", "destinations", JSON.stringify(trip.destinations)) } } : {}),
     modules: await Promise.all(modules.map(async m => ({ ...m, label: await f("module", m.id, "label", m.label) }))),
     ...(presentation ? { presentation: {
       kicker: await f("spec", "spec", "kicker", presentation.kicker), postcardLabel: await f("spec", "spec", "postcardLabel", presentation.postcardLabel),
@@ -239,7 +247,7 @@ export async function sealSpec(key: CryptoKey, capsuleId: string, generation: nu
       dayHeadings: await Promise.all(presentation.dayHeadings.map(async h => ({ day: h.day, title: await f("heading", h.day, "title", h.title) }))),
       travelers: await f("spec", "spec", "travelers", JSON.stringify(presentation.travelers)),
     } } : {}),
-  };
+  } as SealedSpec | SealedBoardSpec;
 }
 // One item: its kind, status, title, place, description and tags as one ciphertext, the rest plain.
 async function sealItem(key: CryptoKey, capsuleId: string, generation: number, item: Item, f: Sealer = (kind, id, field, plain) => sealField(key, capsuleId, generation, kind, id, field, plain)): Promise<SealedItem> {
@@ -247,8 +255,8 @@ async function sealItem(key: CryptoKey, capsuleId: string, generation: number, i
   for (const [k, v] of Object.entries(item)) if (v !== undefined) ((ITEM_PLAIN as readonly string[]).includes(k) ? plain : words)[k] = v;
   return { ...plain, sealed: await f("item", item.id, "sealed", JSON.stringify(words)) } as SealedItem;
 }
-async function sealDocument<D extends Partial<Document>>(key: CryptoKey, capsuleId: string, generation: number, d: D, f: Sealer = (kind, id, field, plain) => sealField(key, capsuleId, generation, kind, id, field, plain)) {
-  const out: Record<string, unknown> = { ...d };
+async function sealDocument(key: CryptoKey, capsuleId: string, generation: number, given: Partial<Document> | Partial<BoardDocument>, f: Sealer = (kind, id, field, plain) => sealField(key, capsuleId, generation, kind, id, field, plain)) {
+  const out: Record<string, unknown> = { ...given }, d = given as Partial<Document>;
   if (d.items) out.items = await Promise.all(d.items.map(i => sealItem(key, capsuleId, generation, i, f)));
   for (const list of ["suggestions", "comments", "reflections"] as const) {
     const posts = d[list] as Array<{ id: string; author: string; body: string }> | undefined;
@@ -260,24 +268,32 @@ async function sealDocument<D extends Partial<Document>>(key: CryptoKey, capsule
   return out;
 }
 // The whole trip, as the owner's browser seals a plain one (POST seal). `previous` is sealed the same way; its revisedIds stay plain.
-export async function sealTrip(key: CryptoKey, capsuleId: string, generation: number, t: { spec: Spec; document: Document; previous?: Previous }) {
+// A board is sealed the same way; it has no step back.
+export function sealTrip(key: CryptoKey, capsuleId: string, generation: number, t: { spec: Spec; document: Document; previous?: Previous }): Promise<{ spec: SealedSpec; document: SealedDocument; previous?: SealedPrevious }>;
+export function sealTrip(key: CryptoKey, capsuleId: string, generation: number, t: { spec: BoardSpec; document: BoardDocument }): Promise<{ spec: SealedBoardSpec; document: SealedBoardDocument }>;
+export function sealTrip(key: CryptoKey, capsuleId: string, generation: number, t: { spec: Spec | BoardSpec; document: Document | BoardDocument; previous?: Previous }): Promise<{ spec: SealedSpec | SealedBoardSpec; document: SealedDocument | SealedBoardDocument; previous?: SealedPrevious }>;
+export async function sealTrip(key: CryptoKey, capsuleId: string, generation: number, t: { spec: Spec | BoardSpec; document: Document | BoardDocument; previous?: Previous }) {
   return {
     spec: await sealSpec(key, capsuleId, generation, t.spec),
-    document: await sealDocument(key, capsuleId, generation, t.document) as SealedDocument,
+    document: await sealDocument(key, capsuleId, generation, t.document) as SealedDocument | SealedBoardDocument,
     ...(t.previous ? { previous: { ...t.previous, spec: await sealSpec(key, capsuleId, generation, t.previous.spec), document: await sealDocument(key, capsuleId, generation, t.previous.document) } } : {}),
   };
 }
 
 // A plain trip as the owner's browser reads it (GET "", GET seal, GET grants), to move it at once (docs/ephemeral-trip-capsule.md「5.4 平文の旅行を移す」).
-export type MoveInput = {
-  spec: Spec; document: Document; previous: Previous | null;
+export type MoveInput<S = Spec, D = Document> = {
+  spec: S; document: D; previous: Previous | null;
   footprints: Array<{ id: string; lat: number; lng: number; accuracy: number; by: string }>;
   grants: Array<{ id: string; label: string; members: Array<{ id: string; label: string }> }>;
 };
 // The body of the one POST seal that moves a plain trip (spec「5.4 平文の旅行を移す」): the trip as sealTrip seals it, each footprint's point and
 // `by`, and each member's and invite's name. The host's own invite names stay as they are (#712); the history's names
 // are not sent, the host drops them. A trip too large to move goes again with `dropPrevious`.
-export async function sealMove(key: CryptoKey, capsuleId: string, generation: number, input: MoveInput, { dropPrevious = false } = {}) {
+type Moved = { generation: number; footprints: Array<{ id: string; point: string; by: string }>; members: Record<string, string>; grants: Record<string, string>; confirm: true };
+export function sealMove(key: CryptoKey, capsuleId: string, generation: number, input: MoveInput, options?: { dropPrevious?: boolean }): Promise<Moved & { spec: SealedSpec; document: SealedDocument; previous?: SealedPrevious }>;
+export function sealMove(key: CryptoKey, capsuleId: string, generation: number, input: MoveInput<BoardSpec, BoardDocument>, options?: { dropPrevious?: boolean }): Promise<Moved & { spec: SealedBoardSpec; document: SealedBoardDocument }>;
+export function sealMove(key: CryptoKey, capsuleId: string, generation: number, input: MoveInput<Spec | BoardSpec, Document | BoardDocument>, options?: { dropPrevious?: boolean }): Promise<Moved & { spec: SealedSpec | SealedBoardSpec; document: SealedDocument | SealedBoardDocument; previous?: SealedPrevious }>;
+export async function sealMove(key: CryptoKey, capsuleId: string, generation: number, input: MoveInput<Spec | BoardSpec, Document | BoardDocument>, { dropPrevious = false } = {}) {
   const { spec, document, previous } = input;
   const footprints = await Promise.all(input.footprints.map(async p => ({ id: p.id, point: await sealPoint(key, capsuleId, generation, p.id, { lat: p.lat, lng: p.lng, accuracy: p.accuracy }), by: await sealName(key, capsuleId, generation, "footprint", p.id, p.by) })));
   const members: Record<string, string> = {}, grants: Record<string, string> = {};
@@ -328,15 +344,22 @@ export async function resealTrip(key: CryptoKey, capsuleId: string, generation: 
 
 // Opens what the host sent and checks the words as the host checks a plain trip, before anything is shown (spec「5.3 暗号化した旅行で Host にできないこと」): a place's
 // link that is not public https is dropped, and a record that does not open or does not pass the plain shape is left out
-// and named in `unreadable` ("<kind>/<id>"), never shown with made-up words. null when the Spec itself does not open.
-export async function openTrip(key: CryptoKey, capsuleId: string, sealed: { spec: SealedSpec; document: SealedDocument }): Promise<{ spec: Spec; document: Document; unreadable: string[] } | null> {
+// and named in `unreadable` ("<kind>/<id>"), never shown with made-up words. null when the Spec itself does not open, or is not a trip's.
+export const openTrip = (key: CryptoKey, capsuleId: string, sealed: { spec: SealedSpec; document: SealedDocument }) =>
+  sealed.spec.kind === "trip" ? openCapsule(key, capsuleId, sealed) : Promise.resolve(null);
+// A capsule of either kind, opened by its kind as openTrip opens a trip. A board has no items.
+export function openCapsule(key: CryptoKey, capsuleId: string, sealed: { spec: SealedSpec; document: SealedDocument }): Promise<{ spec: Spec; document: Document; unreadable: string[] } | null>;
+export function openCapsule(key: CryptoKey, capsuleId: string, sealed: { spec: SealedBoardSpec; document: SealedBoardDocument }): Promise<{ spec: BoardSpec; document: BoardDocument; unreadable: string[] } | null>;
+export function openCapsule(key: CryptoKey, capsuleId: string, sealed: { spec: SealedSpec | SealedBoardSpec; document: SealedDocument | SealedBoardDocument }): Promise<{ spec: Spec | BoardSpec; document: Document | BoardDocument; unreadable: string[] } | null>;
+export async function openCapsule(key: CryptoKey, capsuleId: string, sealed: { spec: SealedSpec | SealedBoardSpec; document: SealedDocument | SealedBoardDocument }): Promise<{ spec: Spec | BoardSpec; document: Document | BoardDocument; unreadable: string[] } | null> {
   const f = (kind: RecordKind, id: string, field: string, s: string) => openField(key, capsuleId, kind, id, field, s);
-  let spec: Spec;
+  const board = sealed.spec.kind === "board", shapes = board ? boardDocumentSchema.shape : documentSchema.shape;
+  let spec: Spec | BoardSpec;
   try {
-    const { title, summary, trip, modules, presentation, ...rest } = sealed.spec;
-    const parsed = specSchema.safeParse({
+    const { title, summary, trip, modules, presentation, ...rest } = sealed.spec as Partial<SealedSpec> & Pick<SealedSpec, "title" | "modules">;
+    const parsed = (board ? boardSpecSchema : specSchema).safeParse({
       ...rest, title: await f("spec", "spec", "title", title), ...(summary !== undefined ? { summary: await f("spec", "spec", "summary", summary) } : {}),
-      trip: { ...trip, destinations: JSON.parse(await f("spec", "spec", "destinations", trip.destinations)) },
+      ...(trip ? { trip: { ...trip, destinations: JSON.parse(await f("spec", "spec", "destinations", trip.destinations)) } } : {}),
       modules: await Promise.all(modules.map(async m => ({ ...m, label: await f("module", m.id, "label", m.label) }))),
       ...(presentation ? { presentation: {
         kicker: await f("spec", "spec", "kicker", presentation.kicker), postcardLabel: await f("spec", "spec", "postcardLabel", presentation.postcardLabel),
@@ -348,22 +371,22 @@ export async function openTrip(key: CryptoKey, capsuleId: string, sealed: { spec
     if (!parsed.success) return null;
     spec = parsed.data;
   } catch { return null; }
-  const unreadable: string[] = [], d = sealed.document;
+  const unreadable: string[] = [], d = sealed.document as SealedDocument;
   // Each record on its own: one that fails is dropped and counted, the others still show.
   const each = async <S extends { id: string }, P>(kind: RecordKind, list: S[], openOne: (s: S) => Promise<unknown>, shape: { safeParse(v: unknown): { success: true; data: P } | { success: false } }) =>
     (await Promise.all(list.map(async s => {
       try { const r = shape.safeParse(await openOne(s)); if (r.success) return [r.data]; } catch { /* left out below */ }
       unreadable.push(`${kind}/${s.id}`); return [];
     }))).flat();
-  const items = await each("item", d.items, async i => {
+  const items = board ? undefined : await each("item", d.items, async i => {
     const { sealed: words, ...plain } = i, item = { ...JSON.parse(await f("item", i.id, "sealed", words)), ...plain };
     // A link that is not public https is dropped, the rest of the item kept (spec「5.3 暗号化した旅行で Host にできないこと」).
     if (item.place?.publicUrl !== undefined && itemSchema.safeParse(item).error?.issues.some(x => x.path.join(".") === "place.publicUrl")) delete item.place.publicUrl;
     return item;
   }, itemSchema);
   const post = (kind: RecordKind) => async ({ seat: _seat, ...p }: { id: string; author: string; body: string; seat?: string }) => ({ ...p, author: await f(kind, p.id, "author", p.author), body: await f(kind, p.id, "body", p.body) });
-  const document: Document = {
-    revision: d.revision, items,
+  const document = {
+    revision: d.revision, ...(items ? { items } : {}),
     suggestions: await each("suggestion", d.suggestions, post("suggestion"), shapes.suggestions.element),
     comments: await each("comment", d.comments, post("comment"), shapes.comments.element),
     reflections: await each("reflection", d.reflections, post("reflection"), shapes.reflections.element),
@@ -371,7 +394,7 @@ export async function openTrip(key: CryptoKey, capsuleId: string, sealed: { spec
     budget: await each("budget", d.budget, async b => ({ id: b.id, title: await f("budget", b.id, "title", b.title), amount: JSON.parse(await f("budget", b.id, "amount", b.amount)), description: await f("budget", b.id, "description", b.description) }), shapes.budget.element),
     notes: (await each("notes", [{ id: "notes", body: d.notes }], async n => f("notes", "notes", "body", n.body), shapes.notes))[0] ?? "",
   };
-  return { spec, document, unreadable };
+  return { spec, document: document as Document | BoardDocument, unreadable };
 }
 
 // A plain operation as the screen made it, checked as the host checks a plain one (operationSchema, then the record's plain
@@ -379,7 +402,8 @@ export async function openTrip(key: CryptoKey, capsuleId: string, sealed: { spec
 // pass: the screen shows the message. A post gets its id here, since its words are sealed against it; promoting a
 // suggestion makes the item the host made from it before (title: the body's first 80 characters), under a new id.
 const newId = () => crypto.randomUUID().replace(/-/g, ""), shapes = documentSchema.shape;
-export async function sealOperation(key: CryptoKey, capsuleId: string, generation: number, input: unknown, document: Document): Promise<SealedOperation> {
+// A board's document has no items and its suggestions are never promoted: the same operations but those, sealed the same way.
+export async function sealOperation(key: CryptoKey, capsuleId: string, generation: number, input: unknown, document: Document | BoardDocument): Promise<SealedOperation> {
   const op = operationSchema.parse(input), f = (kind: RecordKind, id: string, field: string, plain: string) => sealField(key, capsuleId, generation, kind, id, field, plain);
   switch (op.type) {
     case "check": case "include": case "move": case "remove": return op;
@@ -390,8 +414,8 @@ export async function sealOperation(key: CryptoKey, capsuleId: string, generatio
     case "rewrite": return { ...op, body: await f(POSTS[op.list], op.id, "body", op.body) };
     case "item": return { ...op, item: await sealItem(key, capsuleId, generation, op.item) };
     case "promote": {
-      const t = document.suggestions.find(s => s.id === op.id);
-      if (!t || t.promoted) throw new Error("候補が存在しないか追加済みです");
+      const t = (document as Document).suggestions.find(s => s.id === op.id);
+      if (!t || !("items" in document) || t.promoted) throw new Error("候補が存在しないか追加済みです");
       const id = newId(), item = itemSchema.parse({ id, day: op.day, title: t.body.slice(0, 80), description: t.body, status: "confirmed", kind: "activity", revision: 1 });
       const { sealed: words } = await sealItem(key, capsuleId, generation, item);
       return { type: "promote", id: op.id, day: op.day, item: { id, sealed: words } };
@@ -474,12 +498,17 @@ export async function acceptRekey(a: { self: { id: string; ed25519: string }; kn
 // name, each member's and invite's name. A name the host gave stays as it is. Nothing that fails to open is dropped quietly: it
 // throws, and the key is not replaced. `previous` is not sealed again; the host drops it (spec「5.5 旅行の鍵を替える」).
 const isCipher = (v: string) => { try { unpack(v); return true; } catch { return false; } };
-export async function resealAll(oldKey: CryptoKey, newKey: CryptoKey, capsuleId: string, generation: number, t: {
-  spec: SealedSpec; document: SealedDocument; footprints: Array<{ id: string; point: string; by: string }>; members: Array<{ id: string; label: string }>; grants: Array<{ id: string; label: string }>;
+type Others = {
+  footprints: Array<{ id: string; point: string; by: string }>; members: Array<{ id: string; label: string }>; grants: Array<{ id: string; label: string }>;
   // The photos' sealed parts (src/media.ts PhotoAsset). The images stay as they are: they are sealed under each photo's own key.
   media?: Array<{ id: string; key: string; location?: string; caption?: string }>;
-}) {
-  const opened = await openTrip(oldKey, capsuleId, t);
+};
+type Resealed<S, D> = { spec: S; document: D; footprints: Others["footprints"]; media: Array<{ id: string; key: string; location?: string; caption?: string }>; members: Others["members"]; grants: Others["grants"] };
+export function resealAll(oldKey: CryptoKey, newKey: CryptoKey, capsuleId: string, generation: number, t: { spec: SealedSpec; document: SealedDocument } & Others): Promise<Resealed<SealedSpec, SealedDocument>>;
+export function resealAll(oldKey: CryptoKey, newKey: CryptoKey, capsuleId: string, generation: number, t: { spec: SealedBoardSpec; document: SealedBoardDocument } & Others): Promise<Resealed<SealedBoardSpec, SealedBoardDocument>>;
+export function resealAll(oldKey: CryptoKey, newKey: CryptoKey, capsuleId: string, generation: number, t: { spec: SealedSpec | SealedBoardSpec; document: SealedDocument | SealedBoardDocument } & Others): Promise<Resealed<SealedSpec | SealedBoardSpec, SealedDocument | SealedBoardDocument>>;
+export async function resealAll(oldKey: CryptoKey, newKey: CryptoKey, capsuleId: string, generation: number, t: { spec: SealedSpec | SealedBoardSpec; document: SealedDocument | SealedBoardDocument } & Others) {
+  const opened = await openCapsule(oldKey, capsuleId, t);
   if (!opened) throw new Error("旅程を開けません");
   const unreadable = [...opened.unreadable];
   const name = async (kind: Named, id: string, value: string) => {

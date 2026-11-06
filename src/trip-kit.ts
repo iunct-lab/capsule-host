@@ -3,9 +3,9 @@
 // document, so a published trip reads and writes as before.
 import { randomBytes } from "node:crypto";
 import { z } from "zod";
-import { refuse, type DomainKit } from "./kit";
+import { refuse, type DomainKit, type Asked } from "./kit";
 import { localDay } from "./fields";
-import { validate, validateSealed, untimed, stateOf, operationSchema, sealedOperationSchema, sealedSpecSchema, sealedDocumentSchema, type Spec, type Document, type SealedSpec, type SealedDocument, type SealedOperation } from "./schema";
+import { validate, validateSealed, untimed, stateOf, operationSchema, sealedOperationSchema, sealedSpecSchema, sealedDocumentSchema, type Spec, type Document, type SealedSpec, type SealedDocument, type Operation, type SealedOperation } from "./schema";
 import { exportFiles, tripHtml, tripMarkdown, zip } from "./export";
 import { refusal, reviseText, reviseTrip, undoTrip, same, type Previous } from "./revise";
 import { recipe } from "./recipe";
@@ -47,6 +47,45 @@ function retime<T extends Placed>(items: T[], index: number, timezone: string): 
 }
 
 
+// What a member's request does to the records every kind holds (posts, checks, notes, the budget), plain or sealed, and who
+// may ask it: the trip's items are tripKit's alone. A board (src/board-kit.ts) brings only these; `suggestion` is what a new
+// suggestion holds besides the post (a trip's is not yet promoted).
+export type SharedDoc = Omit<Doc, "items" | "suggestions"> & { suggestions: Array<Post & { promoted?: boolean }> };
+export function applyShared({ spec, role, state, seat, now }: Pick<Asked<{ modules: Array<{ id: string; kind: string }>; navigation: string[]; collaboration: Spec["collaboration"] }, unknown>, "spec" | "role" | "state" | "seat" | "now">, op: Operation | SealedOperation, doc: SharedDoc, suggestion: { promoted?: false } = {}) {
+  const editor = role === "owner" || role === "editor";
+  if (state === "reflection" && !editor && op.type !== "reflect") refuse(403, "旅行後は思い出のみ追記できます");
+  if (!editor && ["item", "promote", "notes", "include", "move", "checklist", "budget", "rewrite", "remove"].includes(op.type)) refuse(403, "確定旅程の編集はオーナー・編集者のみです");
+  if (!editor && ((op.type === "suggest" && !spec.collaboration.participantSuggestions) || (op.type === "comment" && !spec.collaboration.participantComments) || (op.type === "check" && !spec.collaboration.participantChecklist))) refuse(403, "この操作は許可されていません");
+  const kinds: Record<string, string> = { check: "checklist", suggest: "suggestion-board", comment: "suggestion-board", reflect: "reflection", include: "reflection", item: "day-timeline", promote: "suggestion-board", notes: "notes", move: "day-timeline", checklist: "checklist", budget: "budget", rewrite: "suggestion-board", remove: "suggestion-board" };
+  if (!spec.modules.some(m => m.kind === kinds[op.type] && spec.navigation.includes(m.id))) refuse(403, "このモジュールは無効です");
+  if (op.type === "check") { const t = doc.checklist.find(x => x.id === op.id); if (!t) refuse(404, "項目が見つかりません"); t.done = op.done; }
+  // A sealed post keeps the id its words were sealed against, and the seat that wrote it.
+  const post = (list: "suggestions" | "comments" | "reflections") => {
+    const at = new Date(now).toISOString();
+    if (!("id" in op)) return { id: uid(), createdAt: at };
+    if (doc[list].some(x => x.id === op.id)) refuse(400, "投稿を確認してください");
+    return { id: op.id, seat, createdAt: at };
+  };
+  if (op.type === "suggest") doc.suggestions.push({ ...post("suggestions"), author: op.author, body: op.body, ...suggestion });
+  if (op.type === "comment") doc.comments.push({ ...post("comments"), author: op.author, body: op.body });
+  if (op.type === "rewrite") { const t = doc[op.list].find(x => x.id === op.id); if (!t) refuse(404, "投稿が見つかりません"); t.body = op.body; }
+  if (op.type === "remove") { const i = doc[op.list].findIndex(x => x.id === op.id); if (i < 0) refuse(404, "投稿が見つかりません"); doc[op.list].splice(i, 1); }
+  if (op.type === "reflect") doc.reflections.push({ ...post("reflections"), author: op.author, body: op.body, included: false });
+  if (op.type === "include") { const t = doc.reflections.find(x => x.id === op.id); if (!t) refuse(404, "項目が見つかりません"); t.included = op.included; }
+  if (op.type === "notes") doc.notes = op.body;
+  // A check stays with its item through a rename; an item new to the list comes in unchecked.
+  if (op.type === "checklist") doc.checklist = op.checklist.map(x => ({ ...x, done: doc.checklist.find(o => o.id === x.id)?.done ?? false }));
+  if (op.type === "budget") doc.budget = op.budget;
+}
+
+// The capsule as it stands, sealed again under a new key (DomainKit.sealed.rekeyed): the same records in each of `lists`, a post
+// keeping its seat and time. A board (src/board-kit.ts) compares its lists, which hold no items.
+export function rekeyedPosts(before: unknown, after: unknown, lists: Array<"items" | "suggestions" | "comments" | "reflections" | "checklist" | "budget">) {
+  const ids = (list: Array<{ id: string }>) => list.map(x => x.id).sort().join("\n"), d = before as Doc, n = after as Doc;
+  if (lists.some(l => ids(d[l]) !== ids(n[l]))) refuse(409, "旅行が変わりました。開き直してください");
+  for (const l of ["suggestions", "comments", "reflections"] as const) for (const p of n[l]) { const o = d[l].find(x => x.id === p.id)!; if (o.seat !== p.seat || o.createdAt !== p.createdAt) refuse(400, "投稿の書き手と時刻は変えられません"); }
+}
+
 export const tripKit: DomainKit<TripSpec, TripDocument> = {
   kind: "trip",
   publish(spec, document, now) {
@@ -77,33 +116,12 @@ export const tripKit: DomainKit<TripSpec, TripDocument> = {
     const { spec, document } = taken.value as { spec: unknown; document: unknown };
     return { ...checked, trip: { spec, document } };
   },
-  apply({ spec, document, created, sealed, role, state, seat, now }, input) {
+  apply(asked, input) {
+    const { spec, document, created, sealed, now } = asked;
     // A sealed trip's records arrive as ciphertext (docs/ephemeral-trip-capsule.md「5.2 暗号化するもの・平文に残すもの」): the roles are checked by the kind of
     // operation as before, and only where the forms differ (a post's id and seat, the item a promotion brings) is there a branch.
-    const op = sealed ? sealedOperationSchema.parse(input) : operationSchema.parse(input), doc = document as Doc, editor = role === "owner" || role === "editor";
-    if (state === "reflection" && !editor && op.type !== "reflect") refuse(403, "旅行後は思い出のみ追記できます");
-    if (!editor && ["item", "promote", "notes", "include", "move", "checklist", "budget", "rewrite", "remove"].includes(op.type)) refuse(403, "確定旅程の編集はオーナー・編集者のみです");
-    if (!editor && ((op.type === "suggest" && !spec.collaboration.participantSuggestions) || (op.type === "comment" && !spec.collaboration.participantComments) || (op.type === "check" && !spec.collaboration.participantChecklist))) refuse(403, "この操作は許可されていません");
-    const kinds: Record<string, string> = { check: "checklist", suggest: "suggestion-board", comment: "suggestion-board", reflect: "reflection", include: "reflection", item: "day-timeline", promote: "suggestion-board", notes: "notes", move: "day-timeline", checklist: "checklist", budget: "budget", rewrite: "suggestion-board", remove: "suggestion-board" };
-    if (!spec.modules.some(m => m.kind === kinds[op.type] && spec.navigation.includes(m.id))) refuse(403, "このモジュールは無効です");
-    if (op.type === "check") { const t = doc.checklist.find(x => x.id === op.id); if (!t) refuse(404, "項目が見つかりません"); t.done = op.done; }
-    // A sealed post keeps the id its words were sealed against, and the seat that wrote it.
-    const post = (list: "suggestions" | "comments" | "reflections") => {
-      const at = new Date(now).toISOString();
-      if (!("id" in op)) return { id: uid(), createdAt: at };
-      if (doc[list].some(x => x.id === op.id)) refuse(400, "投稿を確認してください");
-      return { id: op.id, seat, createdAt: at };
-    };
-    if (op.type === "suggest") doc.suggestions.push({ ...post("suggestions"), author: op.author, body: op.body, promoted: false });
-    if (op.type === "comment") doc.comments.push({ ...post("comments"), author: op.author, body: op.body });
-    if (op.type === "rewrite") { const t = doc[op.list].find(x => x.id === op.id); if (!t) refuse(404, "投稿が見つかりません"); t.body = op.body; }
-    if (op.type === "remove") { const i = doc[op.list].findIndex(x => x.id === op.id); if (i < 0) refuse(404, "投稿が見つかりません"); doc[op.list].splice(i, 1); }
-    if (op.type === "reflect") doc.reflections.push({ ...post("reflections"), author: op.author, body: op.body, included: false });
-    if (op.type === "include") { const t = doc.reflections.find(x => x.id === op.id); if (!t) refuse(404, "項目が見つかりません"); t.included = op.included; }
-    if (op.type === "notes") doc.notes = op.body;
-    // A check stays with its item through a rename; an item new to the list comes in unchecked.
-    if (op.type === "checklist") doc.checklist = op.checklist.map(x => ({ ...x, done: doc.checklist.find(o => o.id === x.id)?.done ?? false }));
-    if (op.type === "budget") doc.budget = op.budget;
+    const op = sealed ? sealedOperationSchema.parse(input) : operationSchema.parse(input), doc = document as Doc;
+    applyShared(asked, op, doc, { promoted: false });
     let moved: { id: string; startsAt: string } | undefined;
     if (op.type === "item" && op.after !== undefined) {
       const target = doc.items.findIndex(x => x.id === op.after);
@@ -182,12 +200,6 @@ export const tripKit: DomainKit<TripSpec, TripDocument> = {
   },
   sealed: {
     previous: z.object({ spec: sealedSpecSchema, document: sealedDocumentSchema.pick({ items: true, checklist: true, notes: true, budget: true }).extend({ suggestions: sealedDocumentSchema.shape.suggestions.optional(), comments: sealedDocumentSchema.shape.comments.optional() }).strict(), revisedIds: z.object({ suggestions: z.array(z.string()), comments: z.array(z.string()) }).strict().optional() }).strict(),
-    // The trip as it stands, sealed again: the same records, a post keeping its seat and time.
-    rekeyed(before, after) {
-      const ids = (list: Array<{ id: string }>) => list.map(x => x.id).sort().join("\n"), d = before as Doc, n = after as Doc;
-      const lists = ["items", "suggestions", "comments", "reflections", "checklist", "budget"] as const;
-      if (lists.some(l => ids(d[l]) !== ids(n[l]))) refuse(409, "旅行が変わりました。開き直してください");
-      for (const l of ["suggestions", "comments", "reflections"] as const) for (const p of n[l]) { const o = d[l].find(x => x.id === p.id)!; if (o.seat !== p.seat || o.createdAt !== p.createdAt) refuse(400, "投稿の書き手と時刻は変えられません"); }
-    },
+    rekeyed: (before, after) => rekeyedPosts(before, after, ["items", "suggestions", "comments", "reflections", "checklist", "budget"]),
   },
 };

@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { open, seal } from "./private-entries";
 import { testTrip } from "./test-fixture";
 import { sealedOperationSchema, type Document } from "./schema";
@@ -213,11 +213,27 @@ describe("sealed trip records", () => {
       { type: "checklist", checklist: [{ id: "c1", title: "傘" }] }, { type: "budget", budget: [{ id: "b1", title: "宿", amount: 1000, description: "" }] },
       { type: "remove", list: "comments", id: "m1" },
     ];
-    for (const op of ops) {
+    // The words are looked for in the whole sealed form: none of them can turn up by chance in a hex id or base64url ciphertext.
+    // The amount is digits, which can (an id ending …b10001), so it is looked at in its own field: sealed, and opening to 1000.
+    const check = async (op: (typeof ops)[number]) => {
       const out = await sealOperation(key, "trip-a", 1, op, doc);
       expect(sealedOperationSchema.safeParse(out).success).toBe(true);
-      for (const w of ["朝市", "夜市", "昼食", "メモ", "傘", "1000", "思い出"]) expect(JSON.stringify(out)).not.toContain(w);
-    }
+      for (const w of ["朝市", "夜市", "昼食", "メモ", "傘", "思い出"]) expect(JSON.stringify(out)).not.toContain(w);
+      if (op.type === "budget") {
+        const amount = (out as { budget: Array<{ id: string; amount: string }> }).budget[0]!.amount;
+        expect(amount).not.toBe("1000");
+        expect(await openField(key, "trip-a", "budget", "b1", "amount", amount)).toBe("1000");
+      }
+      return out;
+    };
+    for (const op of ops) await check(op);
+    // New ids holding 1000 pass the same checks.
+    const uuid = spyOn(crypto, "randomUUID").mockReturnValue("00000000-0000-4000-8000-000000001000" as ReturnType<typeof crypto.randomUUID>);
+    try {
+      const comment = await check({ type: "comment", author: "A", body: "相談" }) as { id: string };
+      const promotedAgain = await check({ type: "promote", id: "s1", day: doc.items[0]!.day }) as { item: { id: string } };
+      expect(comment.id).toContain("1000"); expect(promotedAgain.item.id).toContain("1000");
+    } finally { uuid.mockRestore(); }
     const post = await sealOperation(key, "trip-a", 1, { type: "suggest", author: "A", body: "朝市" }, doc) as { id: string; body: string };
     expect(post.id).toMatch(/^[0-9a-f]{32}$/);
     expect(await openField(key, "trip-a", "suggestion", post.id, "body", post.body)).toBe("朝市");

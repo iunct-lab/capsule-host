@@ -56,6 +56,29 @@ AssetsBucket出力で指定された非公開S3へ `dist/public/` の6ファイ�
 
 パラメータだけを変える（コードは配置し直さない）ときは `aws cloudformation update-stack --use-previous-template` に、変えるものを `ParameterValue=…`、ほかの全部を `UsePreviousValue=true` で渡す（渡さなかったパラメータは既定値に戻る）。今のパラメータの一覧は `aws cloudformation describe-stacks --stack-name $STACK --query 'Stacks[0].Parameters[].ParameterKey'` で見える。Lambda の環境変数を `update-function-configuration` で直接書かない（解決済みの秘密を含む全変数の書き直しになり、テンプレートとずれる）。
 
+```sh
+aws cloudformation update-stack --stack-name $STACK --use-previous-template \
+  --capabilities CAPABILITY_IAM CAPABILITY_AUTO_EXPAND \
+  --region ap-northeast-1 --profile YOUR_PROFILE \
+  --parameters \
+    ParameterKey=WebCodeBucket,UsePreviousValue=true \
+    ParameterKey=WebCodeVersion,UsePreviousValue=true \
+    ParameterKey=WebRateLimit,UsePreviousValue=true \
+    ParameterKey=PublicOrigin,UsePreviousValue=true \
+    ParameterKey=ReservedConcurrency,UsePreviousValue=true \
+    ParameterKey=ClaimCountries,UsePreviousValue=true \
+    ParameterKey=DisabledActions,UsePreviousValue=true \
+    ParameterKey=Photos,ParameterValue='1' \
+    ParameterKey=AssistModel,UsePreviousValue=true \
+    ParameterKey=BudgetLimitUsd,UsePreviousValue=true \
+    ParameterKey=BudgetEmail,UsePreviousValue=true \
+    ParameterKey=PermissionsBoundary,UsePreviousValue=true
+aws cloudformation wait stack-update-complete --stack-name $STACK \
+  --region ap-northeast-1 --profile YOUR_PROFILE
+```
+
+例は `Photos` を変える形で、変えるものをその 1 つと入れ替える。テンプレートにパラメータを足したら、この例にも足す（今の一覧は上の `describe-stacks` の問い合わせ）。`PermissionsBoundary` は、それを持つテンプレートを配置した後のスタックでだけ付くので、まだ付いていないスタックでは、その行を除き、1 つ前の行（`BudgetEmail`）の末尾の `\` も除く（残すと次の `wait` の行が `update-stack` の引数につながる）。
+
 ### 写真の置き場（`Media`）
 
 **写真は既定で無効**で、スタックのパラメータ `Photos`（`'0'` が既定、`'1'` で有効）が Host と Web の `CAPSULE_PHOTOS` になる。有効にするのは、機微な情報が増えうること・費用がかさむことを検討して決めてから（`sam deploy` に `--parameter-overrides Photos=1`）。無効のあいだ `Media` は空で費用は出ず、`aws/verify.ts` は写真の場面を走らせず、Host が断ることだけを確かめる（有効のスタックでは全部走る）。

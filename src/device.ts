@@ -6,3 +6,5 @@ export function deviceLabel(ua: string | null) {
   return browser ? `${os} · ${browser}` : os;
 }
 export const CLAIM_WINDOW = 3 * 86400000;
+// Whether the page can offer to put the trip on the home screen: the browser has Web Install (navigator.install, Chrome 158 and later) and this page is not already the installed app.
+export function canInstall(nav: { install?: unknown }, standalone: boolean) { return typeof nav.install === "function" && !standalone; }

@@ -685,6 +685,27 @@ async function plan() {
   await owner.size(390, 844, true);
   console.log("Plan verification passed: the owner's first opening making the trip's key (the seat's public keys listed, 「この端末に鍵がある」), a passkey check before the owner's important actions (the first invite registers one, the second asks nothing), no チャットで直す in the owner's header, reordering by grip (touch) and by arrow key with the host's new time shown as a placeholder (ごろ), an item without a time given one by a drag and by the edit form (required, the placeholder box unticked by a new time), 詳細 / リスト kept across a reload and reordered from the list, a line opening its card, an end typed / moved with the start / refused before it / emptied with the free time and overlap shown in both views (after an item inside a long one too), shared/personal entries on list boundaries (zero extra height, unchanged row positions, targets at least 24px) and adding one there (the form offering the host's time, a placeholder; the heading's button after the last item; another day by its time; by keyboard; dragged like any other), the 候補・相談 tab saying what each column is for (nothing off the side at 375px), the night theme's preview banner, day tabs, notice and invite warning at a contrast of 4.5 or more, the owner adding, renaming and removing 準備 and 費用メモ lines (kept across a reload), the owner changing a 候補's words and removing a 相談 (kept across a reload, nothing off the side at 375px), 旅を保存 at 375px (the trip page saved as one file (downloaded, or handed to the share sheet as text/html) for every role, Markdown copied to the clipboard, or shown selected when the clipboard is refused; the ZIP and a line per file of the trip's exports for the owner only, the same dialog from 共有・管理), 招待とオーナーの履歴 in 共有・管理 at 375px (an invite issued and revoked from the screen listed first, newest first, with the date and time, the role, the link's name and this phone's member name and device).");
 }
+// The install button of a trip's page (#1197), on a page that is already open on the trip. The browser's Web Install is counted by a
+// stand-in, so it does not matter whether this Chrome has the real one; without one, there is neither button nor manifest link.
+async function installScene(member: NonNullable<typeof owner>, id: string, joined: string) {
+  const manifest = `link[rel="manifest"]`;
+  // The dialog after joining offers it exactly where this Chrome itself has Web Install (before any stand-in below).
+  assert.equal(joined.includes("ホーム画面に置く"), await member.evaluate(`typeof navigator.install === "function" && !matchMedia("(display-mode: standalone)").matches`), "the join dialog offers the install button only where Web Install exists");
+  const { identifier: counted } = await member.cdp("Page.addScriptToEvaluateOnNewDocument", { source: `window.installed = 0; Object.defineProperty(Navigator.prototype, "install", { configurable: true, value() { window.installed++; return Promise.resolve(); } });` });
+  await member.reload();
+  assert.equal(await member.evaluate(`!!document.querySelector('footer [data-action="install"]')`), true, "the install button is in the footer");
+  assert.equal(await member.evaluate(`document.querySelectorAll('${manifest}').length`), 1);
+  assert.equal(await member.evaluate(`document.querySelector('${manifest}').getAttribute("href")`), `/v1/c/${id}/manifest.webmanifest`);
+  assert.deepEqual(await member.evaluate(`(async () => { const r = await fetch(document.querySelector('${manifest}').href); return [r.status, (await r.json()).start_url]; })()`), [200, `/c/${id}`]);
+  await member.evaluate(`document.querySelector('footer [data-action="install"]').click()`); await member.until(`window.installed === 1`);
+  await member.cdp("Page.removeScriptToEvaluateOnNewDocument", { identifier: counted });
+  const { identifier: gone } = await member.cdp("Page.addScriptToEvaluateOnNewDocument", { source: `delete Navigator.prototype.install;` });
+  await member.reload();
+  assert.deepEqual(await member.evaluate(`[!!document.querySelector('[data-action="install"]'), !!document.querySelector('${manifest}')]`), [false, false], "neither button nor link without Web Install");
+  await member.cdp("Page.removeScriptToEvaluateOnNewDocument", { identifier: gone });
+  // Opened again by the address alone (no # secret): the member's seat still opens the trip.
+  await member.cdp("Page.navigate", { url: `${origin}/c/${id}` }); await member.until(drawn);
+}
 async function members() {
   const { owner } = await openTrip();
   // (d) a participant, in a browser context of their own, sees no grip but has the switch.
@@ -928,6 +949,7 @@ async function members() {
   // Off again for the steps below, which reload this page.
   await member.evaluate(`localStorage.removeItem("auto-footprint:${capsuleId}")`); await member.reload(); await stays(2);
   await member.close(); await dispose(memberContext);
+  { const { page: guest, joined } = await joinAs("participant"); await installScene(guest, capsuleId, joined); await guest.close(); }
   // (m) The editor revises the shared plan from the header, while settings stay the owner's, and can undo once.
   const { page: editor, context: editorContext, joined: editorJoined } = await joinAs("editor");
   // The editor's passkey is also the check before handing out and revoking its invites, and its join dialog says so.
@@ -2639,7 +2661,8 @@ async function board() {
   assert.deepEqual(await owner.evaluate(`["revise", "undo", "settings"].filter(a => document.querySelector('#dialog [data-action="' + a + '"]'))`), []);
   await owner.evaluate(`document.querySelector('#dialog [data-action="close"]').click()`);
   // A participant posts; the owner reads it, with nothing to promote it to.
-  const { page: member } = await joinAs("participant");
+  const { page: member, joined } = await joinAs("participant");
+  await installScene(member, capsuleId, joined);
   await tabTo(member, "ideas", 'form[data-form="entry"][data-type="suggest"]');
   await member.evaluate(`(() => { const f = document.querySelector('form[data-form="entry"][data-type="suggest"]'); f.elements.namedItem("author").value = "ボードの人"; f.elements.namedItem("body").value = "土曜の夜にしたい"; f.requestSubmit(); return true; })()`);
   await member.until(`[...document.querySelectorAll(".entry-body")].some(p => p.textContent === "土曜の夜にしたい")`);

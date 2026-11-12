@@ -27,6 +27,7 @@ const assets = new Map([
   ["/app.css", { body: readFileSync(`${root}/src/style.css`, "utf8"), type: "text/css; charset=utf-8" }],
   ["/map.js", { body: await mapBuild.outputs[0]!.text(), type: "text/javascript; charset=utf-8" }],
   ["/maplibre-worker.mjs", { body: readFileSync(`${root}/node_modules/maplibre-gl/dist/maplibre-gl-worker.mjs`, "utf8"), type: "text/javascript; charset=utf-8" }],
+  ["/icon.svg", { body: readFileSync(`${root}/src/icon.svg`, "utf8"), type: "image/svg+xml" }],
   ["/map.css", { body: readFileSync(`${root}/node_modules/maplibre-gl/dist/maplibre-gl.css`, "utf8"), type: "text/css; charset=utf-8" }],
 ]);
 const start = process.env.CAPSULE_TRIP_START ?? new Date().toISOString().slice(0, 10);

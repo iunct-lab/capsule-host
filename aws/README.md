@@ -33,7 +33,7 @@ Lambda同時実行上限が10の新規アカウントは予約同時実行を確
 
 標準ドメイン（`*.cloudfront.net`）の証明書では、閲覧者向けの最低 TLS を 1.2 以上に制限できない（`Cdn` に `ViewerCertificate` を指定していないので CloudFront の標準証明書になり、セキュリティポリシーは TLSv1 に固定される。`MinimumProtocolVersion` を TLSv1.2 以上にできるのは独自の証明書を付けたときだけ）。CloudFront から Web Function のオリジン（`api`）へは `OriginSSLProtocols: [TLSv1.2]` で 1.2 以上に限っている。閲覧者向けを制限するには独自ドメインが要るが、独自ドメインは求めない（現時点）。
 
-AssetsBucket出力で指定された非公開S3へ `dist/public/` の6ファイル（画面の `index.html`・`app.js`・`app.css` と、足あとの地図の部品 `map.js`・`maplibre-worker.mjs`・`map.css`）だけを配置する。`aws s3 sync dist/public/ s3://BUCKET/ --profile YOUR_PROFILE --region ap-northeast-1` を使う。data/・原本・実旅程・ownerリンク・リポジトリ全体をアップロードしない。更新時はCloudFrontのキャッシュを無効化する。画面の3ファイルにはCloudFrontの応答ヘッダーポリシー（`SecurityHeaders`）が `Cache-Control: no-cache` を付けるので、端末のブラウザは開くたびにETagで確かめ直し（変わっていなければ304）、配置の後に前の版の `app.js` を使い続けない。エッジのキャッシュは無効化で新しくなるので、無効化は省かない。CloudFrontは画面のファイルを `Accept-Encoding` に合わせて Brotli か gzip に圧縮して返す（`DefaultCacheBehavior` の `Compress`。圧縮するのは 1,000 B〜10,000,000 B のファイルだけなので、`index.html`（約 700 B）と地図データ `map/*.pmtiles` は圧縮されず、地図データは Range のまま）。`sync` に `--delete` を付けない（同じバケットの `map/` の地図データを消してしまう）。
+AssetsBucket出力で指定された非公開S3へ `dist/public/` の7ファイル（画面の `index.html`・`app.js`・`app.css` と、アプリのアイコン `icon.svg`、足あとの地図の部品 `map.js`・`maplibre-worker.mjs`・`map.css`）だけを配置する。`aws s3 sync dist/public/ s3://BUCKET/ --profile YOUR_PROFILE --region ap-northeast-1` を使う。data/・原本・実旅程・ownerリンク・リポジトリ全体をアップロードしない。更新時はCloudFrontのキャッシュを無効化する。画面の3ファイルにはCloudFrontの応答ヘッダーポリシー（`SecurityHeaders`）が `Cache-Control: no-cache` を付けるので、端末のブラウザは開くたびにETagで確かめ直し（変わっていなければ304）、配置の後に前の版の `app.js` を使い続けない。エッジのキャッシュは無効化で新しくなるので、無効化は省かない。CloudFrontは画面のファイルを `Accept-Encoding` に合わせて Brotli か gzip に圧縮して返す（`DefaultCacheBehavior` の `Compress`。圧縮するのは 1,000 B〜10,000,000 B のファイルだけなので、`index.html`（約 700 B）と地図データ `map/*.pmtiles` は圧縮されず、地図データは Range のまま）。`sync` に `--delete` を付けない（同じバケットの `map/` の地図データを消してしまう）。
 
 `/v1/*` には静的用の `SecurityHeaders` ではなく API 用の応答ヘッダーポリシー（`ApiSecurityHeaders`）を付ける。`Cache-Control: no-store`・`X-Content-Type-Options`・`X-Frame-Options`・`Referrer-Policy`・HSTS を、すべて `Override: false` で足すので、Host が付けた値（写真の `private, max-age=3600` など）がそのまま優先され、Host を通らない CloudFront 自身の応答（拒否など）にだけ効く。CSP と `no-cache` は付けない。
 
@@ -266,7 +266,7 @@ Host を廃止する（スタックを消す）のは、有効な旅行が 1 件
 | 論理名 | 種類 | スタックを消すと |
 |---|---|---|
 | `Data`（`aws/template.yaml`） | DynamoDB のテーブル | 残る（Retain） |
-| `Assets`（`aws/template.yaml`） | S3（画面の 6 ファイルと地図データ） | 残る（Retain） |
+| `Assets`（`aws/template.yaml`） | S3（画面の 7 ファイルと地図データ） | 残る（Retain） |
 | `Media`（`aws/template.yaml`） | S3（写真の暗号文） | 残る（Retain） |
 | `aws/code.yaml` のバケット | S3（Web Function の zip。バージョン付き） | 残る（Retain） |
 | `/capsule-host/<スタック名>/creator-key/*` | Parameter Store（作成者の API キー。Host が動いている間に作るもので、スタックの資源ではない） | 残る。30 日使われないキーを消す `Host` の掃除もスタックと一緒に消える |

@@ -14,6 +14,7 @@ import { openField, sealField, openPhotoImage, openPhotoLocation, sealPhoto, typ
 import { privateReviseText, takePrivate, privateDiff } from "./private-revise";
 import { expiredIn, listedRow, type Joined } from "./joined";
 import { linkNote, memberTags, revokeConfirm, revokeNote, waitingSeats, type ListedGrant } from "./seat-status";
+import { canInstall } from "./device";
 import { autoDue, footprints, spotsOf, type Point } from "./footprints";
 import type { MapCamera, MapData } from "./map";
 import { itemAt, linkPhotos, photoDays, photoInstant, photoPlace, photosPageShown, photosUploadable, type Shown } from "./moments";
@@ -1281,7 +1282,12 @@ async function sealFirst() {
     await reload(); notice("旅行を、メンバーにだけ読める形にしました。");
   } catch (err) { notice((err as Error).message, true); } finally { sealing = false; }
 }
+const installable = () => canInstall(navigator as { install?: unknown }, matchMedia("(display-mode: standalone)").matches);
+// The manifest is linked only where it can be used, so other browsers and the top page never fetch it.
+function linkManifest() { if (id && installable() && !document.head.querySelector('link[rel="manifest"]')) document.head.append(Object.assign(document.createElement("link"), { rel: "manifest", href: `/v1/c/${id}/manifest.webmanifest` })); }
+const installButton = () => installable() ? button("ホーム画面に置く", "install", "quiet") : "";
 function render() {
+  linkManifest();
   mapCamera = unmountMap?.(); unmountMap = undefined; mapData = undefined;
   if (locked || view.mustSeal) {
     document.title = "旅のカプセル";
@@ -1306,7 +1312,7 @@ function render() {
     <main>${isTrip() ? `<section class="hero"><div class="hero-copy"><span class="eyebrow">${e(trip().spec.presentation?.kicker ?? "A LITTLE GETAWAY")}</span><h1>${e(s.title)}</h1><p>${e(s.summary ?? "")}</p><div class="trip-meta"><span>${dateLabel(trip().spec.trip.startsOn)} — ${dateLabel(trip().spec.trip.endsOn)}</span><span>${e(s.timezone)}</span></div><div class="people">${(trip().spec.presentation?.travelers ?? []).map(t => `<span>${e(t.name.slice(0, 1))}</span>`).join("")}<small>${(trip().spec.presentation?.travelers ?? []).map(t => e(t.name) + (t.note ? `（${e(t.note)}）` : "")).join("・")}</small></div></div><div class="postcard" aria-hidden="true"><div class="postcard-top">POSTCARD <span>${e(trip().spec.presentation?.postcardLabel ?? trip().spec.trip.destinations[0]!)}</span></div><div class="landscape"><div class="sun"></div><div class="island one"></div><div class="island two"></div><div class="sea"></div><div class="boat">⛵</div></div><div class="postcard-bottom">${e(trip().spec.presentation?.postcardCaption ?? "旅に、出かけよう。").replace(/\n/g, "<br>")}<span>TRIP<br>CAPSULE</span></div></div></section>` : `<section class="hero board"><div class="hero-copy"><span class="eyebrow">SHARED BOARD</span><h1>${e(s.title)}</h1><p>${e(s.summary ?? "")}</p></div></section>`}
     <section class="overview">${isTrip() ? `<div><small>旅のルート</small><strong>${trip().spec.trip.destinations.map(e).join(" → ")}</strong></div>` : ""}<div><small>準備チェック</small><strong>${d.checklist.filter(c => c.done).length} / ${d.checklist.length} 完了</strong></div><div><small>まず決めたいこと</small><strong>${e(d.checklist.find(c => !c.done)?.title ?? "準備が整いました")}</strong></div></section>
     <nav class="navigation" aria-label="しおりのページ">${pages.map(m => button(m.label, "tab", m.id === tab ? "active" : "", `data-tab="${e(m.id)}" aria-current="${m.id === tab ? "page" : "false"}"`)).join("")}</nav><section class="content">${content()}</section>
-    <footer>${isTrip() ? "この旅のための、小さなしおり。" : "みんなで使う、小さなボード。"}${id && passkeys ? button(view.passkey ? "パスキーを登録し直す" : "パスキーで戻れるようにする", "passkey-register", "quiet") : ""}${id ? button("この端末からログアウト", "signout", "quiet") : ""}${keyStatus()}${handoffWaiting()}<span>招待された人との共有 · revision ${d.revision}</span></footer></main>`;
+    <footer>${isTrip() ? "この旅のための、小さなしおり。" : "みんなで使う、小さなボード。"}${id ? installButton() : ""}${id && passkeys ? button(view.passkey ? "パスキーを登録し直す" : "パスキーで戻れるようにする", "passkey-register", "quiet") : ""}${id ? button("この端末からログアウト", "signout", "quiet") : ""}${keyStatus()}${handoffWaiting()}<span>招待された人との共有 · revision ${d.revision}</span></footer></main>`;
   boundaryRows();
   void mountMap();
   void mountPlaceElement();
@@ -1573,7 +1579,7 @@ document.addEventListener("click", async event => {
     }
     if (action === "save") saveModal();
     if (action === "copy") { const field = document.querySelector<HTMLInputElement>("#issued-link")!; try { await navigator.clipboard.writeText(field.value); notice("リンクをコピーしました。"); } catch { field.select(); notice("リンクを選択しました。コピーして保存してください。"); } }
-    if (action === "join") { const joined = await api("sessions", "POST", { secret: joinSecret }); joinSecret = ""; history.replaceState(null, "", location.pathname); if (joined.pending) return pendingScreen(joined.code); await reload(); modal("この端末を登録しました", `<p>次からは <strong>${e(location.host)}</strong> を開くと「この端末で参加中の旅行」から入れます。このページをブックマークするか、ホーム画面に追加しておくと確実です。</p><p class="muted">受け取った招待リンクも、このブラウザでなら開き直せます。ブラウザのデータ（Cookie）を消すと登録が消え、${passkeys ? "パスキーを登録していなければ" : ""}オーナーからの再招待が必要になります。</p>${passkeys ? `<div class="admin-actions">${button("Face ID / 指紋で戻れるようにする（任意）", "passkey-register", "secondary")}</div><p class="muted">Cookie を消したときに同じ席に戻れます。${view.role === "owner" ? "オーナーは、招待の発行や削除などの前の本人確認にも使います。" : view.role === "editor" ? "編集者は、招待の発行・失効の前の本人確認にも使います。" : ""}閲覧の盗み見を防ぐものではありません。</p>` : ""}`); }
+    if (action === "join") { const joined = await api("sessions", "POST", { secret: joinSecret }); joinSecret = ""; history.replaceState(null, "", location.pathname); if (joined.pending) return pendingScreen(joined.code); await reload(); modal("この端末を登録しました", `<p>次からは <strong>${e(location.host)}</strong> を開くと「この端末で参加中の旅行」から入れます。このページをブックマークするか、ホーム画面に追加しておくと確実です。</p>${installable() ? `<div class="admin-actions">${installButton()}</div>` : ""}<p class="muted">受け取った招待リンクも、このブラウザでなら開き直せます。ブラウザのデータ（Cookie）を消すと登録が消え、${passkeys ? "パスキーを登録していなければ" : ""}オーナーからの再招待が必要になります。</p>${passkeys ? `<div class="admin-actions">${button("Face ID / 指紋で戻れるようにする（任意）", "passkey-register", "secondary")}</div><p class="muted">Cookie を消したときに同じ席に戻れます。${view.role === "owner" ? "オーナーは、招待の発行や削除などの前の本人確認にも使います。" : view.role === "editor" ? "編集者は、招待の発行・失効の前の本人確認にも使います。" : ""}閲覧の盗み見を防ぐものではありません。</p>` : ""}`); }
     if (action === "copy-recipe") {
       const kind = document.querySelector<HTMLSelectElement>("[data-recipe-kind]")?.value ?? "trip";
       const { text } = await api(`/v1/recipe?kind=${encodeURIComponent(kind)}`) as { text: string };
@@ -1676,6 +1682,7 @@ document.addEventListener("click", async event => {
     if (action === "rekey-keep") { await stepUp(); const prf = checkedPrf; checkedPrf = undefined; await api("keys", "PATCH", { type: "keep" }); dialog.close(); await reload(); if (prf) await sealSeatKeys(prf).catch(() => undefined); notice("鍵はそのままです"); }
     if (action === "approve-member") { await api("approve", "POST", { member: b.dataset.id, approve: true, confirm: true }); await manage(); }
     if (action === "reject-member" && confirm("拒否しますか？席は戻りません")) { await api("approve", "POST", { member: b.dataset.id, approve: false, confirm: true }); await manage(); }
+    if (action === "install") { try { await (navigator as unknown as { install(): Promise<unknown> }).install(); } catch (err) { if ((err as Error).name !== "AbortError") notice("ホーム画面に置けませんでした。ブラウザのメニューから追加してください", true); } }
     if (action === "pending-reload") location.reload();
     // A seat that held the key is gone: reading the trip again lets the owner's browser replace the key (load) before the list is shown.
     if (action === "revoke-member" && confirm("この端末の登録を失効させますか？席は戻りません。再参加には新しい招待リンクが必要です。")) { await api("revoke", "POST", { member: b.dataset.id, confirm: true }); await reload(); await manage(); }

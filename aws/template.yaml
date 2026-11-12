@@ -300,7 +300,7 @@ Resources:
           StrictTransportSecurity: { AccessControlMaxAgeSec: 31536000, Override: true }
           ContentSecurityPolicy:
             Override: true
-            ContentSecurityPolicy: "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self' https://api.anthropic.com; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+            ContentSecurityPolicy: "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self' https://api.anthropic.com; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; manifest-src 'self'"
         CustomHeadersConfig:
           Items:
             - { Header: X-Robots-Tag, Value: "noindex, nofollow", Override: true }

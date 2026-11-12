@@ -652,6 +652,10 @@ export class CloudHost {
     const picture = req.method === "GET" && /^\/v1\/c\/[a-f0-9]{32}\/media\/[a-f0-9]{32}\/(thumb|display)$/.test(url.pathname);
     await this.rate(picture ? `ip-media:${ip}` : `ip:${ip}`, picture ? 1200 : 300);
     if (!['GET', 'HEAD'].includes(req.method) && req.headers.get("origin") !== this.env.CAPSULE_ORIGIN) fail(403, "別のサイトからの操作は許可されていません");
+    // The install manifest of a trip's page (#1195): made from the shape of the id alone, so a request with no cookie learns nothing of
+    // whether the trip exists, and the store is not read. A page of a trip has no name the Host can read, so the manifest names none.
+    const manifest = /^\/v1\/c\/([a-f0-9]{32})\/manifest\.webmanifest$/.exec(url.pathname)?.[1];
+    if (manifest && ["GET", "HEAD"].includes(req.method)) return new Response(req.method === "HEAD" ? null : JSON.stringify(tripManifest(manifest)), { headers: { "Content-Type": "application/manifest+json", "Cache-Control": "public, max-age=86400" } });
     const identity = await this.publisherIdentity(req);
     // A creator may make a new trip and nothing more: the cookie is read on these four paths only, and never opens a capsule.
     const registry = (["/v1/account", "/v1/account/key", "/v1/recipe", "/v1/check", "/v1/publish"].includes(url.pathname) || /^\/v1\/assist(\/[a-f0-9]{32})?$/.test(url.pathname)) && req.headers.get("cookie")?.includes("capsule_creator=") ? (await this.registry()).reg : undefined;
@@ -1318,12 +1322,16 @@ export class CloudHost {
     return fail(409, "同時更新がありました。再読込して再試行してください");
   }
 }
+// The same for every trip but its id (no title: the Host cannot read one, and a cookie-less request must learn nothing).
+export function tripManifest(id: string) {
+  return { id: `/c/${id}`, start_url: `/c/${id}`, scope: `/c/${id}`, name: "旅のカプセル", short_name: "旅のカプセル", display: "standalone", background_color: "#f7f5ef", theme_color: "#355a47", icons: [{ src: "/icon.svg", sizes: "any", type: "image/svg+xml" }] };
+}
 // HSTS only means something on https; local development runs on http loopback.
 export function secure(response: Response, origin: string) {
   if (!response.headers.has("Cache-Control")) response.headers.set("Cache-Control", "no-store");
   response.headers.set("Referrer-Policy", "no-referrer"); response.headers.set("X-Content-Type-Options", "nosniff"); response.headers.set("X-Frame-Options", "DENY");
   // One outside origin: a sealed trip's browser sends the trip to Anthropic itself, under the member's own key (#692 回答 B).
-  response.headers.set("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self' https://api.anthropic.com; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");
+  response.headers.set("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self' https://api.anthropic.com; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; manifest-src 'self'");
   response.headers.set("Permissions-Policy", "camera=(), microphone=(), geolocation=(self)");
   if (origin.startsWith("https:")) response.headers.set("Strict-Transport-Security", "max-age=31536000");
   return response;

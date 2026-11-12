@@ -263,11 +263,32 @@ describe("a loopback origin for local development", () => {
     expect(secureSession.headers.get("Set-Cookie")).toContain("HttpOnly; Secure; SameSite=Strict"); expect(secureSession.headers.get("Strict-Transport-Security")).toBe("max-age=31536000");
     expect(secureSession.headers.get("Permissions-Policy")).toBe("camera=(), microphone=(), geolocation=(self)");
   });
+  test("manifest: the same generic manifest for any trip id, without a cookie, and nothing secret in it", async () => {
+    const t = await setup(), name = (t.seed as { spec: { title?: string } }).spec.title;
+    const get = async (id: string, init: RequestInit = {}) => t.host.fetch(new Request(`${origin}/v1/c/${id}/manifest.webmanifest`, init));
+    const real = await get(t.created.id), other = await get("0".repeat(32)), withCookie = await get(t.created.id, { headers: { Cookie: await t.login(t.created.url) } });
+    for (const r of [real, other, withCookie]) {
+      expect(r.status).toBe(200);
+      expect(r.headers.get("Content-Type")).toBe("application/manifest+json");
+      expect(r.headers.get("Cache-Control")).toBe("public, max-age=86400");
+    }
+    const text = await real.text(), json = JSON.parse(text);
+    expect((await other.text()).replaceAll("0".repeat(32), "<id>")).toBe(text.replaceAll(t.created.id, "<id>"));
+    expect(await withCookie.text()).toBe(text);
+    expect(json).toEqual({ id: `/c/${t.created.id}`, start_url: `/c/${t.created.id}`, scope: `/c/${t.created.id}`, name: "旅のカプセル", short_name: "旅のカプセル", display: "standalone", background_color: "#f7f5ef", theme_color: "#355a47", icons: [{ src: "/icon.svg", sizes: "any", type: "image/svg+xml" }] });
+    // The colours are the only "#" in it; the fragment of the trip's link (k=, t=) and its secret are not.
+    for (const secret of ["k=", "t=", new URL(t.created.url).hash.slice(1), t.created.grantId]) expect(text).not.toContain(secret);
+    expect([json.id, json.start_url, json.scope].some(v => v.includes("#"))).toBe(false);
+    if (name) expect(text).not.toContain(name);
+    expect((await get(t.created.id, { method: "HEAD" })).status).toBe(200);
+    expect((await get("0".repeat(31))).status).toBe(404);
+    expect((await get("A".repeat(32))).status).toBe(404);
+  });
   test("CSP: images and scripts come only from the host itself; connections also go to Anthropic, and nowhere else", async () => {
     // The footprint map's background (#563) comes from the same origin: MapLibre's worker is a file beside app.js and the
     // map tiles are ranges of /map/*.pmtiles, so the policy needs nothing added (aws/README.md「足あとの地図の背景（地図データ）」).
     // The one outside origin is Anthropic's API, which a sealed trip's browser calls with the member's own key (#692 回答 B).
-    const csp = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self' https://api.anthropic.com; base-uri 'none'; frame-ancestors 'none'; form-action 'self'";
+    const csp = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self' https://api.anthropic.com; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; manifest-src 'self'";
     // The page itself (src/main.ts passes it through secure(), as every answer of the host) and an answer of the API.
     expect(secure(new Response("<!doctype html>", { headers: { "Content-Type": "text/html" } }), local).headers.get("Content-Security-Policy")).toBe(csp);
     const t = await setup();

@@ -1,7 +1,7 @@
 import { createHash, generateKeyPairSync, randomBytes, sign, type KeyObject } from "node:crypto";
 import { emptyTrip } from "./template";
 import type { BoardSpec, BoardDocument } from "./board-schema";
-import { newAttempt, newHandoffKeys, newSeatKeys, newTripKey, openCapsule, openName, openPoint, sealMove, sealName, sealOperation, sealPoint, sealSpec, seatPublic, wrapTripKey } from "./trip-keys";
+import { newLinkSecret, newSeatKeys, sealLinkKey, newTripKey, openCapsule, openName, openPoint, sealMove, sealName, sealOperation, sealPoint, sealSpec, seatPublic, wrapTripKey } from "./trip-keys";
 // Fictional test data only. Not imported by client or production entrypoints.
 // The day n days after `start` (YYYY-MM-DD), counted in UTC like `emptyTrip`.
 export function tripDay(start: string, n: number) {
@@ -118,17 +118,17 @@ export async function sealedTrip(request: CapsuleRequest, capsuleId: string, own
   await expectOk(request("/seal", "POST", await sealMove(trip, capsuleId, 1, { spec: view.spec, document: view.document, previous, footprints: view.footprints, grants }), owner, view.document.revision));
   return { trip, revisions: 1, owner: { cookie: owner, seat, pub } };
 }
-// The trip key handed from a seat holding it to another member's seat, as their two browsers do it (docs/ephemeral-trip-capsule.md
-// 「鍵の受け渡し」; PATCH keys wait → give → reveal → wrap. The codes the two screens compare are tested in src/cloud-host.test.ts).
-export async function handKey(request: CapsuleRequest, capsuleId: string, giver: { cookie: string; pub: { x25519: string; ed25519: string } }, trip: CryptoKey, member: string) {
-  const keys = (cookie: string, body: object) => expectOk(request("/keys", "PATCH", body, cookie)), view = async (cookie: string) => (await (await expectOk(request("", "GET", undefined, cookie))).json()) as any;
-  const memberPub = await seatPublic(await newSeatKeys()), attempt = await newAttempt(memberPub, capsuleId);
-  const att = (await (await keys(member, { type: "wait", commitment: attempt.commitment })).json() as any).handoff.attempt as string;
-  const waiting = (await view(giver.cookie)).waiting.find((w: any) => w.handoff?.attempt === att), h = await newHandoffKeys();
-  await keys(giver.cookie, { type: "give", seat: waiting.id, attempt: att, ephemeral: h.ephemeral });
-  await keys(member, { type: "reveal", attempt: att, ...memberPub, nonce: attempt.nonce });
-  const wrap = await wrapTripKey(trip, memberPub.x25519, capsuleId, 1, h.pair);
-  await keys(giver.cookie, { type: "wrap", seat: waiting.id, attempt: att, wrapped: wrap.wrapped });
+// The trip key handed from the owner's seat to another member's seat by an invite link, as the screens do it (docs/ephemeral-trip-capsule.md
+// 「5.1 旅行の鍵と受け渡し」): the owner issues an invite carrying the key, and the member's seat takes it with keys of its own.
+// `check` is the giver's passkey check (default: this fixture's stepUp); a caller with its own authenticator for the giver passes its own.
+export async function handKey(request: CapsuleRequest, capsuleId: string, giver: { cookie: string; pub: { x25519: string; ed25519: string } }, trip: CryptoKey, member: string, check: () => Promise<unknown> = () => stepUp(request, giver.cookie)) {
+  await check();
+  const view = (await (await expectOk(request("", "GET", undefined, giver.cookie))).json()) as any, linkSecret = newLinkSecret(), who = { seat: view.self.id as string, ...giver.pub };
+  const issued = await request("/grants", "POST", { role: "participant", id: randomBytes(16).toString("hex"), expiresAt: view.spec.lifecycle.purgeAt, confirm: true, linkKey: { generation: 1, wrapped: await sealLinkKey(trip, linkSecret, capsuleId, 1, who), owner: who } }, giver.cookie);
+  if (issued.status !== 201) throw new Error(`${issued.status} ${await issued.text()}`);
+  const g = await issued.json() as { url: string };
+  const secret = new URLSearchParams(new URL(g.url).hash.slice(1)).get("k")!, pub = await seatPublic(await newSeatKeys());
+  await expectOk(request("/keys", "PATCH", { type: "seat-link", secret, ...pub, ...await wrapTripKey(trip, pub.x25519, capsuleId, 1), generation: 1 }, member));
 }
 // `request` for a sealed trip, as a member's browser holding the trip key talks to the host: what it writes is sealed
 // (src/trip-keys.ts sealOperation, sealSpec, sealPoint, sealName) and what it reads is opened (openCapsule, openPoint, openName),

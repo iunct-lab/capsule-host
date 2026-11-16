@@ -17,7 +17,7 @@ import { recipe, boardRecipe } from "./recipe";
 import { revisable, reviseTrip, undoTrip } from "./revise";
 import { emptyTrip } from "./template";
 import { b64 } from "./private-entries";
-import { newLinkSecret, openLinkKey, sealLinkKey, confirmationCodes, matchesCommitment, openName, openPoint, sealName, sealPoint, sealTrip, sealMove, sealSpec, openField, openTrip, sealOperation, newAttempt, newHandoffKeys, newSeatKeys, newTripKey, seatPublic, signEdge, unwrapSeatSecret, unwrapTripKey, verifyEdge, wrapSeatSecret, wrapTripKey, acceptRekey, reachableSeats, resealAll, sealField, signRekey, signSuccession, openCapsule, type SeatKeys } from "./trip-keys";
+import { newLinkSecret, openLinkKey, sealLinkKey, openName, openPoint, sealName, sealPoint, sealTrip, sealMove, sealSpec, openField, openTrip, sealOperation, newSeatKeys, newTripKey, seatPublic, signEdge, unwrapSeatSecret, unwrapTripKey, verifyEdge, wrapSeatSecret, wrapTripKey, acceptRekey, reachableSeats, resealAll, sealField, signRekey, signSuccession, openCapsule, type SeatKeys } from "./trip-keys";
 
 // Exercises actual SQLite statements through D1's asynchronous shape, without claiming remote D1 QA.
 
@@ -1151,22 +1151,24 @@ describe("trip keys", () => {
       await t.login(used.url);
       expect((await take(t, member, secretOf(used.url))).status).toBe(200);
     });
-    test("a member's seat puts a new pair by a link, as a browser that lost its storage does; an owner's holding the key does not", async () => {
+    test("a member's seat puts a new pair by a link, as a browser that lost its storage does; an owner's holding the key does not, one left out does", async () => {
       const { t, owner, s, issue, who } = await linked(), { res, linkSecret } = await issue(), { url } = await res.json(), member = await t.login(url), k = secretOf(url);
       const put = async (cookie: string) => { const seat = await newSeatKeys(), pub = await seatPublic(seat); return t.request("/keys", "PATCH", { type: "seat-link", secret: k, ...pub, ...await wrapTripKey(await openLinkKey((await sealLinkKey(s.trip, linkSecret, t.created.id, 1, who)), linkSecret, t.created.id, 1, who), pub.x25519, t.created.id, 1), generation: 1 }, cookie); };
       expect((await put(member)).status).toBe(200); expect((await put(member)).status).toBe(200);
       expect((await put(owner)).status).toBe(409); expect((await take(t, owner, k)).status).toBe(409);
       expect((await (await t.request("", "GET", undefined, owner)).json()).seatKey.x25519).toBe(s.owner.pub.x25519);
-      // An owner seat left at an older generation is not replaced either.
+      // An owner seat left at an older generation takes it, its passkey checked just now (the test's owner was).
       const row = t.db.db.query("SELECT payload FROM trip_capsules").get() as { payload: string }, c = JSON.parse(row.payload);
       c.sessions.find((x: any) => x.seatKey?.x25519 === s.owner.pub.x25519).seatKey.generation = 0; t.db.db.run("UPDATE trip_capsules SET payload = ?", [JSON.stringify(c)]);
-      expect((await put(owner)).status).toBe(409);
+      expect((await put(owner)).status).toBe(200);
     });
-    test("a link cannot name a member's seat as the owner's, even with that seat's own keys", async () => {
+    test("a link names any seat holding the key with its keys as they stand, and no seat without it", async () => {
       const { t, owner, s, who, issue } = await linked(), { res, linkSecret } = await issue(), { url } = await res.json(), member = await t.login(url), k = secretOf(url), seat = await newSeatKeys(), pub = await seatPublic(seat);
       await t.request("/keys", "PATCH", { type: "seat-link", secret: k, ...pub, ...await wrapTripKey(s.trip, pub.x25519, t.created.id, 1), generation: 1 }, member);
       const id = (await (await t.request("", "GET", undefined, member)).json()).self.id as string, named = { seat: id, ...pub };
-      expect((await issue({ linkKey: { generation: 1, wrapped: await sealLinkKey(s.trip, linkSecret, t.created.id, 1, named), owner: named } })).res.status).toBe(400); void owner; void who;
+      expect((await issue({ linkKey: { generation: 1, wrapped: await sealLinkKey(s.trip, linkSecret, t.created.id, 1, named), owner: named } })).res.status).toBe(201);
+      const keyless = (await (await t.request("", "GET", undefined, await t.login((await (await issue()).res.json()).url))).json()).self.id as string;
+      expect((await issue({ linkKey: { generation: 1, wrapped: await sealLinkKey(s.trip, linkSecret, t.created.id, 1, { ...named, seat: keyless }), owner: { ...named, seat: keyless } } })).res.status).toBe(400); void owner; void who;
     });
     test("the owner's keys a link names are the owner seat's as they stand", async () => {
       const { t, owner, s, issue, who } = await linked(), wrapped = await sealLinkKey(s.trip, newLinkSecret(), t.created.id, 1, who);
@@ -1246,156 +1248,6 @@ describe("trip keys", () => {
     expect(listed.every((m: any) => m.publicKey === null)).toBe(true);
   });
 
-  describe("鍵の受け渡し", () => {
-    type T = Awaited<ReturnType<typeof setup>>;
-    // The owner's seat takes the trip key, as its browser does, and the trip is sealed with it, as a trip is once its owner's seat is taken; the seat keys stay in the test, as in the browser.
-    async function keyedOwner(t: T) {
-      const { trip, owner } = await t.sealByOwner(await t.login(t.created.url));
-      return { cookie: owner.cookie, seat: owner.seat, pub: owner.pub, trip };
-    }
-    const patch = async (t: T, cookie: string, body: object) => { const r = await put(t, cookie, body); return { status: r.status, body: await r.json() as any }; };
-    const view = async (t: T, cookie: string) => (await (await t.request("", "GET", undefined, cookie)).json()) as any;
-    // Steps 1-4 with both browsers' real functions. `mutate` is the operator's hand on the stored payload between steps.
-    async function run(t: T, giver: { cookie: string; seat: { x25519: CryptoKeyPair; ed25519: CryptoKeyPair }; pub: { x25519: string; ed25519: string }; trip: CryptoKey }, member: string, typed?: { member?: string; giver?: string }) {
-      const memberSeat = await newSeatKeys(), memberPub = await seatPublic(memberSeat), attempt = await newAttempt(memberPub, t.created.id);
-      const waited = await patch(t, member, { type: "wait", commitment: attempt.commitment }); expect(waited.status).toBe(200);
-      const att = waited.body.handoff.attempt as string;
-      const waiting = (await view(t, giver.cookie)).waiting.find((w: any) => w.handoff?.attempt === att);
-      const commitment = waiting.handoff.commitment as string;  // read before the giver's own values are put
-      const h = await newHandoffKeys();
-      expect((await patch(t, giver.cookie, { type: "give", seat: waiting.id, attempt: att, ephemeral: h.ephemeral })).status).toBe(200);
-      const given = (await view(t, member)).handoff.giver;  // the member keeps this
-      expect((await patch(t, member, { type: "reveal", attempt: att, ...memberPub, nonce: attempt.nonce })).status).toBe(200);
-      const revealed = (await view(t, giver.cookie)).waiting.find((w: any) => w.id === waiting.id).handoff.reveal;
-      expect(await matchesCommitment(commitment, { x25519: revealed.x25519, ed25519: revealed.ed25519 }, revealed.nonce, t.created.id)).toBe(true);
-      const mine = await confirmationCodes({ capsuleId: t.created.id, giver: { ephemeral: given.ephemeral, x25519: given.x25519, ed25519: given.ed25519 }, member: { ...memberPub, nonce: attempt.nonce } });
-      const theirs = await confirmationCodes({ capsuleId: t.created.id, giver: { ephemeral: h.ephemeral, x25519: giver.pub.x25519, ed25519: giver.pub.ed25519 }, member: revealed });
-      return { att, memberSeat, memberPub, attempt, waiting, given, h, mine, theirs, wrapNow: async () => {
-        const wrap = await wrapTripKey(giver.trip, revealed.x25519, t.created.id, 1, h.pair);
-        return patch(t, giver.cookie, { type: "wrap", seat: waiting.id, attempt: att, wrapped: wrap.wrapped });
-      } };
-    }
-
-    test("owner → participant: the codes agree, the key is wrapped, and both seats hold the edge", async () => {
-      const t = await setup(), giver = await keyedOwner(t), member = await invite(t, giver.cookie);
-      const r = await run(t, giver, member);
-      expect(r.mine).toEqual(r.theirs);
-      expect((await r.wrapNow()).status).toBe(200);
-      const v = await view(t, member);
-      expect(v.handoff).toBeNull(); expect(v.seatKey).toMatchObject({ x25519: r.memberPub.x25519, ed25519: r.memberPub.ed25519, ephemeral: r.h.ephemeral });
-      const opened = await unwrapTripKey(v.seatKey.wrapped, v.seatKey.ephemeral, r.memberSeat.x25519.privateKey, t.created.id, 1);
-      // The same key: what one encrypts, the other decrypts.
-      const iv = crypto.getRandomValues(new Uint8Array(12)), sealedText = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, giver.trip, new TextEncoder().encode("旅行の鍵"));
-      expect(new TextDecoder().decode(await crypto.subtle.decrypt({ name: "AES-GCM", iv }, opened, sealedText))).toBe("旅行の鍵");
-      const ownerId = r.given.seat as string, memberId = r.waiting.id as string;
-      expect((await patch(t, giver.cookie, { type: "edge", seat: memberId, signature: await signEdge(giver.seat.ed25519.privateKey, { seat: memberId, ...r.memberPub }, t.created.id) })).status).toBe(200);
-      expect((await patch(t, member, { type: "edge", seat: ownerId, signature: await signEdge(r.memberSeat.ed25519.privateKey, { seat: ownerId, ...giver.pub }, t.created.id) })).status).toBe(200);
-      const edges = sessions(t).flatMap(s => s.seatKey?.edges ?? []);
-      expect(edges).toHaveLength(2);
-      const stored = sessions(t).find(s => s.id === ownerId).seatKey.edges[0];
-      expect(await verifyEdge(giver.pub.ed25519, stored.signature, { seat: memberId, ...r.memberPub }, t.created.id)).toBe(true);
-    });
-    test("every role with the key can give, and a seat without it cannot (403)", async () => {
-      const t = await setup(), owner = await keyedOwner(t);
-      for (const role of ["viewer", "editor", "participant"]) {
-        const holder = await invite(t, owner.cookie, { role, label: role });
-        const first = await run(t, owner, holder); expect((await first.wrapNow()).status).toBe(200);
-        // The holder gives to a newcomer with the key it was just given.
-        const newcomer = await invite(t, owner.cookie, { role: "participant", label: `n-${role}` });
-        const giver = { cookie: holder, seat: first.memberSeat, pub: first.memberPub, trip: owner.trip };
-        const second = await run(t, giver, newcomer); expect(second.mine).toEqual(second.theirs);
-        expect((await second.wrapNow()).status).toBe(200);
-      }
-      const keyless = await invite(t, owner.cookie, { label: "k" }), other = await invite(t, owner.cookie, { label: "o" });
-      const w = await patch(t, other, { type: "wait", commitment: (await newAttempt(await seatPublic(await newSeatKeys()), t.created.id)).commitment });
-      const id = (await view(t, owner.cookie)).waiting.find((x: any) => x.handoff?.attempt === w.body.handoff.attempt).id;
-      const h = await newHandoffKeys();
-      const refused = await patch(t, keyless, { type: "give", seat: id, attempt: w.body.handoff.attempt, ephemeral: h.ephemeral });
-      expect(refused.status).toBe(403); expect(refused.body.error).toBe("旅行の鍵を持つメンバーだけが渡せます");
-    });
-    test("abandon leaves nothing, and a new wait changes the attempt and the commitment", async () => {
-      const t = await setup(), giver = await keyedOwner(t), member = await invite(t, giver.cookie);
-      const r = await run(t, giver, member);
-      expect((await patch(t, giver.cookie, { type: "abandon", seat: r.waiting.id, attempt: r.att })).status).toBe(200);
-      expect((await view(t, member)).handoff).toBeNull();
-      expect((await r.wrapNow()).status).toBe(409);
-      expect((await view(t, member)).seatKey).toBeNull();
-      const again = await run(t, giver, member);
-      expect(again.att).not.toBe(r.att); expect(again.attempt.commitment).not.toBe(r.attempt.commitment);
-      // A newer attempt makes the older one's writes fail.
-      expect((await patch(t, member, { type: "reveal", attempt: r.att, ...r.memberPub, nonce: r.attempt.nonce })).status).toBe(409);
-      expect((await patch(t, giver.cookie, { type: "give", seat: r.waiting.id, attempt: r.att, ephemeral: r.h.ephemeral })).status).toBe(409);
-    });
-    test("the waiting member takes back its own attempt", async () => {
-      const t = await setup(), giver = await keyedOwner(t), member = await invite(t, giver.cookie);
-      const r = await run(t, giver, member);
-      expect((await patch(t, member, { type: "abandon", attempt: r.att })).status).toBe(200);
-      expect((await view(t, member)).handoff).toBeNull();
-      expect((await r.wrapNow()).status).toBe(409);
-      expect((await view(t, member)).seatKey).toBeNull();
-      const again = await run(t, giver, member);
-      expect((await patch(t, member, { type: "abandon", seat: r.waiting.id, attempt: again.att })).status).toBe(200);
-      expect((await view(t, member)).handoff).toBeNull();
-    });
-    test("a payload rewritten by the host is caught by the screens, not passed", async () => {
-      const t = await setup(), giver = await keyedOwner(t), member = await invite(t, giver.cookie);
-      const rewrite = (edit: (h: any) => void) => {
-        const row = t.db.db.query("SELECT key, payload FROM trip_capsules").get() as { key: string; payload: string }, c = JSON.parse(row.payload);
-        edit(c.sessions.find((s: any) => s.handoff).handoff); t.db.db.query("UPDATE trip_capsules SET payload = ? WHERE key = ?").run(JSON.stringify(c), row.key);
-      };
-      // The member's public key is swapped: the giver's check of the commitment fails.
-      const a = await run(t, giver, member);
-      const other = await seatPublic(await newSeatKeys());
-      rewrite(h => { h.reveal.x25519 = other.x25519; });
-      const swapped = (await view(t, giver.cookie)).waiting.find((w: any) => w.id === a.waiting.id).handoff.reveal;
-      expect(await matchesCommitment(a.attempt.commitment, { x25519: swapped.x25519, ed25519: swapped.ed25519 }, swapped.nonce, t.created.id)).toBe(false);
-      // The giver's throwaway key is swapped after the member kept the original: the two codes no longer agree.
-      const t2 = await setup(), g2 = await keyedOwner(t2), m2 = await invite(t2, g2.cookie);
-      const b = await run(t2, g2, m2);
-      const row = t2.db.db.query("SELECT key, payload FROM trip_capsules").get() as { key: string; payload: string }, c = JSON.parse(row.payload);
-      c.sessions.find((s: any) => s.handoff).handoff.giver.ephemeral = (await newHandoffKeys()).ephemeral;
-      t2.db.db.query("UPDATE trip_capsules SET payload = ? WHERE key = ?").run(JSON.stringify(c), row.key);
-      const shown = (await view(t2, g2.cookie)).waiting[0].handoff;
-      const fromHost = await confirmationCodes({ capsuleId: t2.created.id, giver: { ephemeral: shown.giver.ephemeral, x25519: shown.giver.x25519, ed25519: shown.giver.ed25519 }, member: { ...b.memberPub, nonce: b.attempt.nonce } });
-      expect(fromHost.member).not.toBe(b.mine.member); expect(fromHost.giver).not.toBe(b.mine.giver);
-    });
-    test("pending seat 403, revoked seat 401, an unknown seat or another capsule's seat 404, frozen lists the owner only", async () => {
-      const t = await setup(), giver = await keyedOwner(t), pending = await invite(t, giver.cookie, { approval: "owner" });
-      const att = (await newAttempt(await seatPublic(await newSeatKeys()), t.created.id)).commitment;
-      expect((await put(t, pending, { type: "wait", commitment: att })).status).toBe(403);
-      const member = await invite(t, giver.cookie);
-      const h = await newHandoffKeys();
-      const missing = await patch(t, giver.cookie, { type: "give", seat: "no-such-seat", attempt: "a".repeat(32), ephemeral: h.ephemeral });
-      expect(missing.status).toBe(404);
-      // A seat that exists, but in another capsule on the same host: its id is no seat of this trip.
-      const other = await t.publish(), there = capsuleAt(t.host, other.id);
-      const otherOwner = (await there("/sessions", "POST", { secret: new URLSearchParams(new URL(other.url).hash.slice(1)).get("k") })).headers.get("Set-Cookie")!.split(";")[0]!;
-      const otherSeat = (await (await there("/grants", "GET", undefined, otherOwner)).json()).flatMap((g: any) => g.members).find((m: any) => m.self).id as string;
-      expect((await patch(t, giver.cookie, { type: "give", seat: otherSeat, attempt: "a".repeat(32), ephemeral: h.ephemeral })).status).toBe(404);
-      const listed = (await (await t.request("/grants", "GET", undefined, giver.cookie)).json()).flatMap((g: any) => g.members);
-      const id = listed.find((m: any) => !m.self && !m.pending).id;
-      expect((await t.request("/revoke", "POST", { member: id, confirm: true }, giver.cookie)).status).toBe(200);
-      expect((await put(t, member, { type: "wait", commitment: att })).status).toBe(401);
-      expect((await t.request("/freeze", "POST", { confirm: true }, giver.cookie)).status).toBe(200);
-      const v = await view(t, giver.cookie);
-      expect(v.waiting).toEqual([]);
-    });
-    test("the host takes only the form of the values and keeps no code", async () => {
-      const t = await setup(), giver = await keyedOwner(t), member = await invite(t, giver.cookie);
-      const good = await newAttempt(await seatPublic(await newSeatKeys()), t.created.id);
-      for (const bad of [{ commitment: "short" }, { commitment: `${"A".repeat(42)}=` }, { type: "other" }, { extra: 1 }])
-        expect((await put(t, member, { type: "wait", commitment: good.commitment, ...bad })).status).toBe(400);
-      const w = await patch(t, member, { type: "wait", commitment: good.commitment });
-      const att = w.body.handoff.attempt;
-      expect((await put(t, giver.cookie, { type: "give", seat: (await view(t, giver.cookie)).waiting[0].id, attempt: att, ephemeral: "short" })).status).toBe(400);
-      expect((await put(t, member, { type: "reveal", attempt: att, x25519: "x", ed25519: "y", nonce: "z" })).status).toBe(400);
-      expect((await put(t, giver.cookie, { type: "wrap", seat: "s", attempt: att, wrapped: "plain" })).status).toBe(400);
-      expect((await put(t, giver.cookie, { type: "edge", seat: "s", signature: "short" })).status).toBe(400);
-      const text = await (await t.request("/grants", "GET", undefined, giver.cookie)).text();
-      expect(text).not.toContain("handoff"); expect(text).not.toContain(good.commitment);
-      expect(JSON.stringify(sessions(t))).not.toMatch(/"code":"\d{6}"/);
-    });
-  });
 });
 describe("passkeys", () => {
   const challenge = async (t: Awaited<ReturnType<typeof setup>>) => (await (await t.request("/passkey/challenge", "POST", {})).json()) as { challenge: string; rpId: string };
@@ -3884,7 +3736,7 @@ describe("sealed footprints and names", () => {
 
 
 
-// A sealed trip whose owner seat holds the trip key, and members given it by the confirmation-code handoff (#702), with the
+// A sealed trip whose owner seat holds the trip key, and members given it by an invite link (#1072), with the
 // browsers' own functions. The seat keys stay in the test, as in the browsers.
 type Keyed = { cookie: string; id: string; grant: string; seat: SeatKeys; pub: { x25519: string; ed25519: string } };
 async function keyedTrip(env: { MEDIA?: MediaStore; CAPSULE_PHOTOS?: string } = {}) {
@@ -3901,14 +3753,12 @@ async function keyedTrip(env: { MEDIA?: MediaStore; CAPSULE_PHOTOS?: string } = 
     expect(r.status).toBe(201); const g = await r.json(), c = await t.login(g.url);
     return { cookie: c, id: ((await read(c)).self?.id ?? "") as string, grant: g.grantId as string };  // no id for a seat awaiting approval
   };
-  // Steps 1-4 and the two edges, from a seat holding the key to one waiting.
+  // The key taken by a seat waiting, by an invite link the owner issued (`key` of `generation`), and the two edges between it and `giver`.
   const hand = async (giver: Keyed, to: { cookie: string; id: string; grant: string }, key = trip, generation = 1): Promise<Keyed> => {
-    const ms = await newSeatKeys(), mp = await seatPublic(ms), attempt = await newAttempt(mp, t.created.id), h = await newHandoffKeys();
-    const att = (await (await t.request("/keys", "PATCH", { type: "wait", commitment: attempt.commitment }, to.cookie)).json()).handoff.attempt;
-    expect((await t.request("/keys", "PATCH", { type: "give", seat: to.id, attempt: att, ephemeral: h.ephemeral }, giver.cookie)).status).toBe(200);
-    expect((await t.request("/keys", "PATCH", { type: "reveal", attempt: att, ...mp, nonce: attempt.nonce }, to.cookie)).status).toBe(200);
-    const w = await wrapTripKey(key, mp.x25519, t.created.id, generation, h.pair);
-    expect((await t.request("/keys", "PATCH", { type: "wrap", seat: to.id, attempt: att, wrapped: w.wrapped }, giver.cookie)).status).toBe(200);
+    const o = (await read(owner.cookie)).seatKey, who = { seat: owner.id, x25519: o.x25519, ed25519: o.ed25519 }, linkSecret = newLinkSecret();
+    const g = await (await t.request("/grants", "POST", { role: "participant", id: crypto.randomUUID().replaceAll("-", ""), expiresAt: t.seed.spec.lifecycle.purgeAt, confirm: true, linkKey: { generation, wrapped: await sealLinkKey(key, linkSecret, t.created.id, generation, who), owner: who } }, owner.cookie)).json();
+    const ms = await newSeatKeys(), mp = await seatPublic(ms), secret = new URLSearchParams(new URL(g.url).hash.slice(1)).get("k")!;
+    expect((await t.request("/keys", "PATCH", { type: "seat-link", secret, ...mp, ...await wrapTripKey(key, mp.x25519, t.created.id, generation), generation }, to.cookie)).status).toBe(200);
     expect((await t.request("/keys", "PATCH", { type: "edge", seat: to.id, signature: await signEdge(giver.seat.ed25519.privateKey, { seat: to.id, ...mp }, t.created.id) }, giver.cookie)).status).toBe(200);
     expect((await t.request("/keys", "PATCH", { type: "edge", seat: giver.id, signature: await signEdge(ms.ed25519.privateKey, { seat: giver.id, ...giver.pub }, t.created.id) }, to.cookie)).status).toBe(200);
     return { ...to, seat: ms, pub: mp };
@@ -4012,6 +3862,72 @@ describe("rekey", () => {
     const v = await t.read(m.cookie), key = await unwrapTripKey(v.seatKey.wrapped, v.seatKey.ephemeral, m.seat.x25519.privateKey, t.created.id, generation);
     return { key, trip: await openTrip(key, t.created.id, v), view: v };
   };
+  describe("key-only links", () => {
+    // A key-only link made by `by` (a seat holding the key), as the screen makes it.
+    const drop = async (t: Awaited<ReturnType<typeof keyedTrip>>, by: Keyed, key = t.trip, generation = 1) => {
+      const linkSecret = newLinkSecret(), self = { seat: by.id, ...by.pub };
+      const r = await t.request("/keys", "PATCH", { type: "drop", linkKey: { generation, wrapped: await sealLinkKey(key, linkSecret, t.created.id, generation, self), owner: self } }, by.cookie);
+      return { r, linkSecret, secret: r.status === 200 ? (await r.json()).secret as string : "" };
+    };
+    const takeBy = async (t: Awaited<ReturnType<typeof keyedTrip>>, cookie: string, d: { secret: string; linkSecret: string }) => {
+      const got = await t.request("/keys", "PATCH", { type: "link", secret: d.secret }, cookie); if (got.status !== 200) return got.status;
+      const l = (await got.json()).linkKey, trip = await openLinkKey(l.wrapped, d.linkSecret, t.created.id, l.generation, l.owner), seat = await newSeatKeys(), pub = await seatPublic(seat);
+      return (await t.request("/keys", "PATCH", { type: "seat-link", secret: d.secret, ...pub, ...await wrapTripKey(trip, pub.x25519, t.created.id, l.generation), generation: l.generation }, cookie)).status;
+    };
+    test("a participant holding the key makes one, and a seat without the key takes the key by it", async () => {
+      const t = await keyedTrip(), a = await t.hand(t.owner, await t.join()), b = await t.join(), d = await drop(t, a);
+      expect(d.r.status).toBe(200); expect(t.stored().drops).toHaveLength(1); expect(JSON.stringify(t.stored().drops)).not.toContain(d.secret);
+      expect(await takeBy(t, b.cookie, d)).toBe(200);
+      expect((await t.read(b.cookie)).seatKey.linked).toBe(true);
+    });
+    test("a seat without the key makes none, and one naming another seat is refused", async () => {
+      const t = await keyedTrip(), a = await t.hand(t.owner, await t.join()), b = await t.join();
+      expect((await drop(t, { ...b, seat: a.seat, pub: a.pub })).r.status).toBe(403);
+      const linkSecret = newLinkSecret(), other = { seat: t.owner.id, ...t.owner.pub };
+      expect((await t.request("/keys", "PATCH", { type: "drop", linkKey: { generation: 1, wrapped: await sealLinkKey(t.trip, linkSecret, t.created.id, 1, other), owner: other } }, a.cookie)).status).toBe(400);
+    });
+    test("a browser without a seat is not seated by one", async () => {
+      const t = await keyedTrip(), d = await drop(t, t.owner), before = t.stored().sessions.length;
+      expect((await t.request("/sessions", "POST", { secret: d.secret })).status).toBe(409);
+      expect(t.stored().sessions.length).toBe(before);
+    });
+    test("replacing the key drops them", async () => {
+      const t = await keyedTrip(), a = await t.hand(t.owner, await t.join()), b = await t.hand(t.owner, await t.join()), c = await t.join(), d = await drop(t, t.owner);
+      expect((await t.request("/revoke", "POST", { member: b.id, confirm: true }, t.owner.cookie)).status).toBe(200);
+      expect((await (await rekey(t, t.owner, [t.owner, a])).send()).status).toBe(200);
+      expect(t.stored().drops).toBeUndefined(); expect(await takeBy(t, c.cookie, d)).toBe(409);
+    });
+    test("an owner seat left out of a replaced key takes it again by one, with its passkey checked", async () => {
+      const t = await keyedTrip(), a = await t.hand(t.owner, await t.join());
+      // As another owner seat would leave this one out: the trip is of generation 2 and only A's wrap is of it.
+      const c = t.stored(); c.sealed = { generation: 2 }; c.sessions.find((x: any) => x.id === a.id).seatKey.generation = 2;
+      t.db.db.run("UPDATE trip_capsules SET payload = ? WHERE payload IS NOT NULL", [JSON.stringify(c)]);
+      const key = await newTripKey(), linkSecret = newLinkSecret(), named = { seat: a.id, ...a.pub };
+      const made = await t.request("/keys", "PATCH", { type: "drop", linkKey: { generation: 2, wrapped: await sealLinkKey(key, linkSecret, t.created.id, 2, named), owner: named } }, a.cookie);
+      expect(made.status).toBe(200); const secret = (await made.json()).secret as string;
+      const seat = await newSeatKeys(), pub = await seatPublic(seat), body = { type: "seat-link", secret, ...pub, ...await wrapTripKey(key, pub.x25519, t.created.id, 2), generation: 2 };
+      now += 6 * 60000;
+      expect((await t.request("/keys", "PATCH", body, t.owner.cookie)).status).toBe(428);
+      await stepUp(t.request, t.owner.cookie);
+      expect((await t.request("/keys", "PATCH", body, t.owner.cookie)).status).toBe(200);
+      expect((await t.read(t.owner.cookie)).seatKey.generation).toBe(2); now -= 6 * 60000;
+    });
+    test("an owner seat given again by /recover reads, by one made by an editor holding the key", async () => {
+      const t = await keyedTrip(), editor = await t.hand(t.owner, await t.join({ role: "editor" }));
+      const recovered = await (await t.request("/recover", "POST", { confirm: true })).json(), next = await t.login(recovered.url);
+      const d = await drop(t, editor); expect(d.r.status).toBe(200);
+      expect(await takeBy(t, next, d)).toBe(200);
+      expect((await t.read(next)).seatKey.generation).toBe(1);
+    });
+  });
+  test("a seat holding what the code handoff left is read as before, and the leftover is never sent", async () => {
+    const t = await keyedTrip(), a = await t.join(), c = t.stored();
+    c.sessions.find((x: any) => x.id === a.id).handoff = { attempt: "a".repeat(32), commitment: "A".repeat(43) };
+    t.db.db.run("UPDATE trip_capsules SET payload = ? WHERE payload IS NOT NULL", [JSON.stringify(c)]);
+    for (const cookie of [a.cookie, t.owner.cookie]) { const r = await t.request("", "GET", undefined, cookie); expect(r.status).toBe(200); expect(await r.text()).not.toContain("A".repeat(43)); }
+    expect(JSON.stringify(await (await t.request("/grants", "GET", undefined, t.owner.cookie)).json())).not.toContain("A".repeat(43));
+    for (const op of [{ type: "wait", commitment: "A".repeat(43) }, { type: "abandon", attempt: "a".repeat(32) }]) expect((await t.request("/keys", "PATCH", op, a.cookie)).status).toBe(400);
+  });
   test("替える drops the invites' link keys: a link left unused holds the old key", async () => {
     const t = await keyedTrip(), a = await t.hand(t.owner, await t.join()), b = await t.hand(t.owner, await t.join()), link = newLinkSecret(), who = { seat: t.owner.id, ...t.owner.pub };
     const old = await unwrapTripKey((await t.read(t.owner.cookie)).seatKey.wrapped, (await t.read(t.owner.cookie)).seatKey.ephemeral, t.owner.seat.x25519.privateKey, t.created.id, 1, true);
@@ -4133,7 +4049,7 @@ describe("rekey", () => {
     const v = await t.read(t.owner.cookie), spec = { ...v.spec, title: await sealField(r.old, t.created.id, 1, "spec", "spec", "title", "古い題") };
     expect((await t.request("/spec", "PATCH", { spec, confirm: true }, t.owner.cookie, v.document.revision)).status).toBe(409);
   });
-  test("待っている席: a seat the owner could not reach waits again, and takes the present generation by the codes", async () => {
+  test("待っている席: a seat the owner could not reach waits again, and takes the present generation by a link", async () => {
     const t = await keyedTrip(), a = await t.hand(t.owner, await t.join()), c = await t.hand(a, await t.join());
     expect((await t.request("/revoke", "POST", { member: a.id, confirm: true }, t.owner.cookie)).status).toBe(200);
     const view = await t.read(t.owner.cookie);
@@ -4142,10 +4058,7 @@ describe("rekey", () => {
     expect((await r.send()).status).toBe(200);
     expect((await t.read(t.owner.cookie)).waiting.map((w: any) => w.id)).toEqual([c.id]);
     expect((await t.read(c.cookie)).seatKey.generation).toBe(1);
-    // A seat of an older generation gives nothing.
-    const d = await t.join(), w = await (await t.request("/keys", "PATCH", { type: "wait", commitment: (await newAttempt(await seatPublic(await newSeatKeys()), t.created.id)).commitment }, d.cookie)).json();
-    expect((await t.request("/keys", "PATCH", { type: "give", seat: d.id, attempt: w.handoff.attempt, ephemeral: (await newHandoffKeys()).ephemeral }, c.cookie)).status).toBe(403);
-    expect((await t.request("/keys", "PATCH", { type: "abandon", attempt: w.handoff.attempt }, d.cookie)).status).toBe(200);
+    const d = await t.join();
     const again = await t.hand(t.owner, c, r.key, 2);
     expect((await opens(t, again, 2)).trip!.spec.title).toBe("テスト旅行");
     expect((await t.read(t.owner.cookie)).waiting.map((x: any) => x.id)).toEqual([d.id]);
@@ -4160,7 +4073,7 @@ describe("rekey", () => {
     expect((await t.request("/keys", "PATCH", { ...body, generation: 2 }, cookie)).status).toBe(400);
     expect((await t.request("/keys", "PATCH", body, cookie)).status).toBe(200);
     const seats = (await t.read(t.owner.cookie)).seats;
-    expect(seats.find((s: any) => s.id === a.id)).toEqual({ id: a.id, role: "participant", ...pub, edges, since });
+    expect(seats.find((s: any) => s.id === a.id)).toEqual({ id: a.id, role: "participant", ...pub, edges, since, linked: true });
     expect(JSON.stringify(seats)).not.toContain(w.wrapped);
     // A seat that holds no key is told none of them.
     expect((await t.read((await t.join()).cookie)).seats).toEqual([]);
@@ -4340,5 +4253,125 @@ describe("a board capsule", () => {
     expect((await t.raw("/purge", "POST", { title: "画面が確かめた題" }, t.owner)).status).toBe(200);
     expect((await t.raw("", "GET", undefined, t.owner)).status).not.toBe(200);
     expect((t.db.db.query("SELECT payload FROM trip_capsules").get() as any).payload).toBeNull();
+  });
+});
+
+// The owner changes one member's role where it sits: no new invite, no new seat, the same cookie (spec「2.3 Grant（招待）と Session（メンバー）」).
+describe("member role", () => {
+  const setRole = (t: Awaited<ReturnType<typeof setup>>, by: string, id: string, role: string) => t.request("/members", "PATCH", { id, role, confirm: true }, by);
+  const view = async (t: Awaited<ReturnType<typeof setup>>, cookie: string) => (await (await t.request("", "GET", undefined, cookie)).json()) as any;
+  // Against the revision as it stands, so that a refusal is the role's and not a stale revision's.
+  const patch = async (t: Awaited<ReturnType<typeof setup>>, cookie: string, op: object) => (await t.request("/document", "PATCH", op, cookie, (await view(t, cookie)).document.revision)).status;
+  const edit = (t: Awaited<ReturnType<typeof setup>>, cookie: string) => patch(t, cookie, { type: "item", item: testTrip().document.items[0] });
+  const grants = async (t: Awaited<ReturnType<typeof setup>>, owner: string) => (await (await t.request("/grants", "GET", undefined, owner)).json()) as any[];
+  const start = async () => {
+    const t = await setup(), owner = await stepUp(t.request, await t.login(t.created.url)); await t.sealByOwner(owner);
+    const invite = await (await t.request("/grants", "POST", { role: "participant", label: "旅行メンバー用", seats: 3, expiresAt: t.seed.spec.lifecycle.purgeAt, confirm: true }, owner)).json();
+    const a = await t.login(invite.url), b = await t.login(invite.url);
+    return { t, owner, invite, a, b, aSeat: (await view(t, a)).self.id as string, bSeat: (await view(t, b)).self.id as string };
+  };
+  test("a participant made an editor edits with the same cookie; the invite, its other member and its free seat stay as they were", async () => {
+    const { t, owner, invite, a, b, aSeat } = await start(), before = await grants(t, owner);
+    expect([await edit(t, a), await edit(t, b)]).toEqual([403, 403]);
+    expect((await setRole(t, owner, aSeat, "editor")).status).toBe(200);
+    const after = await grants(t, owner), listed = after.find(g => g.id === invite.grantId);
+    expect(after.map(g => [g.id, g.role, g.seats, g.claimed])).toEqual(before.map(g => [g.id, g.role, g.seats, g.claimed]));
+    expect(listed.members.map((m: any) => m.role)).toEqual(["editor", "participant"]);
+    expect([(await view(t, a)).role, await edit(t, a)]).toEqual(["editor", 200]);
+    expect([(await view(t, b)).role, await edit(t, b)]).toEqual(["participant", 403]);
+    // The seat still free is the invite's own.
+    const c = await t.login(invite.url); expect([(await view(t, c)).role, await edit(t, c)]).toEqual(["participant", 403]);
+    // Re-opening the invite in the changed member's browser answers with the role it has now, and takes no seat.
+    const again = await t.request("/sessions", "POST", { secret: secretOf(invite.url) }, a);
+    expect([again.status, (await again.json()).role]).toEqual([200, "editor"]);
+    expect((await grants(t, owner)).find(g => g.id === invite.grantId).claimed).toBe(3);
+  });
+  test("an editor made a participant, then a viewer, loses what the role had; the viewer invite it handed out stays the owner's to revoke", async () => {
+    const { t, owner, a, aSeat } = await start();
+    expect((await setRole(t, owner, aSeat, "editor")).status).toBe(200); await stepUp(t.request, a);
+    const handed = await t.request("/grants", "POST", { role: "viewer", label: "家族用", expiresAt: t.seed.spec.lifecycle.purgeAt, confirm: true }, a); expect(handed.status).toBe(201);
+    const viewerInvite = await handed.json();
+    expect((await setRole(t, owner, aSeat, "participant")).status).toBe(200);
+    // Back at the invite's own role, the member holds none of its own.
+    expect(JSON.parse((t.db.db.query("SELECT payload FROM trip_capsules").get() as { payload: string }).payload).sessions.find((s: any) => s.id === aSeat).role).toBeUndefined();
+    expect(await edit(t, a)).toBe(403);
+    expect((await t.request("/grants", "POST", { role: "viewer", label: "もう 1 本", expiresAt: t.seed.spec.lifecycle.purgeAt, confirm: true }, a)).status).toBe(403);
+    expect((await t.request("/grants", "GET", undefined, a)).status).toBe(403);
+    expect(await patch(t, a, { type: "suggest", author: "参加者", body: "海を見たい" })).toBe(200);
+    expect((await grants(t, owner)).find(g => g.id === viewerInvite.grantId)).toMatchObject({ role: "viewer", revoked: null, issuedBy: { id: aSeat } });
+    expect((await setRole(t, owner, aSeat, "viewer")).status).toBe(200);
+    expect((await view(t, a)).role).toBe("viewer");
+    expect(await patch(t, a, { type: "suggest", author: "参加者", body: "山も見たい" })).toBe(403);
+    expect((await t.request("/revoke", "POST", { id: viewerInvite.grantId, confirm: true }, owner)).status).toBe(200);
+  });
+  test("the seat is the same one: its id, name, passkey and own entries stay", async () => {
+    const { t, owner, a, aSeat } = await start();
+    await withKey(t.request, a);
+    expect((await t.request("/private", "PATCH", { type: "put", entry: { id: "p1", kind: "item", day: "2026-09-25", startsAt: "2026-09-25T10:00:00+09:00", title: seal("題"), body: seal("本文") } }, a)).status).toBe(200);
+    const pick = async () => { const v = await view(t, a); return { self: v.self, passkey: v.passkey, private: v.private, privateKey: v.privateKey }; }, before = await pick();
+    expect(before).toMatchObject({ self: { id: aSeat }, passkey: true, private: [{ id: "p1" }] });
+    expect((await setRole(t, owner, aSeat, "editor")).status).toBe(200);
+    expect(await pick()).toEqual(before);
+  });
+  test("a sealed trip's seat keeps its key and reads on; the seats it is told of name its role as it stands", async () => {
+    const t = await keyedTrip(), a = await t.hand(t.owner, await t.join()), before = (await t.read(a.cookie)).seatKey;
+    expect(before).toBeTruthy();
+    expect((await setRole(t, t.owner.cookie, a.id, "editor")).status).toBe(200);
+    const after = await t.read(a.cookie);
+    expect([after.role, after.seatKey]).toEqual(["editor", before]);
+    expect(after.seats.find((s: any) => s.id === a.id).role).toBe("editor");
+    expect(await mark(t, t.owner.cookie)).toBeNull();
+  });
+  const mark = async (t: Awaited<ReturnType<typeof keyedTrip>>, cookie: string) => (await t.read(cookie)).rekey;
+  test("only the owner, after a passkey check; never an owner's seat, a seat awaiting approval, or to owner", async () => {
+    const { t, owner, a, b, aSeat, bSeat } = await start(), ownerSeat = (await view(t, owner)).self.id;
+    expect((await setRole(t, a, bSeat, "editor")).status).toBe(403);
+    expect((await setRole(t, a, aSeat, "editor")).status).toBe(403);
+    expect((await setRole(t, owner, bSeat, "editor")).status).toBe(200);
+    await stepUp(t.request, b);
+    expect((await setRole(t, b, aSeat, "editor")).status).toBe(403);
+    expect((await setRole(t, b, bSeat, "viewer")).status).toBe(403);
+    const v = await (await t.request("/grants", "POST", { role: "viewer", label: "閲覧用", expiresAt: t.seed.spec.lifecycle.purgeAt, confirm: true }, owner)).json(), viewer = await t.login(v.url);
+    expect((await setRole(t, viewer, aSeat, "editor")).status).toBe(403);
+    expect((await setRole(t, owner, ownerSeat, "editor")).status).toBe(400);
+    expect((await setRole(t, owner, aSeat, "owner")).status).toBe(400);
+    expect((await setRole(t, owner, aSeat, "participant")).status).toBe(400);  // already that
+    expect((await setRole(t, owner, "none", "editor")).status).toBe(404);
+    const p = await (await t.request("/grants", "POST", { role: "participant", label: "承認つき", approval: "owner", expiresAt: t.seed.spec.lifecycle.purgeAt, confirm: true }, owner)).json(); await t.login(p.url);
+    const waiting = (await grants(t, owner)).find(g => g.id === p.grantId).members[0];
+    expect(waiting.pending).toBe(true);
+    expect((await setRole(t, owner, waiting.id, "editor")).status).toBe(400);
+    // The passkey check lasts five minutes; a name is still the owner's to change without one, a role is not.
+    const then = now;
+    try {
+      now += 6 * 60_000;
+      expect((await setRole(t, owner, aSeat, "editor")).status).toBe(428);
+      expect((await view(t, a)).role).toBe("participant");
+      await stepUp(t.request, owner);
+      expect((await setRole(t, owner, aSeat, "editor")).status).toBe(200);
+    } finally { now = then; }
+  });
+  test("the history names who was changed from which role to which, by id in a sealed trip", async () => {
+    const { t, owner, invite, aSeat } = await start(), ownerSeat = (await view(t, owner)).self.id;
+    expect((await setRole(t, owner, aSeat, "editor")).status).toBe(200);
+    const lines = await (await t.request("/history", "GET", undefined, owner)).json() as any[];
+    const { at: _at, ...line } = lines[0];
+    expect(line).toEqual({ event: "role", role: "editor", from: "participant", grant: invite.grantId, member: aSeat, seat: ownerSeat, device: "不明な端末" });
+    // Revoked after, the line names the role the member had, not the invite's.
+    expect((await t.request("/revoke", "POST", { member: aSeat, confirm: true }, owner)).status).toBe(200);
+    expect((await (await t.request("/history", "GET", undefined, owner)).json())[0]).toMatchObject({ event: "revoke-member", role: "editor", member: aSeat });
+  });
+  test("a trip stored before members had roles of their own reads as it did, and the screen before this one still renames", async () => {
+    const { t, owner, a, b, aSeat } = await start();
+    // What is stored is put back as it was kept before this change, whatever is written now: no session holds a role.
+    expect((await setRole(t, owner, aSeat, "editor")).status).toBe(200);
+    const row = t.db.db.query("SELECT payload FROM trip_capsules").get() as { payload: string }, stored = JSON.parse(row.payload);
+    expect(stored.sessions.find((s: any) => s.id === aSeat).role).toBe("editor");
+    for (const s of stored.sessions) delete s.role;
+    t.db.db.query("UPDATE trip_capsules SET payload = ?").run(JSON.stringify(stored));
+    expect([(await view(t, owner)).role, (await view(t, a)).role, await edit(t, a), await edit(t, b)]).toEqual(["owner", "participant", 403, 403]);
+    const listed = (await grants(t, owner)).flatMap(g => g.members);
+    expect(listed.map((m: any) => m.role).sort()).toEqual(["owner", "participant", "participant"]);
+    expect((await t.request("/members", "PATCH", { id: aSeat, label: listed.find((m: any) => m.id === aSeat).label }, owner)).status).toBe(200);
   });
 });

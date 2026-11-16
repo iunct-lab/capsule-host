@@ -30,10 +30,9 @@ const canIssue: Record<Role, Role[]> = { owner: ["owner", "editor", "participant
 // signature over the new ones (docs/ephemeral-trip-capsule.md「5.5 旅行の鍵を替える」).
 // `rekey`: the owner seat's signature over this wrap, when the owner's browser replaced the trip key (POST rekey, spec「5.5 旅行の鍵を替える」).
 type SeatKey = { x25519: string; ed25519: string; generation: number; wrapped: string; ephemeral: string; linked?: boolean; secret?: { x25519: string; ed25519: string; passkey: string }; edges?: Array<{ seat: string; signature: string }>; since?: { x25519: string; ed25519: string; signature: string }; rekey?: { seat: string; signature: string } };
-// `handoff`: the values of a seat waiting for the trip key, in the order of docs/ephemeral-trip-capsule.md「5.1 旅行の鍵と受け渡し」 (the commitment,
-// then the giver's, then the member's own). Every one is public; the host only holds them and checks who may write which.
-type Handoff = { attempt: string; commitment: string; giver?: { seat: string; ephemeral: string; x25519: string; ed25519: string }; reveal?: { x25519: string; ed25519: string; nonce: string } };
-type Session = { id: string; digest: string; grantId: string; expires: number; label: string; device: string; created: number; lastUsed: number; passkey?: Passkey; verifiedUntil?: number; pending?: boolean; code?: string; seen?: number; privateKey?: { wrapped: string; passkey: string }; seatKey?: SeatKey; handoff?: Handoff; assistKey?: string; assistWrapped?: string };
+// `handoff`: what the code handoff (gone, #1072) left on a seat of a trip that used it. Never read, never sent.
+// `Session.role`: held only by a member whose role the owner changed from the invite's; without it the seat has its invite's role.
+type Session = { id: string; digest: string; grantId: string; expires: number; label: string; device: string; created: number; lastUsed: number; passkey?: Passkey; verifiedUntil?: number; pending?: boolean; code?: string; seen?: number; role?: Exclude<Role, "owner">; privateKey?: { wrapped: string; passkey: string }; seatKey?: SeatKey; handoff?: unknown; assistKey?: string; assistWrapped?: string };
 // `assistKey`: this seat's own Anthropic API key for revising the trip on the host, sealed with the subject `<capsule id>:<seat id>`
 // (src/key-store.ts). It is the seat's alone: no other member and no creator can open it, and it goes with the seat when the
 // seat or the trip goes.
@@ -62,15 +61,18 @@ type FootprintRecord = { id: string; seat: string; by: string; at: string; auto?
 // about (`label`), and who did it: a member's name and device, or 発行者 / 作成者 for the publisher and the creator. Older lines
 // have none of these, and are not filled in. A sealed trip's lines copy no name (docs/ephemeral-trip-capsule.md「5.2 暗号化するもの・平文に残すもの」, `Audit`): they
 // hold the invite's id (`grant`), the seat that did it (`seat`) and the seat it was done to (`member`), and the screen names them.
-type Audit = { event: string; at: number; role?: Role; label?: string; by?: string; device?: string; grant?: string; seat?: string; member?: string };
+type Audit = { event: string; at: number; role?: Role; label?: string; by?: string; device?: string; grant?: string; seat?: string; member?: string; from?: Role };
 // The events the owner sees as the history of invites and owner seats (GET history).
-const HISTORY = ["publish", "replay", "creator-owner", "recover", "sessions", "grants", "rotate", "revoke", "revoke-member", "freeze"];
+const HISTORY = ["publish", "replay", "creator-owner", "recover", "sessions", "grants", "rotate", "revoke", "revoke-member", "role", "freeze"];
 // `sealed`: the trip's words are kept as ciphertext under the trip's key (docs/ephemeral-trip-capsule.md「5.2 暗号化するもの・平文に残すもの」), in the key generation
 // named; `spec`, `document` and `previous` then have the kind's sealed forms (src/schema.ts for a trip). Without it they are plain.
 // All three are the kind's (src/kit.ts, by `spec.kind`): the host reads only the Envelope and the document's version.
 // `departed`: the seats that held the present generation of the trip key and are gone, and why (docs/ephemeral-trip-capsule.md「5.5 旅行の鍵を替える」).
 // The owner's browser replacing the key clears it.
-type Capsule = { sealed?: { generation: number }; spec: Envelope; document: Versioned; previous?: unknown; id?: string; ownedAt?: number; joined?: number; created: number; updated: string; forced: string | null; hash: string; publishHash?: string; grants: Grant[]; sessions: Session[]; audit: Audit[]; spent?: Array<{ digest: string; expires: number }>; private?: Record<string, PrivateEntry[]>; footprints?: FootprintRecord[]; media?: PhotoAsset[]; departed?: Departure[]; left?: string[] };
+// `drops`: key-only links (spec「5.1 旅行の鍵と受け渡し」): the trip key wrapped for a link that takes no seat, made by any seat holding the key.
+// Only the link's digest is kept; replacing the key drops them.
+type Drop = { digest: string; linkKey: LinkKey; expires: number; by: string };
+type Capsule = { sealed?: { generation: number }; drops?: Drop[]; spec: Envelope; document: Versioned; previous?: unknown; id?: string; ownedAt?: number; joined?: number; created: number; updated: string; forced: string | null; hash: string; publishHash?: string; grants: Grant[]; sessions: Session[]; audit: Audit[]; spent?: Array<{ digest: string; expires: number }>; private?: Record<string, PrivateEntry[]>; footprints?: FootprintRecord[]; media?: PhotoAsset[]; departed?: Departure[]; left?: string[] };
 // `left`: the cookie digests of the seats that are gone (revoked, their invite rotated, revoked or ended, sharing ended, the owner
 // recovered), newest last, so their 401 can say so. A cookie not in it (a seat gone before it was kept, or dropped off its end) is
 // answered as an idle one is: the browser then keeps its keys, as before. Its end bounds the row: a trip holds 100 seats at
@@ -133,31 +135,26 @@ const privateOperations = z.discriminatedUnion("type", [
 ]);
 // A seat's keys for the trip (#689). Only the form and length are checked here; the host cannot open any of it.
 const rawKey = z.string().regex(/^[A-Za-z0-9_-]{43}$/);  // 32 bytes, base64url
-const nonce = z.string().regex(/^[A-Za-z0-9_-]{22}$/);  // 16 bytes
 const signature = z.string().regex(/^[A-Za-z0-9_-]{86}$/);  // 64 bytes
 const attempt = z.string().regex(/^[a-f0-9]{32}$/);
 const seatId = z.string().min(1).max(64);
 const inviteSecret = z.string().min(32).max(100);
+const linkKey = z.object({ generation: z.number().int(), wrapped: sealed(200), owner: z.object({ seat: seatId, x25519: rawKey, ed25519: rawKey }).strict() }).strict();
 const keysOperation = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("seat"), x25519: rawKey, ed25519: rawKey, ephemeral: rawKey, generation: z.number().int().min(1), wrapped: sealed(200),
     secret: z.object({ x25519: sealed(200), ed25519: sealed(200) }).strict().optional(),
     since: z.object({ x25519: rawKey, ed25519: rawKey, signature }).strict().optional(), edges: z.array(z.object({ seat: seatId, signature }).strict()).max(200).optional(),
   }).strict(),
-  // The handoff of the trip key to a seat that has none (docs/ephemeral-trip-capsule.md「5.1 旅行の鍵と受け渡し」, steps 1-4 and the edge).
-  z.object({ type: z.literal("wait"), commitment: rawKey }).strict(),
-  z.object({ type: z.literal("give"), seat: seatId, attempt, ephemeral: rawKey }).strict(),
-  z.object({ type: z.literal("reveal"), attempt, x25519: rawKey, ed25519: rawKey, nonce }).strict(),
-  z.object({ type: z.literal("wrap"), seat: seatId, attempt, wrapped: sealed(200) }).strict(),
   z.object({ type: z.literal("edge"), seat: seatId, signature }).strict(),
-  z.object({ type: z.literal("abandon"), seat: seatId.optional(), attempt }).strict(),  // no seat: the caller's own attempt
   // The owner keeps the trip key after an owner seat was handed over (spec「5.5 旅行の鍵を替える」).
   z.object({ type: z.literal("keep") }).strict(),
   // The wrapped key of an invite link, read by a seat that opened the link, and that seat's own keys put with it (spec「5.1 旅行の鍵と受け渡し」).
   z.object({ type: z.literal("link"), secret: inviteSecret }).strict(),
+  z.object({ type: z.literal("drop"), linkKey }).strict(),
   z.object({ type: z.literal("seat-link"), secret: inviteSecret, x25519: rawKey, ed25519: rawKey, ephemeral: rawKey, generation: z.number().int(), wrapped: sealed(200) }).strict(),
 ]);
-const EDGES = 200;
+const EDGES = 200, DROPS = 20;
 // Every ciphertext in what a request brings, for the check that it is of the trip key's present generation (spec「5.5 旅行の鍵を替える」).
 const ciphers = (value: unknown): string[] => typeof value === "string" ? value.startsWith("v1.") ? [value] : [] : value && typeof value === "object" ? Object.values(value).flatMap(ciphers) : [];
 // A footprint is one fix of the browser's position: at most a kilometre off, once a minute per seat, a thousand per trip.
@@ -192,7 +189,6 @@ const photoOperations = z.discriminatedUnion("type", [
 ]);
 const grantInput = z.object({ role: z.enum(["owner", "editor", "participant", "viewer"]), label: author.default("招待リンク"), expiresAt: isoTime, seats: z.number().int().min(1).max(50).default(1), claimDays: z.number().int().min(1).max(30).default(3), confirm: z.literal(true), rotate: z.string().optional(), approval: z.enum(["auto", "owner"]).optional() }).strict();
 // A sealed trip's invite is named in ciphertext sealed against the id the browser chose, or with one of the host's own names.
-const linkKey = z.object({ generation: z.number().int(), wrapped: sealed(200), owner: z.object({ seat: seatId, x25519: rawKey, ed25519: rawKey }).strict() }).strict();
 const sealedGrantInput = grantInput.extend({ linkKey: linkKey.optional(), id: z.string().regex(/^[0-9a-f]{32}$/), label: z.union([cipher(CIPHER.short), z.enum(["自分用", "招待リンク"])]).default("招待リンク") });
 
 // Whether Anthropic accepts the key: listing models costs nothing. A key it refuses is false; an outage throws.
@@ -355,13 +351,15 @@ export class CloudHost {
       const gone = s ? !g || g.revoked !== null || g.expires <= this.clock() || s.expires <= this.clock() : Boolean(c.left?.includes(digest));
       throw gone ? new Fault(401, "この端末の登録は失効したか、期限が切れました", "seat-gone", "gone") : new Fault(401, "この端末の登録は失効したか、期限が切れました");
     }
-    return { grant: g, member: s, secret: value };
+    return { grant: g, member: s, secret: value, role: s.role ?? g.role };
   }
   // What opens a link's key vouches for the owner's keys it names, so they are the owner seat's as they stand, of this generation.
+  // The seat a link names is one holding the key of this generation, whatever its role, with its keys as they stand: the seat
+  // that takes the key signs those keys, and a replaced key reaches it through that seat's edges (src/trip-keys.ts reachableSeats).
   checkLink(c: Capsule, l: LinkKey) {
     if (l.generation !== c.sealed?.generation) fail(400, "鍵の世代を確認してください");
     const o = c.sessions.find(s => s.id === l.owner.seat);
-    if (c.grants.find(g => g.id === o?.grantId)?.role !== "owner" || o?.seatKey?.x25519 !== l.owner.x25519 || o.seatKey.ed25519 !== l.owner.ed25519) fail(400, "オーナーの鍵を確認してください");
+    if (o?.pending || o?.seatKey?.generation !== l.generation || o.seatKey.x25519 !== l.owner.x25519 || o.seatKey.ed25519 !== l.owner.ed25519) fail(400, "鍵を持つ席の鍵を確認してください");
   }
   idle(s: Session) { return (s.seen ?? this.clock()) + IDLE <= this.clock(); }
   leave(c: Capsule, gone: Session[]) { const added = gone.map(s => s.digest).filter(d => !c.left?.includes(d)); if (added.length) c.left = [...c.left ?? [], ...added].slice(-LEFT); }
@@ -807,10 +805,11 @@ export class CloudHost {
       if (action === "sessions" && req.method === "POST") {
         const v = z.object({ secret: z.string().min(32).max(100) }).strict().parse(input);
         const digest = this.digest(v.secret), grant = c.grants.find(g => timingSafeEqual(Buffer.from(g.digest, "hex"), Buffer.from(digest, "hex")));
+        if (!grant && c.drops?.some(d => timingSafeEqual(Buffer.from(d.digest, "hex"), Buffer.from(digest, "hex")))) fail(409, "このリンクは旅行に参加済みの端末で開いてください。参加には招待リンクが要ります");
         if (!grant || grant.revoked !== null || grant.expires <= this.clock()) fail(401, "招待リンクが無効か期限切れです");
         // Re-opening the link in the browser that already redeemed it is not a new seat.
         const held = this.cookie(req, id), existing = held && c.sessions.find(s => s.grantId === grant.id && s.digest === this.digest(held) && !this.idle(s));
-        if (existing) return Response.json({ role: grant.role }, { headers: { "Set-Cookie": this.setCookie(id, held!, existing.expires) } });
+        if (existing) return Response.json({ role: existing.role ?? grant.role }, { headers: { "Set-Cookie": this.setCookie(id, held!, existing.expires) } });
         if (grant.claimBy <= this.clock()) fail(401, "この招待リンクは受付期限を過ぎました。オーナーに新しいリンクを依頼してください");
         if (grant.claimed >= grant.seats) fail(401, "この招待リンクは定員に達しました。オーナーに新しいリンクを依頼してください");
         const countries = this.env.CAPSULE_CLAIM_COUNTRIES?.split(",").filter(Boolean);
@@ -839,7 +838,7 @@ export class CloudHost {
         if (counter === undefined || !used || !member?.passkey || !grant) fail(401, "この端末の登録は失効したか、期限が切れました");
         const secret = token(); member.passkey.counter = counter; member.digest = this.digest(secret); member.device = deviceLabel(req.headers.get("user-agent")); member.lastUsed = grant.lastUsed = member.seen = this.clock();
         this.record(c, used);
-        response = Response.json({ role: grant.role }, { headers: { "Set-Cookie": this.setCookie(id, secret, member.expires) } });
+        response = Response.json({ role: member.role ?? grant.role }, { headers: { "Set-Cookie": this.setCookie(id, secret, member.expires) } });
       } else if (action === "recover" && req.method === "POST") {
         // Owner lost the bound browser: the IAM-authorized publisher replaces every owner invite. Trip content stays unreadable to it.
         // A creator cannot: this would hand them an owner seat in any trip whose id they know.
@@ -854,18 +853,18 @@ export class CloudHost {
         z.object({ id: z.literal(id), confirm: z.literal(true) }).strict().parse(input);
         response = Response.json({ ok: true }); erase = true;
       } else {
-        const { grant, member, secret: held } = this.session(req, c, id);
+        const { grant, member, secret: held, role } = this.session(req, c, id);
         // Counted only after authentication: counting before lets anyone who knows the id lock every member out (#609).
         // A page of photos reads a few hundred images at once, which the two counters below would refuse: an image read is counted by seat.
         if (req.method === "GET" && /^media\/[a-f0-9]{32}\/(thumb|display)$/.test(action)) await this.rate(`mediaread:${member.id}`, 600);
         else { await this.rate(`capsule:${id}`, 600); await this.rate(`grant:${grant.id}`, 120); }
-        const editor = grant.role === "owner" || grant.role === "editor";
-        const owner = () => { if (grant.role !== "owner") fail(403, "オーナーのみ操作できます"); };
+        const editor = role === "owner" || role === "editor";
+        const owner = () => { if (role !== "owner") fail(403, "オーナーのみ操作できます"); };
         // Hands out invites (canIssue); changes only those it handed out, unless it is the owner.
-        const issuer = () => { if (!canIssue[grant.role].length) fail(403, "オーナー・編集者のみ操作できます"); };
-        const mine = (g: Grant | undefined) => grant.role === "owner" || g?.issuedBy === member.id;
+        const issuer = () => { if (!canIssue[role].length) fail(403, "オーナー・編集者のみ操作できます"); };
+        const mine = (g: Grant | undefined) => role === "owner" || g?.issuedBy === member.id;
         // Revising with a chat is for those who edit the plan by hand; an editor's leaves the settings as they are.
-        const reviser = () => { if (!editor) fail(403, "オーナー・編集者のみ操作できます"); return grant.role !== "owner"; };
+        const reviser = () => { if (!editor) fail(403, "オーナー・編集者のみ操作できます"); return role !== "owner"; };
         // Every member reads every photo's record; which seat uploaded it is told only as whether it was this one.
         const shown = () => (c.media ?? []).map(({ contributor, blob, ...p }) => ({ ...p, mine: contributor === member.id }));
         const media = () => this.env.MEDIA ?? fail(503, "写真の保存先がありません");
@@ -874,7 +873,7 @@ export class CloudHost {
         if (action === "theme.css" && req.method === "GET") return new Response(`:root{--accent:${kit.accent(c.spec)}}`, { headers: { "Content-Type": "text/css" } });
         // The new screen marks its requests (ui=2). An older one cannot draw ciphertext, nor seal a trip: it is asked to reload.
         if (url.searchParams.get("ui") !== "2") throw new Fault(409, "画面を更新してください", "stale-ui");
-        if (this.mustSeal(c) && !(grant.role === "owner" && (req.method === "GET" ? ["", "grants", "seal"] : ["keys", "passkey", "passkey/verify", "signout", "seal", "purge"]).includes(action))) throw new Fault(409, "オーナーがこの旅行を暗号化するまで開けません", "unsealed");
+        if (this.mustSeal(c) && !(role === "owner" && (req.method === "GET" ? ["", "grants", "seal"] : ["keys", "passkey", "passkey/verify", "signout", "seal", "purge"]).includes(action))) throw new Fault(409, "オーナーがこの旅行を暗号化するまで開けません", "unsealed");
         // An image, as the browser sealed it, for any seat of the trip: the answer is not the page's to cache for long, and not shared.
         const image = /^media\/([a-f0-9]{32})\/(thumb|display)$/.exec(action);
         if (image && req.method === "GET") {
@@ -884,10 +883,10 @@ export class CloudHost {
         }
         if (action === "grants" && req.method === "GET") {
           issuer(); const label = (sid: string) => c.sessions.find(s => s.id === sid)?.label ?? "（失効したメンバー）";
-          return Response.json(c.grants.filter(mine).map(({ digest, issuedBy, linkKey, ...safe }) => ({ ...safe, issuedBy: issuedBy ? { id: issuedBy, label: label(issuedBy) } : null, carriesKey: Boolean(c.sealed && linkKey && linkKey.generation === c.sealed.generation), members: c.sessions.filter(s => s.grantId === safe.id).map(s => { const { digest, passkey, privateKey, seatKey, handoff, assistKey, assistWrapped, ...m } = s; return { ...m, passkey: Boolean(passkey), publicKey: seatKey ? { x25519: seatKey.x25519, ed25519: seatKey.ed25519 } : null, self: m.id === member.id, keyed: Boolean(c.sealed) && keyedSeat(c, s) }; }) })));
+          return Response.json(c.grants.filter(mine).map(({ digest, issuedBy, linkKey, ...safe }) => ({ ...safe, issuedBy: issuedBy ? { id: issuedBy, label: label(issuedBy) } : null, carriesKey: Boolean(c.sealed && linkKey && linkKey.generation === c.sealed.generation), members: c.sessions.filter(s => s.grantId === safe.id).map(s => { const { digest, passkey, privateKey, seatKey, handoff, assistKey, assistWrapped, ...m } = s; return { ...m, role: m.role ?? safe.role, passkey: Boolean(passkey), publicKey: seatKey ? { x25519: seatKey.x25519, ed25519: seatKey.ed25519 } : null, self: m.id === member.id, keyed: Boolean(c.sealed) && keyedSeat(c, s) }; }) })));
         }
         // Newest first. The record is not written to by reading it, as with GET grants.
-        if (action === "history" && req.method === "GET") { owner(); return Response.json(c.audit.filter(a => HISTORY.includes(a.event)).reverse().map(({ event, at, role, label, by, device, grant, seat, member }) => ({ event, at, role, label, by, device, grant, seat, member }))); }
+        if (action === "history" && req.method === "GET") { owner(); return Response.json(c.audit.filter(a => HISTORY.includes(a.event)).reverse().map(({ event, at, role, from, label, by, device, grant, seat, member }) => ({ event, at, role, from, label, by, device, grant, seat, member }))); }
         // The step back of a plain trip, for the owner's browser to seal with the rest when it moves the trip (POST seal, spec「5.4 平文の旅行を移す」).
         // Apart from GET "", so that every read of the trip does not carry it.
         if (action === "seal" && req.method === "GET") { owner(); if (c.sealed) fail(409, "旅程はもう暗号化してあります"); if (!kit.sealed) fail(404, "この種類では使えません"); return Response.json({ previous: c.previous ?? null }); }
@@ -910,15 +909,15 @@ export class CloudHost {
         const footprints = () => (c.footprints ?? []).map(p => ({ id: p.id, at: p.at, ...("point" in p ? { point: p.point } : { lat: p.lat, lng: p.lng, accuracy: p.accuracy }), by: p.by, mine: p.seat === member.id, auto: Boolean(p.auto) }));
         // Only a seat that holds the key is told who waits for it; it is any role's to give, so it is not the grants list's.
         const holds = (s: Session) => keyedSeat(c, s);
-        const waiting = () => member.seatKey ? c.sessions.filter(s => !holds(s) && !s.pending && s.id !== member.id).map(s => ({ id: s.id, label: s.label, handoff: s.handoff ?? null })) : [];
+        const waiting = () => member.seatKey ? c.sessions.filter(s => !holds(s) && !s.pending && s.id !== member.id).map(s => ({ id: s.id, label: s.label })) : [];
         // The public values of every seat holding a key, for a browser to walk the edges (src/trip-keys.ts reachableSeats): told
         // only to a seat that holds one, as `waiting` is.
-        const seats = () => c.sessions.filter(s => s.seatKey && !s.pending).map(s => ({ id: s.id, role: c.grants.find(g => g.id === s.grantId)?.role, x25519: s.seatKey!.x25519, ed25519: s.seatKey!.ed25519, edges: s.seatKey!.edges ?? [], ...s.seatKey!.since && { since: s.seatKey!.since }, ...s.seatKey!.linked && { linked: true } }));
+        const seats = () => c.sessions.filter(s => s.seatKey && !s.pending).map(s => ({ id: s.id, role: s.role ?? c.grants.find(g => g.id === s.grantId)?.role, x25519: s.seatKey!.x25519, ed25519: s.seatKey!.ed25519, edges: s.seatKey!.edges ?? [], ...s.seatKey!.since && { since: s.seatKey!.since }, ...s.seatKey!.linked && { linked: true } }));
         // Once the key is replaced, ciphertext of another generation is not written: a member who left holds the older key. One
         // without a generation is not of the trip's form, and is refused by the checks below (400).
         if (c.sealed && write && ["document", "spec", "footprints", "media", "members", "grants", "revise", "undo"].includes(action) && ciphers(input).some(v => /^v1\.\d+\./.test(v) && !v.startsWith(`v1.${c.sealed!.generation}.`))) throw new Fault(409, "旅行の鍵が替わりました。開き直してください", "generation");
         if (action === "" && req.method === "GET") {
-          response = Response.json({ id, spec: c.spec, document: c.document, sealed: c.sealed ?? null, role: grant.role, state, hash: c.hash, passkey: Boolean(member.passkey), ...(c.sealed ? { assistKey: Boolean(member.assistWrapped), assistWrapped: member.assistWrapped ?? null, assistModel: this.env.CAPSULE_ASSIST_MODEL ?? ASSIST_MODEL, updated: c.updated, created: c.created, label: member.label } : { assistKey: Boolean(member.assistKey) }), self: { id: member.id, label: member.label }, private: c.private?.[member.id] ?? [], privateKey: member.privateKey?.wrapped ?? null, seatKey: member.seatKey ?? null, keyed: c.sessions.some(s => s.seatKey), handoff: member.handoff ?? null, rekey: grant.role === "owner" && c.sealed && c.departed?.length ? c.departed.some(d => d.why !== "owner") ? "auto" : "ask" : null, waiting: waiting(), seats: member.seatKey ? seats() : [], footprints: footprints(), media: shown(), photos: this.photosOn, mustSeal: this.mustSeal(c) }, { headers: { ETag: `"${c.document.revision}"`, "Set-Cookie": this.setCookie(id, held, member.expires) } });
+          response = Response.json({ id, spec: c.spec, document: c.document, sealed: c.sealed ?? null, role: role, state, hash: c.hash, passkey: Boolean(member.passkey), ...(c.sealed ? { assistKey: Boolean(member.assistWrapped), assistWrapped: member.assistWrapped ?? null, assistModel: this.env.CAPSULE_ASSIST_MODEL ?? ASSIST_MODEL, updated: c.updated, created: c.created, label: member.label } : { assistKey: Boolean(member.assistKey) }), self: { id: member.id, label: member.label }, private: c.private?.[member.id] ?? [], privateKey: member.privateKey?.wrapped ?? null, seatKey: member.seatKey ?? null, keyed: c.sessions.some(s => s.seatKey), rekey: role === "owner" && c.sealed && c.departed?.length ? c.departed.some(d => d.why !== "owner") ? "auto" : "ask" : null, waiting: waiting(), seats: member.seatKey ? seats() : [], footprints: footprints(), media: shown(), photos: this.photosOn, mustSeal: this.mustSeal(c) }, { headers: { ETag: `"${c.document.revision}"`, "Set-Cookie": this.setCookie(id, held, member.expires) } });
           // Reading is what keeps a session alive, recorded at most once a day so that reading the trip stays free of writes.
           if (member.seen !== undefined && member.seen + SEEN_EVERY > this.clock() && !expired) return response;
           member.seen = this.clock();
@@ -931,9 +930,9 @@ export class CloudHost {
           issuer(); this.verified(member); if (state === "frozen") fail(403, "共有終了後はリンクを発行できません");
           const v = sealedGrantInput.parse(input), grantId = v.id;
           if (c.grants.some(g => g.id === grantId)) fail(400, "招待を確認してください");
-          if (!canIssue[grant.role].includes(v.role)) fail(403, "この権限の招待は出せません");
+          if (!canIssue[role].includes(v.role)) fail(403, "この権限の招待は出せません");
           // Only the owner reads the codes, so only the owner asks for approval. A rotated invite keeps the one it replaces.
-          if (v.approval === "owner" && grant.role !== "owner") fail(403, "承認つきの招待を出せるのはオーナーだけです");
+          if (v.approval === "owner" && role !== "owner") fail(403, "承認つきの招待を出せるのはオーナーだけです");
           const approval = v.approval ?? (v.rotate ? c.grants.find(g => g.id === v.rotate)?.approval : undefined) ?? "auto";
           if (v.role === "owner" && approval === "owner") fail(400, "オーナー招待は承認を使えません");
           if (v.role === "owner" && v.seats !== 1) fail(400, "オーナー招待は1席です");
@@ -952,10 +951,10 @@ export class CloudHost {
           if (v.member) {
             // The seat stays consumed: a leaked link must not become redeemable again by removing its member.
             const m = c.sessions.find(s => s.id === v.member); if (!m) fail(404, "メンバーが見つかりません");
-            const of = c.grants.find(g => g.id === m.grantId), role = of?.role;
+            const of = c.grants.find(g => g.id === m.grantId);
             if (!mine(of)) fail(403, "失効できるのはオーナーと、この招待を出した人だけです");
-            if (role === "owner") fail(400, "オーナーは交換を使ってください"); this.depart(c, [m], "revoke"); c.sessions = c.sessions.filter(s => s !== m);
-            entry = { event: "revoke-member", role, ...named({ grant: m.grantId, member: m.id, seat: member.id }, { label: m.label, by: member.label }), device: member.device };
+            if (of?.role === "owner") fail(400, "オーナーは交換を使ってください"); this.depart(c, [m], "revoke"); c.sessions = c.sessions.filter(s => s !== m);
+            entry = { event: "revoke-member", role: m.role ?? of?.role, ...named({ grant: m.grantId, member: m.id, seat: member.id }, { label: m.label, by: member.label }), device: member.device };
           } else {
             const target = c.grants.find(g => g.id === v.id);
             if (!target) fail(404, "リンクが見つかりません"); if (!mine(target)) fail(403, "失効できるのはオーナーと、この招待を出した人だけです"); if (target.role === "owner") fail(400, "オーナーリンクは交換を使ってください"); target.revoked = this.clock(); this.depart(c, c.sessions.filter(s => s.grantId === target.id), "rotate"); c.sessions = c.sessions.filter(s => s.grantId !== target.id);
@@ -966,7 +965,7 @@ export class CloudHost {
           owner(); this.verified(member); const v = z.object({ member: z.string(), approve: z.boolean(), confirm: z.literal(true) }).strict().parse(input);
           const m = c.sessions.find(s => s.id === v.member && s.pending); if (!m) fail(404, "承認待ちのメンバーが見つかりません");
           if (v.approve) { delete m.pending; delete m.code; } else c.sessions = c.sessions.filter(s => s !== m);
-          entry = { event: v.approve ? "approve" : "reject", role: c.grants.find(g => g.id === m.grantId)?.role, ...named({ grant: m.grantId, member: m.id, seat: member.id }, { label: m.label, by: member.label }), device: member.device };
+          entry = { event: v.approve ? "approve" : "reject", role: m.role ?? c.grants.find(g => g.id === m.grantId)?.role, ...named({ grant: m.grantId, member: m.id, seat: member.id }, { label: m.label, by: member.label }), device: member.device };
         } else if (action === "passkey" && req.method === "POST") {
           // Optional: a member may add one passkey to their own seat. Replacing it needs `check`, an assertion by the one it replaces
           // in this same request (a check made for another action does not count), so a cookie alone cannot swap in another.
@@ -1054,9 +1053,12 @@ export class CloudHost {
             // be alive, of this generation, past its seats and its time to take them too. A seat without a key (one taken before
             // the trip was sealed, a browser that lost its storage) comes this way. An owner seat's keys are what other seats
             // trust and what its passkey wraps: they are replaced only as `seat` replaces them.
-            if (grant.role === "owner" && member.seatKey) fail(409, "オーナーの席の鍵はリンクでは受け取れません");
-            const digest = this.digest(op.secret), by = c.grants.find(g => timingSafeEqual(Buffer.from(g.digest, "hex"), Buffer.from(digest, "hex")));
-            if (!by || by.revoked !== null || by.expires <= this.clock() || !by.linkKey || by.linkKey.generation !== c.sealed?.generation) fail(409, "このリンクでは鍵を受け取れません。オーナーに新しいリンクを頼んでください");
+            // An owner seat left out of a replaced key (another owner seat replaced it) takes it again by a link, with its passkey checked.
+            if (role === "owner" && member.seatKey) { if (holds(member)) fail(409, "オーナーの席の鍵はリンクでは受け取れません"); this.verified(member); }
+            const digest = this.digest(op.secret), same = (d: string) => timingSafeEqual(Buffer.from(d, "hex"), Buffer.from(digest, "hex"));
+            const invite = c.grants.find(g => same(g.digest)), drop = invite ? undefined : c.drops?.find(d => same(d.digest));
+            const by = invite ? (invite.revoked === null && invite.expires > this.clock() ? invite : undefined) : drop && drop.expires > this.clock() ? drop : undefined;
+            if (!by || !by.linkKey || by.linkKey.generation !== c.sealed?.generation) fail(409, "このリンクでは鍵を受け取れません。鍵を持つメンバーに新しいリンクを頼んでください");
             if (op.type === "link") response = Response.json({ ok: true, linkKey: by.linkKey });
             else {
               if (op.generation !== by.linkKey.generation) fail(400, "鍵の世代を確認してください");
@@ -1064,49 +1066,24 @@ export class CloudHost {
               member.seatKey = { ...pub, linked: true }; delete member.handoff;
               response = Response.json({ ok: true, seatKey: member.seatKey });
             }
-          } else if (op.type !== "seat") {
-            // The handoff (spec「5.1 旅行の鍵と受け渡し」). The host checks who may write what and that the values have the form of keys; the
-            // commitment and the codes are the two screens' to check, so none is computed here.
-            // The waiting seat takes back its own attempt (`abandon` with no seat, or its own); every other action names another seat.
-            const self = op.type === "abandon" && (!op.seat || op.seat === member.id);
-            const other = op.type === "wait" || op.type === "reveal" ? undefined : self ? member : c.sessions.find(s => s.id === op.seat);
-            if (op.type !== "wait" && op.type !== "reveal" && (!other || (other.id === member.id && !self))) fail(404, "メンバーが見つかりません");
-            if (op.type === "wait") {
-              if (holds(member)) fail(409, "旅行の鍵はもうあります");
-              if (!c.sessions.some(s => s.seatKey)) fail(409, "旅行の鍵がまだありません");
-              member.handoff = { attempt: uid(), commitment: op.commitment };
-            } else if (op.type === "reveal") {
-              const h = member.handoff;
-              if (!h || h.attempt !== op.attempt) fail(409, "やり直しになりました");
-              if (!h.giver) fail(409, "渡すメンバーの値がまだありません");
-              if (h.reveal) fail(409, "もう置いてあります");
-              h.reveal = { x25519: op.x25519, ed25519: op.ed25519, nonce: op.nonce };
-            } else if (op.type === "edge") {
-              if (!member.seatKey || !other!.seatKey) fail(409, "鍵のある席どうしだけ結べます");
-              const edges = (member.seatKey.edges ?? []).filter(e => e.seat !== op.seat);
-              if (edges.length >= EDGES) fail(400, `辺は${EDGES}件までです`);
-              member.seatKey.edges = [...edges, { seat: op.seat, signature: op.signature }];
-            } else if (op.type === "give") {
-              if (!holds(member)) fail(403, "旅行の鍵を持つメンバーだけが渡せます");
-              const h = other!.handoff;
-              if (holds(other!) || other!.pending) fail(409, "このメンバーは鍵を待っていません");
-              if (!h || h.attempt !== op.attempt) fail(409, "相手がやり直しました");
-              if (h.giver) fail(409, "ほかのメンバーが渡しています");
-              h.giver = { seat: member.id, ephemeral: op.ephemeral, x25519: member.seatKey!.x25519, ed25519: member.seatKey!.ed25519 };
-            } else if (op.type === "wrap") {
-              const h = other!.handoff;
-              if (!holds(member)) fail(403, "旅行の鍵を持つメンバーだけが渡せます");
-              if (!h || h.attempt !== op.attempt || h.giver?.seat !== member.id) fail(409, "相手がやり直しました");
-              if (!h.reveal) fail(409, "相手の値がまだありません");
-              other!.seatKey = { x25519: h.reveal.x25519, ed25519: h.reveal.ed25519, generation: member.seatKey!.generation, wrapped: op.wrapped, ephemeral: h.giver.ephemeral };
-              delete other!.handoff;
-            } else {
-              const h = other!.handoff;
-              if (h && h.attempt === op.attempt && (other!.id === member.id || h.giver?.seat === member.id)) delete other!.handoff;
-              else if (!h || h.attempt !== op.attempt) { /* already gone or already redone: nothing to take back */ }
-              else fail(403, "この試みを取りやめられるのは、待っている人と渡している人だけです");
-            }
-            response = Response.json({ ok: true, seatKey: member.seatKey ?? null, handoff: member.handoff ?? null });
+          } else if (op.type === "drop") {
+            // Any seat holding the key of this generation makes one; it takes no seat, so it is no invite and needs no check.
+            if (!c.sealed || member.seatKey?.generation !== c.sealed.generation) fail(403, "旅行の鍵を持つメンバーだけが作れます");
+            if (state === "frozen") fail(403, "共有終了後は作れません");
+            this.checkLink(c, op.linkKey);
+            if (op.linkKey.owner.seat !== member.id) fail(400, "自分の席の鍵を名指してください");
+            const secret = token();
+            c.drops = [...(c.drops ?? []), { digest: this.digest(secret), linkKey: op.linkKey, expires: +new Date(c.spec.lifecycle.purgeAt), by: member.id }].slice(-DROPS);
+            response = Response.json({ ok: true, secret });
+          } else if (op.type === "edge") {
+            // A seat holding the key signs another's keys (the one a link named, spec「5.1 旅行の鍵と受け渡し」): the edges a key replaced is taken along.
+            const other = c.sessions.find(s => s.id === op.seat);
+            if (!other || other.id === member.id) fail(404, "メンバーが見つかりません");
+            if (!member.seatKey || !other.seatKey) fail(409, "鍵のある席どうしだけ結べます");
+            const edges = (member.seatKey.edges ?? []).filter(e => e.seat !== op.seat);
+            if (edges.length >= EDGES) fail(400, `辺は${EDGES}件までです`);
+            member.seatKey.edges = [...edges, { seat: op.seat, signature: op.signature }];
+            response = Response.json({ ok: true, seatKey: member.seatKey });
           } else {
           if (!member.seatKey) {
             owner();
@@ -1125,7 +1102,7 @@ export class CloudHost {
           // seat that left it, or by an owner or editor, until sharing ends.
           const op = sealedFootprintOperations.parse(input), list = c.footprints ?? [];
           if (op.type === "add") {
-            if (grant.role === "viewer") fail(403, "閲覧者は足あとを残せません");
+            if (role === "viewer") fail(403, "閲覧者は足あとを残せません");
             const period = kit.period?.(c.spec) ?? fail(404, "この種類では使えません"), today = localDay(this.clock(), period.timezone);
             if (state !== "active" || today < period.startsOn || today > period.endsOn) fail(403, "足あとは旅行期間中だけ残せます");
             if (list.length >= FOOTPRINTS) fail(400, `足あとは1旅行${FOOTPRINTS}件までです`);
@@ -1146,7 +1123,7 @@ export class CloudHost {
           // A photo is sealed by the browser, so it only goes into a trip that has a key: no If-Match and no new revision, as with a
           // footprint. Left by all but a viewer, before and after the trip, until sharing ends.
           if (!this.photosOn) fail(403, "写真は今は使えません");
-          if (grant.role === "viewer") fail(403, "閲覧者は写真を上げられません");
+          if (role === "viewer") fail(403, "閲覧者は写真を上げられません");
           if (state === "frozen") fail(403, "共有終了後は変更できません");
           const v = photoInput.parse(input), list = c.media ?? [];
           if (list.length >= PHOTO_LIMITS.count) fail(413, `この旅行の写真は ${PHOTO_LIMITS.count} 枚までです`);
@@ -1182,9 +1159,19 @@ export class CloudHost {
             response = Response.json({ photo: shown().find(p => p.id === photo.id) });
           }
         } else if (action === "members" && req.method === "PATCH") {
-          // A sealed trip's names arrive sealed against the seat (src/trip-keys.ts sealName).
-          owner(); const v = z.object({ id: z.string(), label: cipher(CIPHER.short) }).strict().parse(input), m = c.sessions.find(s => s.id === v.id);
-          if (!m) fail(404, "メンバーが見つかりません"); m.label = v.label;
+          // A sealed trip's names arrive sealed against the seat (src/trip-keys.ts sealName). A role is the member's own from then on, in
+          // place of the invite's: the seat, its cookie, passkey, key and entries stay, and so do the invite and its other seats. Not to or
+          // from an owner, whose seat is handed over by rotating its invite.
+          owner(); const v = z.union([z.object({ id: z.string(), label: cipher(CIPHER.short) }).strict(), z.object({ id: z.string(), role: z.enum(["editor", "participant", "viewer"]), confirm: z.literal(true) }).strict()]).parse(input), m = c.sessions.find(s => s.id === v.id);
+          if ("role" in v) this.verified(member);
+          if (!m) fail(404, "メンバーが見つかりません");
+          if ("label" in v) m.label = v.label;
+          else {
+            const of = c.grants.find(g => g.id === m.grantId) ?? fail(404, "メンバーが見つかりません"), from = m.role ?? of.role;
+            if (of.role === "owner") fail(400, "オーナーの席は変えられません"); if (m.pending) fail(400, "承認待ちのメンバーは変えられません"); if (from === v.role) fail(400, "すでにその権限です");
+            if (v.role === of.role) delete m.role; else m.role = v.role;
+            entry = { event: "role", role: v.role, from, ...named({ grant: m.grantId, member: m.id, seat: member.id }, { label: m.label, by: member.label }), device: member.device };
+          }
         } else if (action === "freeze" && req.method === "POST") {
           owner(); this.verified(member); z.object({ confirm: z.literal(true) }).strict().parse(input); this.match(req, c); c.forced = "frozen";
           c.grants.forEach(g => { if (g.role !== "owner") g.revoked = this.clock(); }); c.sessions = c.sessions.filter(s => c.grants.some(g => g.id === s.grantId && g.role === "owner"));
@@ -1264,6 +1251,7 @@ export class CloudHost {
           c.sealed = { generation }; delete c.departed; delete c.previous;
           // A link left unused holds the old key: whoever waits gets a new link, and a seat that left cannot use its own.
           for (const g of c.grants) delete g.linkKey;
+          delete c.drops;
           // Except a link issued just now, as the replaced invite it follows set this replacing going: wrapped anew by the owner's browser.
           for (const l of v.links) { const g = c.grants.find(x => x.id === l.grant) ?? fail(400, "招待を確認してください"); this.checkLink(c, l.key); g.linkKey = l.key; }
           response = Response.json({ revision: c.document.revision });
@@ -1296,8 +1284,8 @@ export class CloudHost {
           this.respec(c, next.spec); c.document = { ...next.document, revision: c.document.revision + 1 }; delete c.previous;
           response = Response.json({ revision: c.document.revision });
         } else if (action === "document" && req.method === "PATCH") {
-          this.match(req, c); if (grant.role === "viewer" || state === "frozen") fail(403, "読み取り専用です");
-          const note = kit.apply({ spec: c.spec, document: c.document, created: c.created, sealed: Boolean(c.sealed), role: grant.role, state, seat: member.id, now: this.clock() }, input);
+          this.match(req, c); if (role === "viewer" || state === "frozen") fail(403, "読み取り専用です");
+          const note = kit.apply({ spec: c.spec, document: c.document, created: c.created, sealed: Boolean(c.sealed), role: role, state, seat: member.id, now: this.clock() }, input);
           response = Response.json({ revision: c.document.revision, ...note });
         } else fail(404, "操作が見つかりません");
       }

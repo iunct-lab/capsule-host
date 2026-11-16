@@ -18,11 +18,11 @@ async function login(url: string) {
   assert.match(r.headers.get("Set-Cookie")!, /HttpOnly; SameSite=Strict/); return r.headers.get("Set-Cookie")!.split(";")[0]!;
 }
 // The owner's important actions need a passkey check in the last five minutes; registering the first passkey counts as one.
-const device = fakeAuthenticator({ origin }); let registered = false;
+const device = fakeAuthenticator({ origin }); let registered = false, checkedAt = 0;
 async function stepUp() {
   const { challenge } = await (await request(api("/passkey/challenge"), "POST", {}, "")).json();
   const r = registered ? await request(api("/passkey/verify"), "POST", { challenge, id: device.id, ...device.assert(challenge) }) : await request(api("/passkey"), "POST", { challenge, ...device.register(challenge) });
-  assert.equal(r.status, 200); registered = true;
+  assert.equal(r.status, 200); registered = true; checkedAt = Date.now();
 }
 // The trip sealed by its owner's browser right after the seat is taken, as every trip is (docs/design/trip-e2e.md §5, the third
 // step of handing out): then `request` seals what is written to the trip and opens what is read from it, as a browser holding
@@ -32,7 +32,10 @@ async function sealAfterClaim() {
   const plain = request, base = api(""), under: CapsuleRequest = (p = "", m = "GET", b?, c = owner, r = 1, s = origin) => plain(base + p, m, b, c, r, s);
   const seal = await sealedTrip(under, capsuleId, owner), sealed = sealedRequests(under, capsuleId, seal);
   // A member reads and writes once its seat holds the trip key, handed from the owner's (the codes compared by the two screens).
-  receive = async (cookie: string) => { await handKey(under, capsuleId, seal.owner, seal.trip, cookie); return cookie; };
+  // The giver's passkey check is this script's own (its authenticator, not the fixture's), and made again only once the last one
+  // is about to run out: every check counts against the address's login allowance.
+  const held = async () => { if (Date.now() - checkedAt > 4 * 60_000) await stepUp(); };
+  receive = async (cookie: string) => { await handKey(under, capsuleId, seal.owner, seal.trip, cookie, held); return cookie; };
   request = (path, method = "GET", body?, cookie = owner, revision = 1, source = origin) => path === base || path.startsWith(base + "/") ? sealed(path.slice(base.length), method, body, cookie, revision, source) : plain(path, method, body, cookie, revision, source);
 }
 try {
@@ -73,7 +76,7 @@ try {
   const editorInvite = await (await request(api("/grants"), "POST", { ...invite, role: "editor", label: "HTTP確認用（編集）" })).json(), editor = await receive(await login(editorInvite.url));
   // The owner reads who issued and took which invite, newest first, by the invite's id (a sealed trip's history holds no name); nobody else reads it.
   const history = await request(api("/history")); assert.equal(history.status, 200);
-  assert.deepEqual((await history.json()).slice(0, 2).map((a: any) => [a.event, a.role, a.grant]), [["sessions", "editor", editorInvite.grantId], ["grants", "editor", editorInvite.grantId]]);
+  assert.deepEqual((await history.json()).filter((a: any) => a.grant === editorInvite.grantId).map((a: any) => [a.event, a.role, a.grant]), [["sessions", "editor", editorInvite.grantId], ["grants", "editor", editorInvite.grantId]]);
   assert.equal((await request(api("/history"), "GET", undefined, editor)).status, 403);
   // An editor hands out viewer invites only, after its own passkey check (its first passkey counts as one), lists and revokes
   // its own; the owner's list says who handed each out (#107).
@@ -88,6 +91,18 @@ try {
   assert.equal((await request(api("/revoke"), "POST", { id: h.grantId, confirm: true }, participant)).status, 403);
   assert.equal((await request(api("/revoke"), "POST", { id: h.grantId, confirm: true }, editor)).status, 200);
   assert.equal((await request(api("/document"), "PATCH", { type: "notes", body: "unauthorized" }, participant)).status, 403);
+  // The owner changes a member's role where it sits, with no new invite: the same cookie lists invites as an editor does, is
+  // read-only as a viewer, and is a participant again (the tick below). Nobody but the owner changes a role.
+  const participantSeat = ownerList.find((x: any) => x.id === g.grantId).members[0].id, setRole = (role: string, cookie?: string) => request(api("/members"), "PATCH", { id: participantSeat, role, confirm: true }, cookie);
+  assert.equal((await setRole("editor", participant)).status, 403); assert.equal((await setRole("viewer", editor)).status, 403);
+  assert.equal((await request(api("/grants"), "GET", undefined, participant)).status, 403);
+  assert.equal((await setRole("editor")).status, 200);
+  assert.equal((await (await request(api(""), "GET", undefined, participant)).json()).role, "editor");
+  assert.equal((await request(api("/grants"), "GET", undefined, participant)).status, 200);
+  assert.equal((await setRole("viewer")).status, 200);
+  assert.equal((await request(api("/document"), "PATCH", { type: "check", id: "c3", done: true }, participant)).status, 403);
+  assert.equal((await setRole("participant")).status, 200);
+  assert.deepEqual((await (await request(api("/history"))).json()).slice(0, 3).map((a: any) => [a.event, a.from, a.role, a.member]), [["role", "viewer", "participant", participantSeat], ["role", "editor", "viewer", participantSeat], ["role", "participant", "editor", participantSeat]]);
   // The 準備 list, the 費用メモ and the 候補・相談 posts are changed by the owner and editors only (refused before the post is
   // looked for); a participant may still tick (below).
   for (const op of [{ type: "checklist", checklist: [] }, { type: "budget", budget: [] }, { type: "rewrite", list: "suggestions", id: "x", body: "x" }, { type: "remove", list: "comments", id: "x" }]) assert.equal((await request(api("/document"), "PATCH", op, participant)).status, 403);

@@ -32,10 +32,8 @@ const tripAad = (capsuleId: string, generation: number) => text(`${capsuleId}/${
 
 // The trip key for one seat: a throwaway X25519 pair, ECDH with the seat's public key, HKDF, AES-GCM. The throwaway
 // private key is not kept, so only the seat's private key opens it.
-// A handoff (spec「5.1 旅行の鍵と受け渡し」) passes its own throwaway pair (newHandoffKeys), whose public half the member's screen has already
-// confirmed with the codes; without one a fresh pair is made as before.
-export async function wrapTripKey(trip: CryptoKey, seatX25519: string, capsuleId: string, generation: number, ephemeralPair?: CryptoKeyPair): Promise<{ wrapped: string; ephemeral: string }> {
-  const eph = ephemeralPair ?? await crypto.subtle.generateKey("X25519", false, ["deriveBits"]) as CryptoKeyPair;
+export async function wrapTripKey(trip: CryptoKey, seatX25519: string, capsuleId: string, generation: number): Promise<{ wrapped: string; ephemeral: string }> {
+  const eph = await crypto.subtle.generateKey("X25519", false, ["deriveBits"]) as CryptoKeyPair;
   const pub = await crypto.subtle.importKey("raw", unb64(seatX25519), "X25519", false, []);
   const shared = await crypto.subtle.deriveBits({ name: "X25519", public: pub }, eph.privateKey, 256);
   const iv = crypto.getRandomValues(new Uint8Array(12));
@@ -85,49 +83,9 @@ export async function unwrapSeatSecret(wrapped: SeatPublic, prf: BufferSource, c
   return { x25519: await one(wrapped.x25519, "x25519", "X25519", ["deriveBits"]), ed25519: await one(wrapped.ed25519, "ed25519", "Ed25519", ["sign"]) };
 }
 
-// The confirmation-code handoff (docs/ephemeral-trip-capsule.md「5.1 旅行の鍵と受け渡し」). Pure functions only: the screen keeps the values it
-// saw (never re-reads them from the host) and the host calls none of these, so it never computes or holds a code.
 const raw = (b64url: string) => unb64(b64url);
-const concat = (...parts: Uint8Array[]) => {
-  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
-  let at = 0;
-  for (const p of parts) { out.set(p, at); at += p.length; }
-  return out;
-};
-const sha256 = async (data: BufferSource) => new Uint8Array(await crypto.subtle.digest("SHA-256", data));
 
-// Step 1: a new random nonce every attempt, so a failed attempt's values tell the host nothing about the next one.
-const commitHash = async (seat: SeatPublic, nonce: string, capsuleId: string) =>
-  b64(await sha256(concat(text(`capsule handoff commit v1/${capsuleId}`), raw(seat.x25519), raw(seat.ed25519), raw(nonce))));
-export async function newAttempt(seat: SeatPublic, capsuleId: string): Promise<{ nonce: string; commitment: string }> {
-  const nonce = b64(crypto.getRandomValues(new Uint8Array(16)));
-  return { nonce, commitment: await commitHash(seat, nonce, capsuleId) };
-}
-// Step 3: the giver's screen checks the member's values against the commitment it read before showing its own.
-export async function matchesCommitment(commitment: string, seat: SeatPublic, nonce: string, capsuleId: string): Promise<boolean> {
-  try { return (await commitHash(seat, nonce, capsuleId)) === commitment; } catch { return false; }
-}
-
-// Step 4: two 6-digit codes from different parts of one hash over every public value of the attempt. A host that swaps
-// any of them makes the two screens show different codes.
-export async function confirmationCodes(a: {
-  capsuleId: string;
-  giver: { ephemeral: string; x25519: string; ed25519: string };
-  member: { x25519: string; ed25519: string; nonce: string };
-}): Promise<{ member: string; giver: string }> {
-  const h = await sha256(concat(text(`capsule handoff codes v1/${a.capsuleId}`), raw(a.giver.ephemeral), raw(a.giver.x25519), raw(a.giver.ed25519),
-    raw(a.member.x25519), raw(a.member.ed25519), raw(a.member.nonce)));
-  const code = (at: number) => String(new DataView(h.buffer).getUint32(at, false) % 1_000_000).padStart(6, "0");
-  return { member: code(0), giver: code(4) };
-}
-
-// Step 2: the giver's throwaway pair. The private half cannot be taken out of the browser.
-export async function newHandoffKeys(): Promise<{ pair: CryptoKeyPair; ephemeral: string }> {
-  const pair = await crypto.subtle.generateKey("X25519", false, ["deriveBits"]) as CryptoKeyPair;
-  return { pair, ephemeral: b64(await crypto.subtle.exportKey("raw", pair.publicKey)) };
-}
-
-// The edge (spec「5.1 旅行の鍵と受け渡し」): this seat's signature over another seat's confirmed public keys.
+// The edge (spec「5.1 旅行の鍵と受け渡し」): this seat's signature over the keys a link named (the seat that made it).
 type EdgeTarget = { seat: string; x25519: string; ed25519: string };
 const edgeText = (o: EdgeTarget, capsuleId: string) => text(`capsule edge v1/${capsuleId}/${o.seat}/${o.x25519}/${o.ed25519}`);
 export async function signEdge(ed25519Private: CryptoKey, other: EdgeTarget, capsuleId: string): Promise<string> {

@@ -2,7 +2,7 @@ import { describe, expect, spyOn, test } from "bun:test";
 import { open, seal } from "./private-entries";
 import { testTrip } from "./test-fixture";
 import { sealedOperationSchema, type Document } from "./schema";
-import { openPhotoImage, openPhotoLocation, sealPhoto, confirmationCodes, openField, openName, openPoint, openTrip, sealField, sealName, sealPoint, resealTrip, sealOperation, sealTrip, sealMove, matchesCommitment, newAttempt, newHandoffKeys, newSeatKeys, newTripKey, signEdge, verifyEdge, seatPublic, unwrapSeatSecret, unwrapTripKey, wrapSeatSecret, wrapTripKey, acceptRekey, reachableSeats, resealAll, signRekey, signSuccession, type KeyedSeat, type SeatKeys } from "./trip-keys";
+import { openPhotoImage, openPhotoLocation, sealPhoto, openField, openName, openPoint, openTrip, sealField, sealName, sealPoint, resealTrip, sealOperation, sealTrip, sealMove, newSeatKeys, newTripKey, signEdge, verifyEdge, seatPublic, unwrapSeatSecret, unwrapTripKey, wrapSeatSecret, wrapTripKey, acceptRekey, reachableSeats, resealAll, signRekey, signSuccession, type KeyedSeat, type SeatKeys } from "./trip-keys";
 
 const prf = () => crypto.getRandomValues(new Uint8Array(32));
 const shape = /^v1\.[A-Za-z0-9_-]+$/;
@@ -49,65 +49,8 @@ describe("trip keys", () => {
   });
 });
 
-describe("確認コードの受け渡し（spec「5.1 旅行の鍵と受け渡し」）", () => {
+describe("辺（spec「5.1 旅行の鍵と受け渡し」）", () => {
   const cap = "trip-a";
-  const parties = async () => {
-    const giverSeat = await seatPublic(await newSeatKeys()), memberSeat = await seatPublic(await newSeatKeys());
-    const { ephemeral } = await newHandoffKeys();
-    const attempt = await newAttempt(memberSeat, cap);
-    return { giver: { ephemeral, ...giverSeat }, member: { ...memberSeat, nonce: attempt.nonce }, attempt, memberSeat };
-  };
-  test("確認コード: 同じ入力から同じ 6 桁 2 つ、ハッシュの別の部分から", async () => {
-    const p = await parties();
-    const a = await confirmationCodes({ capsuleId: cap, giver: p.giver, member: p.member });
-    expect(await confirmationCodes({ capsuleId: cap, giver: p.giver, member: p.member })).toEqual(a);
-    expect(a.member).toMatch(/^\d{6}$/); expect(a.giver).toMatch(/^\d{6}$/);
-    const h = Buffer.from(await crypto.subtle.digest("SHA-256", Buffer.concat([
-      Buffer.from(`capsule handoff codes v1/${cap}`), ...[p.giver.ephemeral, p.giver.x25519, p.giver.ed25519, p.member.x25519, p.member.ed25519, p.member.nonce].map((v) => Buffer.from(v, "base64url")),
-    ])));
-    expect(a.member).toBe(String(h.readUInt32BE(0) % 1_000_000).padStart(6, "0"));
-    expect(a.giver).toBe(String(h.readUInt32BE(4) % 1_000_000).padStart(6, "0"));
-  });
-  test("確認コード: 入力を固定すると、2 つは違う値になる", async () => {
-    const key = (n: number) => Buffer.alloc(32, n).toString("base64url");
-    const fixed = { capsuleId: cap, giver: { ephemeral: key(1), x25519: key(2), ed25519: key(3) }, member: { x25519: key(4), ed25519: key(5), nonce: Buffer.alloc(16, 6).toString("base64url") } };
-    const codes = await confirmationCodes(fixed);
-    expect(codes).toEqual(await confirmationCodes(fixed));
-    expect(codes.member).not.toBe(codes.giver);
-  });
-  test("コミットメント: 試みごとに違い、同じ値でだけ合う", async () => {
-    const p = await parties();
-    const again = await newAttempt(p.memberSeat, cap);
-    expect(again.nonce).not.toBe(p.attempt.nonce);
-    expect(again.commitment).not.toBe(p.attempt.commitment);
-    expect(Buffer.from(p.attempt.nonce, "base64url").length).toBe(16);
-    expect(await matchesCommitment(p.attempt.commitment, p.memberSeat, p.attempt.nonce, cap)).toBe(true);
-    expect(await matchesCommitment(p.attempt.commitment, p.memberSeat, p.attempt.nonce, "trip-b")).toBe(false);
-  });
-  test("すり替え: 公開鍵を替えるとコミットメントもコードも合わない", async () => {
-    const p = await parties();
-    const other = await seatPublic(await newSeatKeys());
-    expect(await matchesCommitment(p.attempt.commitment, { ...p.memberSeat, x25519: other.x25519 }, p.attempt.nonce, cap)).toBe(false);
-    expect(await matchesCommitment(p.attempt.commitment, { ...p.memberSeat, ed25519: other.ed25519 }, p.attempt.nonce, cap)).toBe(false);
-    const orig = await confirmationCodes({ capsuleId: cap, giver: p.giver, member: p.member });
-    for (const swapped of [
-      { giver: p.giver, member: { ...p.member, x25519: other.x25519 } },
-      { giver: p.giver, member: { ...p.member, ed25519: other.ed25519 } },
-      { giver: { ...p.giver, ephemeral: (await newHandoffKeys()).ephemeral }, member: p.member },
-      { giver: { ...p.giver, x25519: other.x25519 }, member: p.member },
-    ]) {
-      const c = await confirmationCodes({ capsuleId: cap, ...swapped });
-      expect(c.member).not.toBe(orig.member); expect(c.giver).not.toBe(orig.giver);
-    }
-  });
-  test("使い捨ての鍵で包んだ旅行の鍵を、席の秘密鍵と ephemeral で開ける", async () => {
-    const seat = await newSeatKeys(), trip = await newTripKey(), h = await newHandoffKeys();
-    const { wrapped, ephemeral } = await wrapTripKey(trip, (await seatPublic(seat)).x25519, cap, 1, h.pair);
-    expect(ephemeral).toBe(h.ephemeral);
-    const opened = await unwrapTripKey(wrapped, ephemeral, seat.x25519.privateKey, cap, 1);
-    expect(await open(opened, await seal(trip, "鍵", "a"), "a")).toBe("鍵");
-    await expect(crypto.subtle.exportKey("pkcs8", h.pair.privateKey)).rejects.toThrow();
-  });
   test("辺: 署名 → 確かめる。別のカプセル・席・公開鍵では偽", async () => {
     const mine = await newSeatKeys(), mePub = await seatPublic(mine), other = { seat: "s2", ...(await seatPublic(await newSeatKeys())) };
     const sig = await signEdge(mine.ed25519.privateKey, other, cap);

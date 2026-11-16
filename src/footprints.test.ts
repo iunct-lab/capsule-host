@@ -72,8 +72,8 @@ test("spotsOf makes one spot of points at the same place to 4 decimals, in the o
 
 test("auto: due with no point before, after 15 minutes or 300 m, not at 14 min 59 s and 299 m", () => {
   // Along a meridian, so the distance in metres is exact enough: 1 m north is 1 / 6371000 rad.
-  const at = "2026-10-10T09:00:00+09:00", t = Date.parse(at), last = { at, lat: 35, lng: 135 };
-  const north = (m: number) => ({ lat: 35 + m / 6371000 * 180 / Math.PI, lng: 135 });
+  const at = "2026-10-10T09:00:00+09:00", t = Date.parse(at), last = { at, lat: 35, lng: 135, accuracy: 0 };
+  const north = (m: number, accuracy = 0) => ({ lat: 35 + m / 6371000 * 180 / Math.PI, lng: 135, accuracy });
   expect(AUTO_FOOTPRINT).toEqual({ everyMs: 15 * 60_000, metres: 300 });
   expect(autoDue(undefined, t, north(0))).toBe(true);
   expect(autoDue(last, t + 14 * 60_000 + 59_000, north(299))).toBe(false);
@@ -81,4 +81,16 @@ test("auto: due with no point before, after 15 minutes or 300 m, not at 14 min 5
   // 300 m to a millimetre: the haversine of exactly 300 m comes back a hair under it in floating point.
   expect(autoDue(last, t + 60_000, north(300.001))).toBe(true);
   expect(autoDue(last, t, north(0))).toBe(false);
+});
+
+test("auto: the accuracy of both points is added to 300 m", () => {
+  const at = "2026-10-10T09:00:00+09:00", t = Date.parse(at);
+  const north = (m: number, accuracy: number) => ({ lat: 35 + m / 6371000 * 180 / Math.PI, lng: 135, accuracy });
+  const last = { at, lat: 35, lng: 135, accuracy: 100 };
+  expect(autoDue(last, t + 60_000, north(599, 200))).toBe(false);
+  expect(autoDue(last, t + 60_000, north(601, 200))).toBe(true);
+  const wide = { ...last, accuracy: 1000 };
+  expect(autoDue(wide, t + 60_000, north(2000, 1000))).toBe(false);
+  expect(autoDue(wide, t + 15 * 60_000, north(0, 1000))).toBe(true);
+  expect(autoDue(wide, t + 14 * 60_000 + 59_000, north(0, 1000))).toBe(false);
 });

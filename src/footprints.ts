@@ -14,9 +14,11 @@ export const km = (a: { lat: number; lng: number }, b: { lat: number; lng: numbe
 
 // When a device that turned it on leaves a point by itself, on opening the trip's page or coming back to it (PBI #481): a point
 // every visit would bury the ones pressed, so only 15 minutes or 300 m on from this member's last one. Fixed, as `TRACK_LIMITS`.
+// The 300 m has both points' `accuracy` added (the radius of the circle the position falls in with 68% probability): while the
+// two error circles can overlap, it is not treated as a move.
 export const AUTO_FOOTPRINT = { everyMs: 15 * 60_000, metres: 300 };
-export function autoDue(last: { at: string; lat: number; lng: number } | undefined, now: number, here: { lat: number; lng: number }): boolean {
-  return !last || now - Date.parse(last.at) >= AUTO_FOOTPRINT.everyMs || km(last, here) * 1000 >= AUTO_FOOTPRINT.metres;
+export function autoDue(last: { at: string; lat: number; lng: number; accuracy: number } | undefined, now: number, here: { lat: number; lng: number; accuracy: number }): boolean {
+  return !last || now - Date.parse(last.at) >= AUTO_FOOTPRINT.everyMs || km(last, here) * 1000 > AUTO_FOOTPRINT.metres + last.accuracy + here.accuracy;
 }
 
 // The footprints in the order they were left (one whose time does not read as an instant is left out), and the lines joining them.

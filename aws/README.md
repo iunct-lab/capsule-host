@@ -125,7 +125,9 @@ aws cloudformation deploy --template-file aws/edge-logs.yaml --stack-name $STACK
 bun aws/verify.ts https://DISTRIBUTION.cloudfront.net FUNCTION_NAME YOUR_PROFILE ap-northeast-1
 ```
 
-旅行は、owner が席を取った直後に暗号化してから回す（#696。Host は暗号化していない旅行を、owner が暗号化するまで開かない。下の「暗号化していない旅行」）。暗号化の前には、`ui=2` の無い要求の 409「画面を更新してください」、招待・編集・足あとの 409「オーナーがこの旅行を暗号化するまで開けません」、owner と運用者の一覧の `mustSeal` を確かめ、暗号化の後は、メンバーが確認コードで鍵を受け取ってから読み書きする。出力の `AWS verification passed, on trips sealed by their owners right after claiming the seat` の行で、全部の場面が回ったことが分かる。
+旅行は、owner が席を取った直後に暗号化してから回す（Host は暗号化していない旅行を、owner が暗号化するまで開かない。下の「暗号化していない旅行」）。暗号化の前には、`ui=2` の無い要求の 409「画面を更新してください」、招待・編集・足あとの 409「オーナーがこの旅行を暗号化するまで開けません」、owner と運用者の一覧の `mustSeal` を確かめ、暗号化の後は、メンバーが、鍵を運ぶ招待リンクで鍵を受け取ってから読み書きする。出力の `AWS verification passed, on trips sealed by their owners right after claiming the seat` の行で、全部の場面が回ったことが分かる。
+
+メンバーの権限の変更も見る: owner が参加者の席を、招待を作り直さずに編集者 → 閲覧者 → 参加者と変え、同じ Cookie のまま権限が変わること、owner 以外からの変更が 403 になること、履歴にメンバーの id と前後の権限が残ることを確かめる。
 
 暗号化した旅行の場面では、旅行の鍵を替えることも見る: 鍵を持つ参加者を失効させた後に owner の `GET` が `rekey: "auto"` を返し、owner のブラウザと同じ部品（`src/trip-keys.ts`）で `POST rekey` を送ると、残った参加者が新しい世代を開けて owner の署名と認め、失効した参加者の世代 1 の鍵では開けない。続けて `/recover` の後、新しい owner が参加者から鍵を受け取ると `rekey: "ask"` になり、`keep` で消える（成功行の `trip key replaced`。ローカルの Host は `/recover` に発行者の権限を渡さないので、ここで確かめる）。テーブルの中身を読む確かめ（保存された payload の暗号文が全部世代 2 で `departed`・`previous` が無いこと、個人のメモと旅程の題が平文で残っていないこと、写真の prefix の件数）は、実旅行を読まないように、`aws/verify.ts` が名前で見分ける検証用のスタックでだけ行い、ほかのスタックでは `scan: …飛ばした` と出す。
 

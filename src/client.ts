@@ -159,14 +159,22 @@ async function seatSecret(): Promise<SeatSecret | undefined> {
 }
 // `generation`: the trip key's generation this browser last took (docs/ephemeral-trip-capsule.md「5.5 旅行の鍵を替える」): a later one is taken only when
 // the owner signed it (acceptRekey). A pair kept before it was recorded takes the generation it holds, once.
-async function keepSeat(x25519: string, secret: SeatSecret, ed25519?: string, generation?: number) {
+// Returns "" once the pair is read back from IndexedDB as the one put (and leaves the mark `seat-kept:<trip>`: the public key, for keyStatus
+// to tell a pair this browser kept and lost from one it never kept); otherwise why not: the error's name, or "NotReadBack".
+async function keepSeat(x25519: string, secret: SeatSecret, ed25519?: string, generation?: number): Promise<string> {
   heldSeat = { trip: id!, x25519, secret };
   // The same pair kept again (brought back with the passkey) keeps the generation this browser took: forgetting it would let a
   // later generation in unchecked.
   const before = await keptSeat(), same = before?.x25519 === x25519;
   ed25519 ??= same ? before?.ed25519 : undefined; generation ??= same ? before?.generation : undefined;
-  await keyStore("readwrite", s => s.put({ x25519, secret, ...(ed25519 ? { ed25519 } : {}), ...(generation ? { generation } : {}) }, `seat:${id}`)).catch(() => undefined);
+  let failed = "";
+  await keyStore("readwrite", s => s.put({ x25519, secret, ...(ed25519 ? { ed25519 } : {}), ...(generation ? { generation } : {}) }, `seat:${id}`)).catch(err => { failed = (err as Error | undefined)?.name || "Error"; });
+  if (failed) return failed;
+  if ((await keptSeat())?.x25519 !== x25519) return "NotReadBack";
+  try { localStorage.setItem(`seat-kept:${id}`, x25519); } catch { /* the mark only tells keyStatus which sentence to show */ }
+  return "";
 }
+const seatNotKept = (reason: string) => notice(`旅行の鍵を受け取りましたが、この端末に残せませんでした（${reason}）。このページを閉じると、もう一度リンクを開くまで読めません。`, true);
 const keptSeat = () => keyStore<{ x25519: string; ed25519?: string; secret: SeatSecret; generation?: number } | undefined>("readonly", s => s.get(`seat:${id}`)).catch(() => undefined);
 async function keepGeneration(generation: number) {
   const kept = await keptSeat();
@@ -215,7 +223,8 @@ function ensureTripKey() {
       const seat = await newSeatKeys(), pub = await seatPublic(seat), wrap = await wrapTripKey(await newTripKey(), pub.x25519, id!, 1);
       await api("keys", "PATCH", { type: "seat", ...pub, ephemeral: wrap.ephemeral, generation: 1, wrapped: wrap.wrapped });
       view.seatKey = { ...pub, generation: 1, wrapped: wrap.wrapped, ephemeral: wrap.ephemeral }; view.keyed = true;
-      await keepSeat(pub.x25519, { x25519: await sealedAway(seat.x25519.privateKey, "X25519", ["deriveBits"]), ed25519: await sealedAway(seat.ed25519.privateKey, "Ed25519", ["sign"]) }, pub.ed25519, 1);
+      const notKept = await keepSeat(pub.x25519, { x25519: await sealedAway(seat.x25519.privateKey, "X25519", ["deriveBits"]), ed25519: await sealedAway(seat.ed25519.privateKey, "Ed25519", ["sign"]) }, pub.ed25519, 1);
+      if (notKept) seatNotKept(notKept);
     } catch {
       // 409: another owner seat made them first. Read the keys again so this seat shows as waiting, not as one about to make them.
       stale = false;
@@ -245,13 +254,15 @@ async function sealSeatKeys(prf: BufferSource | undefined) {
   const body = { type: "seat", ...pub, ephemeral: wrap.ephemeral, generation: k.generation, wrapped: wrap.wrapped, secret: await wrapSeatSecret(seat, prf, id), ...since && { since, edges } };
   const put = await api("keys", "PATCH", body);
   view.seatKey = put.seatKey;
-  await keepSeat(pub.x25519, { x25519: await sealedAway(seat.x25519.privateKey, "X25519", ["deriveBits"]), ed25519: await sealedAway(seat.ed25519.privateKey, "Ed25519", ["sign"]) }, pub.ed25519, k.generation);
+  const notKept = await keepSeat(pub.x25519, { x25519: await sealedAway(seat.x25519.privateKey, "X25519", ["deriveBits"]), ed25519: await sealedAway(seat.ed25519.privateKey, "Ed25519", ["sign"]) }, pub.ed25519, k.generation);
+  if (notKept) seatNotKept(notKept);
   await openTripKey();
 }
 // The seat's private keys opened from what the passkey's PRF wrapped, when this browser holds none.
 async function restoreSeat(prf: BufferSource) {
   const k = view.seatKey; if (!id || !k?.secret) return;
-  await keepSeat(k.x25519, await unwrapSeatSecret(k.secret, prf, id));
+  const notKept = await keepSeat(k.x25519, await unwrapSeatSecret(k.secret, prf, id));
+  if (notKept) seatNotKept(notKept);
   await openTripKey();
 }
 // The close event comes after close() returns: a dialog opened again meanwhile is a new one, not one to end.
@@ -275,11 +286,11 @@ async function takeLink() {
     const trip = await openLinkKey(l.wrapped, t, id!, l.generation, l.owner), seat = await newSeatKeys(), pub = await seatPublic(seat), wrap = await wrapTripKey(trip, pub.x25519, id!, l.generation);
     await api("keys", "PATCH", { type: "seat-link", secret: k, ...pub, ...wrap, generation: l.generation });
     const secret = { x25519: await sealedAway(seat.x25519.privateKey, "X25519", ["deriveBits"]), ed25519: await sealedAway(seat.ed25519.privateKey, "Ed25519", ["sign"]) };
-    await keepSeat(pub.x25519, secret, pub.ed25519, l.generation);
+    const notKept = await keepSeat(pub.x25519, secret, pub.ed25519, l.generation);
     // The owner's keys came with what the link opened: a new key the owner signs is taken along this edge (spec「5.5 旅行の鍵を替える」).
     await api("keys", "PATCH", { type: "edge", seat: l.owner.seat, signature: await signEdge(secret.ed25519, l.owner, id!) }).catch(() => undefined);
     sessionStorage.removeItem(linkSlot());
-    await reload(); notice("旅行の鍵を受け取りました。");
+    await reload(); if (notKept) seatNotKept(notKept); else notice("旅行の鍵を受け取りました。");
   } catch (err) {
     // A failure on the way (no network, too many requests) leaves the link for the next reading.
     const final = (err as Error).name === "OperationError" || (err as { status?: number }).status === 409;
@@ -537,7 +548,7 @@ function remember(update: (list: Joined[]) => Joined[]) { try { localStorage.set
 async function forgetTrip(trip: string) {
   await keyStore("readwrite", s => s.delete(trip)).catch(() => undefined);
   await keyStore("readwrite", s => s.delete(`seat:${trip}`)).catch(() => undefined);
-  try { localStorage.removeItem(`auto-footprint:${trip}`); } catch { /* private browsing: nothing was kept */ }
+  try { localStorage.removeItem(`seat-kept:${trip}`); localStorage.removeItem(`auto-footprint:${trip}`); } catch { /* private browsing: nothing was kept */ }
   remember(list => list.filter(t => t.id !== trip));
   if (held?.trip === trip) held = undefined;
   if (heldSeat?.trip === trip) heldSeat = undefined;
@@ -711,11 +722,16 @@ const lastKey = "鍵を持つメンバーが他にいないため、交換する
 // A seat whose private keys the passkey wrapped, of the trip's generation, whose browser lost them: 「パスキーで鍵を取り戻す」 brings them back.
 const restorable = () => passkeys && !tripKey && !keyRefused && Boolean(view.seatKey?.secret) && !(view.sealed && view.seatKey!.generation !== view.sealed.generation);
 const restoreHint = "この端末には旅行の鍵がありません。登録したパスキーで取り戻せます";
+// A seat whose pair this browser kept (the mark is the public key it read back) and no longer finds was removed by the browser; one with no mark
+// was never kept here: it could not be, or the key came to another browser (a web app on the home screen has its own storage).
+const missingKey = () => { let mark: string | null = null; try { mark = localStorage.getItem(`seat-kept:${id}`); } catch { /* none */ }
+  return mark && mark === view.seatKey?.x25519 ? "この端末に残したはずの旅行の鍵が見つかりません（ブラウザが消しました）。オーナーから届いたリンクを、このブラウザでもう一度開いてください"
+    : "この端末には旅行の鍵がありません。前に鍵を残せなかったか、別のブラウザ（ホーム画面に置いたアプリを含む）で受け取りました。オーナーから届いたリンクを、このブラウザで開いてください"; };
 // Whether this browser holds the trip's key (#689). The plan is still plain; a seat that has none waits for another seat's hand-over.
 const keyStatus = () => !id || view.state === "draft" ? ""
   : tripKey ? `<span data-trip-key="held">この端末に鍵がある</span>`
   : keyRefused ? `<span data-trip-key="unverified">${unverifiedKey}</span>`
-  : view.seatKey && !(view.sealed && view.seatKey.generation !== view.sealed.generation) ? `<span data-trip-key="missing">この端末には旅行の鍵がありません</span>${restorable() ? button("パスキーで鍵を取り戻す", "restore-key", "quiet") : ""}`
+  : view.seatKey && !(view.sealed && view.seatKey.generation !== view.sealed.generation) ? `<span data-trip-key="missing">${missingKey()}</span>${restorable() ? button("パスキーで鍵を取り戻す", "restore-key", "quiet") : ""}`
   : view.role !== "owner" || view.keyed ? `<span data-trip-key="waiting">鍵を待っています。オーナーが出すリンクを、このブラウザで開いてください</span>` : "";
 // Seats that wait for the key, shown to a seat that holds it (any role): each with 「渡す」.
 // To the owner, at the top of every page: one link for everyone who waits (docs/ephemeral-trip-capsule.md「5.1 旅行の鍵と受け渡し」).

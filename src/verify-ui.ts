@@ -1559,11 +1559,33 @@ async function linked() {
   await a.until(`!!document.querySelector(".timeline, .timeline-list") && document.querySelector('[data-trip-key]')?.dataset.tripKey === "held"`, 20000);
   assert.ok((sent.get(a.session) ?? []).some(b => b.includes("seat-link")), "the member's page sent no key to its seat");
   assert.equal([...a.requests(), ...owner.requests(), ...sent.get(a.session) ?? [], ...sent.get(owner.session) ?? []].some(u => u.split("#")[0]!.includes(t)), false, "the link's key went to the host");
-  await a.evaluate(`new Promise(ok => { const q = indexedDB.open("capsule", 1); q.onsuccess = () => { const t = q.result.transaction("private-keys", "readwrite"); t.objectStore("private-keys").clear(); t.oncomplete = () => { q.result.close(); ok(true); }; }; })`);
+  // #1236 (a): the mark this browser left is the seat's public key and nothing else; the top page's 開く reads the trip with the key kept.
+  const markAndKey = `(async () => [localStorage.getItem("seat-kept:${capsuleId}"), (await (await vfetch("/v1/c/${capsuleId}")).json()).seatKey?.x25519])()`;
+  const [mark, pubKey] = await a.evaluate(markAndKey) as [string | null, string | undefined];
+  assert.ok(pubKey && mark === pubKey, `the seat-kept mark is not the seat's public key: ${mark} / ${pubKey}`);
+  await a.cdp("Page.navigate", { url: `${origin}/` }); await a.until(`!!document.querySelector('.grant a[href="/c/${capsuleId}"]')`, 20000);
+  await a.evaluate(`document.querySelector('.grant a[href="/c/${capsuleId}"]').click()`);
+  await a.until(`!!document.querySelector(".timeline, .timeline-list") && document.querySelector('[data-trip-key]')?.dataset.tripKey === "held"`, 20000);
+  assert.equal(await a.evaluate(`document.body.textContent.includes(${JSON.stringify(title)})`), true, "the trip opened from the top page does not show its title");
+  // (c) the pair gone with the mark kept says the browser removed it; with the mark gone too, that it was never kept here.
+  await a.evaluate(`new Promise(ok => { const q = indexedDB.open("capsule", 1); q.onsuccess = () => { const t = q.result.transaction("private-keys", "readwrite"); t.objectStore("private-keys").delete("seat:${capsuleId}"); t.oncomplete = () => { q.result.close(); ok(true); }; }; })`);
   await a.cdp("Page.reload"); await a.until(`document.querySelector('[data-trip-key]')?.dataset.tripKey === "missing"`, 20000);
+  assert.ok((await a.evaluate(`document.querySelector('[data-trip-key="missing"]').textContent`) as string).startsWith("この端末に残したはずの旅行の鍵が見つかりません（ブラウザが消しました）"));
+  await a.evaluate(`localStorage.removeItem("seat-kept:${capsuleId}")`); await a.cdp("Page.reload"); await a.until(`document.querySelector('[data-trip-key]')?.dataset.tripKey === "missing"`, 20000);
+  assert.ok((await a.evaluate(`document.querySelector('[data-trip-key="missing"]').textContent`) as string).startsWith("この端末には旅行の鍵がありません。前に鍵を残せなかったか、別のブラウザ"));
   const seats = await seatsNow(), again = await invite("participant", true);
   await a.cdp("Page.navigate", { url: again }); await a.until(`!!document.querySelector(".timeline, .timeline-list")`, 20000);
   assert.equal(await seatsNow(), seats, "a seat that opened a link took a second seat");
+  // (b) a browser whose IndexedDB refuses the write says so instead of "旅行の鍵を受け取りました。", and keeps no mark.
+  {
+    const refusing = await invite("participant", true), fContext = (await send("Target.createBrowserContext")).browserContextId as string, f = await page(390, 844, true, fContext);
+    try {
+      await f.cdp("Page.addScriptToEvaluateOnNewDocument", { source: `IDBObjectStore.prototype.put = function () { throw new DOMException("refused", "DataCloneError"); };` });
+      await f.join(refusing); await f.until(`(${message} ?? "").includes("この端末に残せませんでした（DataCloneError）")`, 20000);
+      assert.ok((await f.evaluate(message) as string).includes("このページを閉じると、もう一度リンクを開くまで読めません"));
+      assert.equal(await f.evaluate(`localStorage.getItem("seat-kept:${capsuleId}")`), null, "a pair that was not kept left a mark");
+    } finally { await f.close(); await dispose(fContext); }
+  }
   const { page: b, context } = await joinAs("participant", 390, 844, false);
   // #1075: the owner's top says who waits, on every page and in the first screen at 390px, and one link is all it takes.
   assert.equal(await b.evaluate(`document.querySelector('[data-sealed="locked"]').textContent`), "この旅行を読むには鍵が要ります。オーナーから届くリンクを、このブラウザで開いてください");

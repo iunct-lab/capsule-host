@@ -87,7 +87,7 @@ aws cloudformation wait stack-update-complete --stack-name $STACK \
 
 ### 足あとの地図の背景（地図データ）
 
-足あとの地図の背景は、Protomaps が OpenStreetMap から毎日作る地図データ（PMTiles、`https://build.protomaps.com/YYYYMMDD.pmtiles`）から切り出したファイルと、その一覧 `map/regions.json` を、Assets バケットの `map/` に置いて配る。画面は `map/regions.json` に載ったファイルだけを読む。画面の配置（`dist/public/` の同期）とは別で、地図の鮮度が問われないので更新は年 1 回程度でよい。無いと背景が無地になるだけで、点と線は出る。
+足あとの地図の背景は、Protomaps が OpenStreetMap から毎日作る地図データ（PMTiles、`https://build.protomaps.com/YYYYMMDD.pmtiles`）から切り出したファイルと、その一覧 `map/regions.json` を、Assets バケットの `map/` に置いて配る。画面は `map/regions.json` に載ったファイルだけを読む。画面の配置（`dist/public/` の同期）とは別で、地図の鮮度が問われないので更新は年 1 回程度か、利用者が日本以外の地域を言ったときに `add` で足す程度でよい（差分の更新はせず、作り直して置き換える）。無いと背景が無地になるだけで、点と線は出る。
 
 | ファイル | 範囲 | 大きさ（日本と世界のとき） |
 |---|---|---|
@@ -95,14 +95,16 @@ aws cloudformation wait stack-update-complete --stack-name $STACK \
 | `map/<地域>.pmtiles` | 地域ごと、z15 まで（初めは日本 `japan`） | 日本で約 3.6 GB |
 | `map/regions.json` | 上のファイルの一覧（build の日付・範囲・大きさ・SHA-256） | 小さい |
 
-作るのは `bun aws/mapdata.ts`。中で `go-pmtiles`（BSD-3-Clause）の `pmtiles extract` を使うので、`pmtiles` を PATH に置く。作業は一時ディレクトリで行い（約 4.2 GB の空きが要る。`/tmp` が小さければ `TMPDIR` を替える）、切り出したファイルを確かめてから置き、最後に `map/regions.json` を置く（リポジトリには入れない）:
+作るのは `bun aws/mapdata.ts`。中で `go-pmtiles`（BSD-3-Clause）の `pmtiles extract` を使うので、`pmtiles` を PATH に置く。取り方は GitHub の Release（`protomaps/go-pmtiles`）から OS に合う tar.gz を `gh release download` で取り、`gh api repos/protomaps/go-pmtiles/releases/tags/<版> -q '.assets[]|.name,.digest'` の `digest` と `sha256sum` が一致することを確かめてから展開する（作業ディレクトリの外に置く）。作業は一時ディレクトリで行い（約 4.5 GB の空きが要る。地域を足せばその分も。`/tmp` が小さければ `TMPDIR` を替える）、切り出したファイルを確かめてから置き、最後に `map/regions.json` を置く（リポジトリには入れない）:
 
 ```sh
 bun aws/mapdata.ts build --bucket BUCKET --profile YOUR_PROFILE                       # 世界（z8）と一覧の地域（無ければ日本、z15）。--build YYYYMMDD で build を選べる（既定は直近）
 bun aws/mapdata.ts add <名前> <西の経度,南の緯度,東の経度,北の緯度> --bucket BUCKET --profile YOUR_PROFILE   # 地域を 1 つ足す（一覧の build から）
 ```
 
-出力は `map/<名前>.pmtiles <bytes> <sha256>` の行と最後の `map/regions.json` だけで、バケット名やアカウントは出さない。ローカル開発（`bun run dev`）の地図データは `--bucket` と `--profile` の代わりに `--dir <開発データの置き場>` を渡す。
+切り出したファイルは信頼せず、置く前にヘッダー（版・ズーム・範囲）を確かめ、外れたら何も置かずに止まる。置いた後は `head-object` の大きさと sha256 が手元と一致することを確かめ、記録は最後に置く。出力は `map/<名前>.pmtiles <bytes> <sha256>` の行と最後の `map/regions.json` だけで、バケット名やアカウントは出さない。ローカル開発（`bun run dev`）の地図データは `--bucket` と `--profile` の代わりに `--dir <開発データの置き場>` を渡す。
+
+**配置の順は記録 → 画面**: 画面（`dist/public/`）を記録を読む版にするときは、先に `map/regions.json` を置く（記録の無い環境へ新しい画面を配ると背景が無地になる）。どの環境でも同じ順。
 
 置いたら `bun aws/verify.ts …`（下の「AWS検証」）が、`map/regions.json` と一覧のファイルを Range で 206 で取れることを確かめる。地図データは ODbL の派生物で、地図に「© OpenStreetMap contributors」を出している（`src/map.ts`）。
 

@@ -338,6 +338,13 @@ async function ensureMemoKey(): Promise<CryptoKey | undefined> {
   const wrapped = await wrapMemoKey(await newMemoKey(), await wrappingKey(prf, id!), id!);
   await api("private", "PATCH", { type: "key", wrapped }); view.privateKey = wrapped; await unlock(prf); return memoKey();
 }
+// Signal API: asks the OS to drop a passkey the host no longer takes (replaced by registerPasskey, or its seat or trip gone: forgetTrip).
+// Browsers without it, or an OS that refuses, leave the old one listed.
+async function forgetPasskeyInOs(credentialId: string) {
+  const pkc = PublicKeyCredential as unknown as { signalUnknownCredential?: (o: { rpId: string; credentialId: string }) => Promise<void> };
+  if (typeof pkc.signalUnknownCredential !== "function") return;
+  try { await pkc.signalUnknownCredential({ rpId: location.hostname, credentialId }); } catch { /* the old passkey just stays listed */ }
+}
 async function registerPasskey() {
   // Replacing is allowed (a new phone), but the old passkey stops working, so say so before the OS dialog appears. The host takes
   // a check by the current passkey in the same request as the new one, so the OS asks for that first.
@@ -388,6 +395,9 @@ async function registerPasskey() {
   if (memo) { if (!next) throw new Error(noPrf); privateKey = await wrapMemoKey(memo, await wrappingKey(next, id!), id!); }
   try { await api("passkey", "POST", { challenge, clientDataJSON: b64(r.clientDataJSON), authenticatorData: b64(r.getAuthenticatorData()), publicKey: b64(key), algorithm: r.getPublicKeyAlgorithm(), ...(check ? { check } : {}), ...(privateKey ? { privateKey } : {}) }); }
   catch (err) { throw check && (err as Error).message === "パスキーで本人確認してください" ? new Error(`${(err as Error).message}。この旅行に登録した今のパスキーを選んでください。今のパスキーを失った場合は、オーナーに失効と再招待を頼んでください。`) : err; }
+  // The host took the replacement: tell the OS the old passkey is no longer used, so its list keeps the new one only.
+  if (check) await forgetPasskeyInOs(check.id!);
+  rememberPasskey(id!, credential.id);
   if (privateKey && next) { view.privateKey = privateKey; await unlock(next); }
   // The host dropped what the old passkey wrapped; this seat's pair is wrapped again with the new passkey's output.
   // The host dropped what the old passkey wrapped; this seat's pair is wrapped again with the new passkey's output.
@@ -413,6 +423,7 @@ async function stepUp() {
   const r = credential.response as AuthenticatorAssertionResponse;
   try { await api("passkey/verify", "POST", { challenge, id: credential.id, clientDataJSON: b64(r.clientDataJSON), authenticatorData: b64(r.authenticatorData), signature: b64(r.signature) }); }
   catch (err) { throw new Error(`${(err as Error).message}。この旅行に登録したパスキーを選んでください。${lostPasskey}`); }
+  rememberPasskey(id!, credential.id);
   checkedPrf = prfOf(credential);
 }
 async function passkeyLogin() {
@@ -423,6 +434,8 @@ async function passkeyLogin() {
   const r = credential.response as AuthenticatorAssertionResponse;
   await api("passkey/session", "POST", { challenge, id: credential.id, clientDataJSON: b64(r.clientDataJSON), authenticatorData: b64(r.authenticatorData), signature: b64(r.signature) });
   joinSecret = ""; history.replaceState(null, "", location.pathname); await reload();
+  // After reload: a signed-out row is gone until reload lists it again.
+  rememberPasskey(id!, credential.id);
   // The same check opens the seat's memo key in this browser; one it cannot open is left for 「パスキーで読む」.
   const prf = prfOf(credential);
   if (prf) {
@@ -544,8 +557,12 @@ function saved(): Joined[] { try { return JSON.parse(localStorage.getItem("capsu
 function joined(): Joined[] { const gone = expiredIn(saved(), Date.now()); return saved().filter(t => !gone.includes(t.id)); }
 // The rows past their deletion stay until the top page forgets them with their keys (forgetTrip): dropped here, their keys would stay.
 function remember(update: (list: Joined[]) => Joined[]) { try { localStorage.setItem("capsules", JSON.stringify(update(saved()).slice(-30))); } catch { /* private browsing: bookmark is the only way back */ } }
-// What this browser put here for one trip: its memo key and seat keys, the setting to leave footprints, and its row in the list.
+// The passkey this browser last used on a trip's seat, kept on its row so forgetTrip can drop it from the OS's list. Called only after the host took the passkey's check.
+function rememberPasskey(trip: string, credentialId: string) { remember(list => list.map(t => t.id === trip ? { ...t, passkey: credentialId } : t)); }
+// What this browser put here for one trip: its memo key and seat keys, the setting to leave footprints, its row in the list, and the seat's passkey in the OS's list.
 async function forgetTrip(trip: string) {
+  const passkey = saved().find(t => t.id === trip)?.passkey;
+  if (passkey) await forgetPasskeyInOs(passkey);
   await keyStore("readwrite", s => s.delete(trip)).catch(() => undefined);
   await keyStore("readwrite", s => s.delete(`seat:${trip}`)).catch(() => undefined);
   try { localStorage.removeItem(`seat-kept:${trip}`); localStorage.removeItem(`auto-footprint:${trip}`); } catch { /* private browsing: nothing was kept */ }
@@ -1508,7 +1525,7 @@ document.addEventListener("click", async event => {
     }
     if (action === "save") saveModal();
     if (action === "copy") { const field = document.querySelector<HTMLInputElement>("#issued-link")!; try { await navigator.clipboard.writeText(field.value); notice("リンクをコピーしました。"); } catch { field.select(); notice("リンクを選択しました。コピーして保存してください。"); } }
-    if (action === "join") { const joined = await api("sessions", "POST", { secret: joinSecret }); joinSecret = ""; history.replaceState(null, "", location.pathname); if (joined.pending) return pendingScreen(joined.code); await reload(); modal("この端末を登録しました", `<p>次からは <strong>${e(location.host)}</strong> を開くと「この端末で参加中の旅行」から入れます。このページをブックマークするか、ホーム画面に追加しておくと確実です。</p>${installable() ? `<div class="admin-actions">${installButton()}</div>` : ""}<p class="muted">受け取った招待リンクも、このブラウザでなら開き直せます。ブラウザのデータ（Cookie）を消すと登録が消え、${passkeys ? "パスキーを登録していなければ" : ""}オーナーからの再招待が必要になります。</p>${passkeys ? `<div class="admin-actions">${button("Face ID / 指紋で戻れるようにする（任意）", "passkey-register", "secondary")}</div><p class="muted">Cookie を消したときに同じ席に戻れます。${view.role === "owner" ? "オーナーは、招待の発行や削除などの前の本人確認にも使います。" : view.role === "editor" ? "編集者は、招待の発行・失効の前の本人確認にも使います。" : ""}閲覧の盗み見を防ぐものではありません。</p>` : ""}`); }
+    if (action === "join") { const joined = await api("sessions", "POST", { secret: joinSecret }); remember(list => list.map(t => t.id === id ? { ...t, passkey: undefined } : t));  /* a new seat does not carry the previous seat's passkey to forget later; the row (its title, the listing of a pending join) stays */ joinSecret = ""; history.replaceState(null, "", location.pathname); if (joined.pending) return pendingScreen(joined.code); await reload(); modal("この端末を登録しました", `<p>次からは <strong>${e(location.host)}</strong> を開くと「この端末で参加中の旅行」から入れます。このページをブックマークするか、ホーム画面に追加しておくと確実です。</p>${installable() ? `<div class="admin-actions">${installButton()}</div>` : ""}<p class="muted">受け取った招待リンクも、このブラウザでなら開き直せます。ブラウザのデータ（Cookie）を消すと登録が消え、${passkeys ? "パスキーを登録していなければ" : ""}オーナーからの再招待が必要になります。</p>${passkeys ? `<div class="admin-actions">${button("Face ID / 指紋で戻れるようにする（任意）", "passkey-register", "secondary")}</div><p class="muted">Cookie を消したときに同じ席に戻れます。${view.role === "owner" ? "オーナーは、招待の発行や削除などの前の本人確認にも使います。" : view.role === "editor" ? "編集者は、招待の発行・失効の前の本人確認にも使います。" : ""}閲覧の盗み見を防ぐものではありません。</p>` : ""}`); }
     if (action === "copy-recipe") {
       const kind = document.querySelector<HTMLSelectElement>("[data-recipe-kind]")?.value ?? "trip";
       const { text } = await api(`/v1/recipe?kind=${encodeURIComponent(kind)}`) as { text: string };

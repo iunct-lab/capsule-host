@@ -1484,7 +1484,9 @@ async function seat() {
   const before = (await member.cdp("WebAuthn.getCredentials", { authenticatorId: memberAuthenticator })).credentials.map((x: { credentialId: string }) => x.credentialId);
   await member.evaluate(`(() => { window.confirm = () => true; document.querySelector('footer [data-action="passkey-register"]').click(); return true; })()`);
   await member.until(`(${message} ?? "").startsWith("この端末のパスキーに登録し直しました")`, 20000);
-  for (const credentialId of before) await member.cdp("WebAuthn.removeCredential", { authenticatorId: memberAuthenticator, credentialId });
+  // The page told the OS (the Signal API) the replaced passkey is unknown, so it may be gone already: only what is left is taken off.
+  const still = (await member.cdp("WebAuthn.getCredentials", { authenticatorId: memberAuthenticator })).credentials.map((x: { credentialId: string }) => x.credentialId);
+  for (const credentialId of before) if (still.includes(credentialId)) await member.cdp("WebAuthn.removeCredential", { authenticatorId: memberAuthenticator, credentialId });
   await locate(member, "granted", memberContext); await footprintsTab(member); await stepHere(member, 1);
   await member.evaluate(`new Promise(ok => { const q = indexedDB.deleteDatabase("capsule"); q.onsuccess = q.onerror = q.onblocked = () => ok(true); })`);
   await member.evaluate(`(() => { window.confirm = () => true; document.querySelector('footer [data-action="signout"]').click(); return true; })()`);
@@ -1664,8 +1666,9 @@ async function passkey() {
   // (i, continued) past the five minutes, a purge from the screen checks this phone's passkey (the authenticator answers; nothing
   // is asked with confirm()) and then purges.
   const left = checkedAt + 5 * 60000 + 2000 - await hostNow(); if (left > 0) { console.log(`Advancing the host clock ${Math.ceil(left / 1000)} s for the passkey check to lapse…`); await advance(left); }
-  // The replacement, the return with the passkey (b) and the purge are some ten ceremonies, which share the login limit of 15 a
-  // minute: they start early in a minute, as the member's replacement below does (#689).
+  // The replacement, the return with the passkey (b), the second replacement without the Signal API (j) and the purge are some
+  // thirteen ceremonies, close to the login limit of 15 a minute they share: they start early in a minute, as the member's
+  // replacement below does (#689). A slow run can still meet the limit (429) before the purge.
   { const into = await hostNow() % 60000; if (into > 20000) await advance(61000 - into); }
   // (i, continued) "パスキーを登録し直す" says what it takes, then the OS checks the current passkey and makes the new one. The old
   // phone is then lost: its passkey is taken off the authenticator, so the purge below can only be checked by the new one.
@@ -1677,22 +1680,77 @@ async function passkey() {
   await owner.evaluate(`new Promise(ok => { const q = indexedDB.deleteDatabase("capsule"); q.onsuccess = q.onerror = q.onblocked = () => ok(true); })`);
   const replaced = (await owner.cdp("WebAuthn.getCredentials", { authenticatorId })).credentials.map((x: { credentialId: string }) => x.credentialId);
   await owner.evaluate(`document.querySelector('[data-action="passkey-register"]').click()`); await owner.until(`(${message} ?? "").startsWith("この端末のパスキーに登録し直しました")`);
+  // The host took the replacement, so the page told the OS (the Signal API) the old passkey is unknown: the authenticator's list
+  // keeps the new one only, and it is not the one replaced.
+  const kept = (await owner.cdp("WebAuthn.getCredentials", { authenticatorId })).credentials.map((x: { credentialId: string }) => x.credentialId);
+  assert.equal(kept.length, 1, "the replaced passkey is still in the OS's list after the host took the new one");
+  assert.equal(replaced.includes(kept[0]!), false, "the passkey left in the OS's list is the replaced one, not the new one");
   assert.equal((await owner.evaluate(message) as string).endsWith("招待の発行や削除などの前の本人確認にも使います。"), true);
   assert.deepEqual(await owner.evaluate(`[window.asked, window.checks, window.made]`), [["今のパスキーで本人確認してから、この端末のパスキーに置き換えます。前に登録したパスキーでは戻れなくなります。今のパスキーを失った場合は、オーナーに失効と再招待を頼んでください。続けますか？"], 2, 1]);  // the current passkey's check, then the new one's PRF output for the seat's keys (#689)
-  for (const credentialId of replaced) await owner.cdp("WebAuthn.removeCredential", { authenticatorId, credentialId });
   // (b) #689: the replacement wrapped the seat's private key with the new passkey's PRF. With the IndexedDB gone and the seat signed
   // out, 「パスキーで戻る」 opens it with the one check and the page says this device holds the key again.
   assert.equal(await owner.evaluate(wrapped), true);
   await owner.evaluate(`new Promise(ok => { const q = indexedDB.deleteDatabase("capsule"); q.onsuccess = q.onerror = q.onblocked = () => ok(true); })`);
   await owner.evaluate(`(() => { window.confirm = () => true; document.querySelector('footer [data-action="signout"]').click(); return true; })()`);
-  await owner.until(`location.pathname === "/"`); await owner.cdp("Page.navigate", { url: `${origin}/c/${capsuleId}` });
+  await owner.until(`location.pathname === "/"`);
+  // Signing out leaves the seat, so the passkey that brings this phone back stays in the OS's list (only a gone seat or trip forgets it).
+  assert.equal((await owner.cdp("WebAuthn.getCredentials", { authenticatorId })).credentials.length, 1, "signing out dropped the passkey from the OS's list");
+  await owner.cdp("Page.navigate", { url: `${origin}/c/${capsuleId}` });
   await owner.until(`!!document.querySelector('[data-action="passkey-login"]')`); await owner.evaluate(`document.querySelector('[data-action="passkey-login"]').click()`);
   await owner.until(`!!document.querySelector('[data-trip-key="held"]')`, 20000);
   // The key back, the plan is drawn without reading the page again (#1030), on the page a reload opens.
   await owner.until(`!!document.querySelector(".timeline, .timeline-list")`, 20000); assert.equal(await owner.evaluate(`!!document.querySelector('[data-sealed="locked"]')`), false);
   const ownerTab = await owner.evaluate(shownTab); await owner.reload(); assert.equal(await owner.evaluate(shownTab), ownerTab);
+  // (j) A browser without the Signal API replaces the passkey as well: the page has it deleted, and the replacement still goes
+  // through (the old passkey then stays in the list, so two are held; the old one is taken off the authenticator below).
+  await owner.evaluate(`delete PublicKeyCredential.signalUnknownCredential; window.confirm = () => true; document.querySelector('[data-action="passkey-register"]').click()`);
+  await owner.until(`(${message} ?? "").startsWith("この端末のパスキーに登録し直しました")`, 20000);
+  const both = (await owner.cdp("WebAuthn.getCredentials", { authenticatorId })).credentials.map((x: { credentialId: string }) => x.credentialId);
+  assert.equal(both.length, 2, "without the Signal API the old passkey is not told to the OS, so it stays listed");
+  for (const credentialId of kept) await owner.cdp("WebAuthn.removeCredential", { authenticatorId, credentialId });
+  // (k) A participant registers a passkey, then the owner revokes the seat: the participant's browser reads 401 `seat: "gone"`, forgets
+  // the trip, and tells its OS the seat's passkey is unknown, so the authenticator's list is empty.
+  {
+    const { page: guest, context: guestContext } = await joinAs("participant");
+    try {
+      await guest.cdp("WebAuthn.enable"); const { authenticatorId: guestAuthenticator } = await guest.cdp("WebAuthn.addVirtualAuthenticator", { options: { protocol: "ctap2", transport: "internal", hasResidentKey: true, hasUserVerification: true, isUserVerified: true, hasPrf: true } });
+      await guest.evaluate(answerYes); await guest.evaluate(`document.querySelector('footer [data-action="passkey-register"]').click()`);
+      await guest.until(`(${message} ?? "").startsWith("パスキーを登録しました")`, 20000);
+      const guestCredentials = async () => (await guest.cdp("WebAuthn.getCredentials", { authenticatorId: guestAuthenticator })).credentials.length as number;
+      assert.equal(await guestCredentials(), 1, "the participant's passkey was not made");
+      const guestSeat = await guest.evaluate(`(async () => (await (await vfetch("/v1/c/${capsuleId}")).json()).self.id)()`) as string;
+      assert.equal((await fromPage("revoke", { member: guestSeat, confirm: true })).status, 200);
+      await guest.cdp("Page.navigate", { url: `${origin}/c/${capsuleId}` }); await guest.until(`document.querySelector("main.empty h1")?.textContent === "しおりを開けませんでした。"`, 20000);
+      for (let i = 0; i < 40 && await guestCredentials() > 0; i++) await new Promise(ok => setTimeout(ok, 250));
+      assert.equal(await guestCredentials(), 0, "a revoked seat's passkey is still in the OS's list");
+    } finally { await guest.close(); await dispose(guestContext); }
+  }
+  // (k2) #1256: a browser whose cookie lapsed (the seat stays) joins by a new invite as another seat, with no passkey of its own. The
+  // row keeps nothing of the first seat, so that seat's passkey is not dropped from the OS's list when the new seat is revoked.
+  await nextMinute();  // (k) spent the owner's requests of this minute
+  {
+    const { page: guest, context: guestContext } = await joinAs("participant");
+    try {
+      await guest.cdp("WebAuthn.enable"); const { authenticatorId: guestAuthenticator } = await guest.cdp("WebAuthn.addVirtualAuthenticator", { options: { protocol: "ctap2", transport: "internal", hasResidentKey: true, hasUserVerification: true, isUserVerified: true, hasPrf: true } });
+      await guest.evaluate(answerYes); await guest.evaluate(`document.querySelector('footer [data-action="passkey-register"]').click()`);
+      await guest.until(`(${message} ?? "").startsWith("パスキーを登録しました")`, 20000);
+      const guestCredentials = async () => (await guest.cdp("WebAuthn.getCredentials", { authenticatorId: guestAuthenticator })).credentials.length as number;
+      assert.equal(await guestCredentials(), 1, "the participant's passkey was not made");
+      await guest.cdp("Network.clearBrowserCookies");  // the cookie only: the row and IndexedDB stay
+      await guest.join(await invite("participant"));
+      const secondSeat = await guest.evaluate(`(async () => (await (await vfetch("/v1/c/${capsuleId}")).json()).self.id)()`) as string;
+      assert.equal((await fromPage("revoke", { member: secondSeat, confirm: true })).status, 200);
+      await guest.cdp("Page.navigate", { url: `${origin}/c/${capsuleId}` }); await guest.until(`document.querySelector("main.empty h1")?.textContent === "しおりを開けませんでした。"`, 20000);
+      await sleep(2000);
+      assert.equal(await guestCredentials(), 1, "the first seat's passkey was dropped from the OS's list when another seat was revoked");
+    } finally { await guest.close(); await dispose(guestContext); }
+  }
+  // The owner's passkey is forgotten with the trip it removes, on a page that has the Signal API (the one reloaded: (j) deleted it).
+  await owner.reload(); await owner.until(`!!document.querySelector('[data-action="manage"]')`, 20000);
   await closeTrip(true);
-  console.log("Passkey verification passed: a replacement of the owner's passkey past the check's five minutes (the current passkey checked, a new one made), a passkey without PRF leaving no wrapped private key on the seat (and no 「パスキーで鍵を取り戻す」 once the storage is lost), the owner coming back with 「パスキーで戻る」 after IndexedDB and the cookie were cleared and holding the key again, the trip then removed from the owner's screen.");
+  for (let i = 0; i < 40 && (await owner.cdp("WebAuthn.getCredentials", { authenticatorId })).credentials.length > 0; i++) await sleep(250);
+  assert.equal((await owner.cdp("WebAuthn.getCredentials", { authenticatorId })).credentials.length, 0, "the owner's passkey is still in the OS's list after the trip was removed");
+  console.log("Passkey verification passed: a replacement of the owner's passkey past the check's five minutes (the current passkey checked, a new one made, the replaced one gone from the OS's list so only the new one is left, and a page without the Signal API replacing it as well), a passkey without PRF leaving no wrapped private key on the seat (and no 「パスキーで鍵を取り戻す」 once the storage is lost), the owner coming back with 「パスキーで戻る」 after IndexedDB and the cookie were cleared and holding the key again, the owner's passkey still in the OS's list after signing out, a revoked participant's passkey gone from it once the browser read the seat gone (not the first seat's, when a lapsed cookie joined another seat that was revoked), the trip then removed from the owner's screen and the owner's passkey gone with it.");
 }
 async function sealed() {
   const { owner } = await openTrip();

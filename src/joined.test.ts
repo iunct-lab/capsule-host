@@ -20,3 +20,14 @@ test("listedRow keeps the title it opened, and never the ciphertext", () => {
   // The owner renamed the trip: the next opening lists the new title.
   expect(listedRow(listedRow(undefined, now, true), { ...now, title: "京都と奈良" }, true).title).toBe("京都と奈良");
 });
+
+test("listedRow keeps the passkey this browser last used on the seat, and reads a row that has none", () => {
+  const now = { id: "t", title: "京都の週末", startsOn: "2026-09-26", endsOn: "2026-09-27", purgeAt: "2026-10-27T00:00:00.000Z" };
+  const prev = { ...row("t", "2026-10-25T00:00:00.000Z"), passkey: "cred-1" };
+  expect(listedRow(prev, now, true).passkey).toBe("cred-1");
+  expect(listedRow(prev, { ...now, title: "ciphertext" }, false).passkey).toBe("cred-1");
+  expect(listedRow(prev, { ...now, passkey: "cred-2" }, true).passkey).toBe("cred-2");
+  // An older row has no passkey: none is made up, and the row stays as it was.
+  expect(listedRow(row("t", "2026-10-25T00:00:00.000Z"), now, true)).toEqual(now);
+  expect("passkey" in listedRow(undefined, now, true)).toBe(false);
+});
